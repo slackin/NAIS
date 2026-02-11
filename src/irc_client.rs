@@ -35,6 +35,7 @@ pub struct ServerState {
     pub auto_reconnect: bool,
     pub last_connect: Option<ConnectInfo>,
     pub connection_log: Vec<String>,
+    pub cached_channel_list: Vec<(String, u32, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -60,6 +61,8 @@ pub enum IrcEvent {
     Users { channel: String, users: Vec<String> },
     Message { channel: String, user: String, text: String },
     System { channel: String, text: String },
+    ChannelListItem { channel: String, user_count: u32, topic: String },
+    ChannelListEnd,
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +97,7 @@ pub enum IrcCommandEvent {
         channel: String,
         topic: Option<String>,
     },
+    List,
     Disconnect,
 }
 
@@ -104,40 +108,22 @@ pub struct CoreHandle {
 }
 
 pub fn default_server_state(server: String, nickname: String, channel: String) -> ServerState {
-    let mut users_by_channel = HashMap::new();
     let channel = channel.trim().to_string();
     let current_channel = if channel.is_empty() { String::new() } else { channel };
-    if !current_channel.is_empty() {
-        users_by_channel.insert(
-            current_channel.clone(),
-            vec!["aiden".to_string(), "nova".to_string(), "you".to_string()],
-        );
-    }
-    let channels = if current_channel.is_empty() {
-        Vec::new()
-    } else {
-        vec![current_channel.clone()]
-    };
-    let mut messages = Vec::new();
-    if !current_channel.is_empty() {
-        messages.push(ChatMessage {
-            channel: current_channel.clone(),
-            user: "system".to_string(),
-            text: "Welcome to NAIS-client.".to_string(),
-            is_system: true,
-        });
-    }
+    
+    // Don't pre-populate channels or users - they'll be added when actually joined
     ServerState {
         status: ConnectionStatus::Disconnected,
         server,
         nickname,
         current_channel,
-        channels,
-        users_by_channel,
-        messages,
+        channels: Vec::new(),
+        users_by_channel: HashMap::new(),
+        messages: Vec::new(),
         auto_reconnect: true,
         last_connect: None,
         connection_log: Vec::new(),
+        cached_channel_list: Vec::new(),
     }
 }
 pub fn apply_event(state: &mut AppState, profile: &str, event: IrcEvent) {
@@ -209,7 +195,13 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent) {
             });
         }
         IrcEvent::Users { channel, users } => {
-            state.users_by_channel.insert(channel, users);
+            // Append users from this NAMES reply to the existing list
+            let user_list = state.users_by_channel.entry(channel).or_insert_with(Vec::new);
+            for user in users {
+                if !user_list.contains(&user) {
+                    user_list.push(user);
+                }
+            }
         }
         IrcEvent::Message { channel, user, text } => {
             state.messages.push(ChatMessage {
@@ -236,6 +228,9 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent) {
                     is_system: true,
                 });
             }
+        }
+        IrcEvent::ChannelListItem { .. } | IrcEvent::ChannelListEnd => {
+            // These events are handled in the UI event loop, not here
         }
     }
 }
@@ -453,6 +448,15 @@ async fn handle_connection(
                             .await;
                         let _ = client.send(IrcCommand::TOPIC(channel, topic));
                     }
+                    IrcCommandEvent::List => {
+                        let _ = evt_tx
+                            .send(IrcEvent::System {
+                                channel: default_channel.clone(),
+                                text: "[IRC] Sent: LIST".to_string(),
+                            })
+                            .await;
+                        let _ = client.send(IrcCommand::LIST(None, None));
+                    }
                     IrcCommandEvent::Disconnect => {
                         let _ = evt_tx
                             .send(IrcEvent::System {
@@ -623,34 +627,41 @@ async fn handle_connection(
                         // User mode response (221) - we're fully connected, trigger auto-join
                         if !auto_joined && !default_channel.is_empty() {
                             auto_joined = true;
-                            let _ = evt_tx
-                                .send(IrcEvent::System {
-                                    channel: default_channel.clone(),
-                                    text: format!("[IRC] Sent: JOIN {}", default_channel),
-                                })
-                                .await;
-                            let _ = client.send_join(&default_channel);
+                            // Join all comma-separated channels
+                            for channel in default_channel.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                                let _ = evt_tx
+                                    .send(IrcEvent::System {
+                                        channel: channel.to_string(),
+                                        text: format!("[IRC] Sent: JOIN {}", channel),
+                                    })
+                                    .await;
+                                let _ = client.send_join(channel);
+                            }
                         }
                     }
                     IrcCommand::Response(Response::RPL_ENDOFMOTD, _) => {
                         // End of MOTD - now we can join the channel
                         if !auto_joined && !default_channel.is_empty() {
                             auto_joined = true;
-                            let _ = evt_tx
-                                .send(IrcEvent::System {
-                                    channel: default_channel.clone(),
-                                    text: format!("[IRC] Sent: JOIN {}", default_channel),
-                                })
-                                .await;
-                            let _ = client.send_join(&default_channel);
+                            // Join all comma-separated channels
+                            for channel in default_channel.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                                let _ = evt_tx
+                                    .send(IrcEvent::System {
+                                        channel: channel.to_string(),
+                                        text: format!("[IRC] Sent: JOIN {}", channel),
+                                    })
+                                    .await;
+                                let _ = client.send_join(channel);
+                            }
                         }
                     }
                     IrcCommand::Response(Response::RPL_NAMREPLY, ref args) => {
                         if args.len() >= 4 {
                             let channel = args[2].clone();
+                            // Keep prefixes: @ for op, + for voice
                             let names = args[3]
                                 .split_whitespace()
-                                .map(|name| name.trim_start_matches(['@', '+']).to_string())
+                                .map(|name| name.to_string())
                                 .collect::<Vec<_>>();
                             let _ = evt_tx
                                 .send(IrcEvent::Users { channel, users: names })
@@ -743,6 +754,28 @@ async fn handle_connection(
                                 })
                                 .await;
                         }
+                    }
+                    IrcCommand::Response(Response::RPL_LIST, ref args) => {
+                        // RPL_LIST: <channel> <# visible> :<topic>
+                        if args.len() >= 3 {
+                            let channel = args[1].clone();
+                            let user_count = args[2].parse::<u32>().unwrap_or(0);
+                            let topic = if args.len() >= 4 {
+                                args[3].clone()
+                            } else {
+                                String::new()
+                            };
+                            let _ = evt_tx
+                                .send(IrcEvent::ChannelListItem {
+                                    channel,
+                                    user_count,
+                                    topic,
+                                })
+                                .await;
+                        }
+                    }
+                    IrcCommand::Response(Response::RPL_LISTEND, _) => {
+                        let _ = evt_tx.send(IrcEvent::ChannelListEnd).await;
                     }
                     _ => {}
                 }

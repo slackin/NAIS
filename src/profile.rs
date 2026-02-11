@@ -10,9 +10,15 @@ pub struct Profile {
     pub channel: String,
     #[serde(default = "default_use_tls")]
     pub use_tls: bool,
+    #[serde(default = "default_auto_connect")]
+    pub auto_connect: bool,
 }
 
 fn default_use_tls() -> bool {
+    true
+}
+
+fn default_auto_connect() -> bool {
     true
 }
 
@@ -34,6 +40,7 @@ impl Default for Profile {
             nickname,
             channel,
             use_tls: true,
+            auto_connect: true,
         }
     }
 }
@@ -76,6 +83,7 @@ pub fn load_store() -> ProfileStore {
             nickname: legacy.nickname,
             channel: legacy.channel,
             use_tls: legacy.use_tls,
+            auto_connect: legacy.auto_connect,
         };
         store.profiles = vec![profile.clone()];
         store.last_used = Some(profile.name.clone());

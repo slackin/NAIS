@@ -47,25 +47,47 @@ fn app() -> Element {
     let mut show_new_profile = use_signal(|| false);
     let mut show_edit_profile = use_signal(|| false);
     let mut show_import_modal = use_signal(|| false);
+    let mut show_channel_browser = use_signal(|| false);
     let mut profile_menu_open = use_signal(|| None::<String>);
 
     let mut new_server_input = use_signal(String::new);
     let mut new_nick_input = use_signal(String::new);
     let mut new_channel_input = use_signal(String::new);
     let mut new_tls_input = use_signal(|| true);
+    let mut new_auto_connect_input = use_signal(|| true);
 
     let mut edit_name_input = use_signal(String::new);
     let mut edit_server_input = use_signal(String::new);
     let mut edit_nick_input = use_signal(String::new);
     let mut edit_channel_input = use_signal(String::new);
     let mut edit_tls_input = use_signal(|| true);
+    let mut edit_auto_connect_input = use_signal(|| true);
 
     let mut search_input = use_signal(String::new);
+    let mut channel_list: Signal<Vec<(String, u32, String)>> = use_signal(Vec::new);
+    let mut channel_search_input = use_signal(String::new);
+    let mut list_loading = use_signal(|| false);
+    let mut channels_collapsed = use_signal(|| false);
+    let mut userlist_collapsed = use_signal(|| false);
+
+    // Auto-scroll messages to bottom when they change
+    use_effect(move || {
+        let _ = eval(
+            r#"
+            const messagesDiv = document.querySelector('.messages');
+            if (messagesDiv) {
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            }
+            "#
+        );
+    });
 
     // Event loop to poll cores for IRC events
     {
         let mut state_handle = state;
         let mut status_handle = profile_status;
+        let mut channel_list_handle = channel_list;
+        let mut list_loading_handle = list_loading;
         spawn(async move {
             loop {
                 let state_read = state_handle.read();
@@ -80,12 +102,56 @@ fn app() -> Element {
                         drop(cores_read);
 
                         while let Ok(event) = evt_rx.try_recv() {
+                            // Handle channel list events separately
+                            match &event {
+                                IrcEvent::ChannelListItem { channel, user_count, topic } => {
+                                    channel_list_handle.write().push((
+                                        channel.clone(),
+                                        *user_count,
+                                        topic.clone(),
+                                    ));
+                                    continue;
+                                }
+                                IrcEvent::ChannelListEnd => {
+                                    list_loading_handle.set(false);
+                                    // Cache the channel list in ServerState
+                                    let mut state_mut = state_handle.write();
+                                    if let Some(server_state) = state_mut.servers.get_mut(&profile_name) {
+                                        server_state.cached_channel_list = channel_list_handle.read().clone();
+                                    }
+                                    drop(state_mut);
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                            
                             let mut state_mut = state_handle.write();
                             irc_client::apply_event(&mut state_mut, &profile_name, event.clone());
                             
                             // Update profile_status signal based on the event
                             if matches!(event, IrcEvent::Connected { .. }) {
                                 status_handle.write().insert(profile_name.clone(), ConnectionStatus::Connected);
+                                
+                                // Auto-refresh channel list 5 seconds after connection
+                                let prof_name_clone = profile_name.clone();
+                                let cores_clone = cores.clone();
+                                let mut channel_list_clone = channel_list_handle.clone();
+                                let mut list_loading_clone = list_loading_handle.clone();
+                                spawn(async move {
+                                    Delay::new(Duration::from_secs(5)).await;
+                                    
+                                    // Clear and start loading
+                                    channel_list_clone.set(Vec::new());
+                                    list_loading_clone.set(true);
+                                    
+                                    // Send LIST command
+                                    let cores_read = cores_clone.read();
+                                    if let Some(handle) = cores_read.get(&prof_name_clone) {
+                                        let cmd_tx = handle.cmd_tx.clone();
+                                        drop(cores_read);
+                                        let _ = cmd_tx.send(irc_client::IrcCommandEvent::List).await;
+                                    }
+                                });
                             } else if matches!(event, IrcEvent::Disconnected) {
                                 status_handle.write().insert(profile_name.clone(), ConnectionStatus::Disconnected);
                             }
@@ -97,6 +163,36 @@ fn app() -> Element {
                 }
 
                 Delay::new(Duration::from_millis(100)).await;
+            }
+        });
+    }
+
+    // Auto-connect to profiles on startup
+    {
+        use_effect(move || {
+            for profile in profiles.read().iter() {
+                if profile.auto_connect {
+                    let prof_name = profile.name.clone();
+                    let server_state = state.read().servers.get(&prof_name).cloned();
+                    
+                    if let Some(ss) = server_state {
+                        if ss.status == ConnectionStatus::Disconnected {
+                            connect_profile(
+                                ss.server.clone(),
+                                ss.nickname.clone(),
+                                ss.current_channel.clone(),
+                                profile.use_tls,
+                                prof_name,
+                                state,
+                                profiles,
+                                last_used,
+                                profile_status,
+                                cores,
+                                skip_reconnect,
+                            );
+                        }
+                    }
+                }
             }
         });
     }
@@ -191,6 +287,7 @@ fn app() -> Element {
                                     let prof_name_for_connect = prof.name.clone();
                                     let prof_name_for_edit = prof.name.clone();
                                     let prof_name_for_log_toggle = prof.name.clone();
+                                    let prof_name_for_browse = prof.name.clone();
                                     let prof_name_for_delete = prof.name.clone();
                                     
                                     let is_active = prof.name == state.read().active_profile;
@@ -280,6 +377,7 @@ fn app() -> Element {
                                                         edit_nick_input.set(profile.nickname.clone());
                                                         edit_channel_input.set(profile.channel.clone());
                                                         edit_tls_input.set(profile.use_tls);
+                                                        edit_auto_connect_input.set(profile.auto_connect);
                                                     }
                                                     drop(profs);
                                                     
@@ -323,6 +421,51 @@ fn app() -> Element {
                                             button {
                                                 class: "menu-item",
                                                 onclick: move |_| {
+                                                    let prof_name_clone = prof_name_for_browse.clone();
+                                                    let status = profile_status.read().get(&prof_name_clone).cloned()
+                                                        .unwrap_or(ConnectionStatus::Disconnected);
+                                                    
+                                                    if status != ConnectionStatus::Connected {
+                                                        return;
+                                                    }
+                                                    
+                                                    // Check if we have a cached channel list
+                                                    let state_read = state.read();
+                                                    let cached_list = state_read.servers.get(&prof_name_clone)
+                                                        .map(|s| s.cached_channel_list.clone())
+                                                        .unwrap_or_default();
+                                                    drop(state_read);
+                                                    
+                                                    if !cached_list.is_empty() {
+                                                        // Use cached list
+                                                        channel_list.set(cached_list);
+                                                        list_loading.set(false);
+                                                    } else {
+                                                        // No cache, fetch new list
+                                                        channel_list.set(Vec::new());
+                                                        list_loading.set(true);
+                                                        
+                                                        // Send LIST command
+                                                        let cores_read = cores.read();
+                                                        if let Some(handle) = cores_read.get(&prof_name_clone) {
+                                                            let cmd_tx = handle.cmd_tx.clone();
+                                                            drop(cores_read);
+                                                            spawn(async move {
+                                                                let _ = cmd_tx.send(irc_client::IrcCommandEvent::List).await;
+                                                            });
+                                                        } else {
+                                                            drop(cores_read);
+                                                        }
+                                                    }
+                                                    
+                                                    show_channel_browser.set(true);
+                                                    profile_menu_open.set(None);
+                                                },
+                                                "Browse Channels"
+                                            }
+                                            button {
+                                                class: "menu-item",
+                                                onclick: move |_| {
                                                     let idx_opt = profiles.read().iter().position(|p| &p.name == &prof_name_for_delete);
                                                     if let Some(idx) = idx_opt {
                                                         let prof_to_remove = profiles.read()[idx].clone();
@@ -362,16 +505,30 @@ fn app() -> Element {
             }
 
             // Body: 3-column grid
-            div {
-                class: "body",
-                style: "display:grid; grid-template-columns:200px 1fr 200px; gap:12px; flex:1; overflow:hidden;",
+            {
+                let grid_cols = if channels_collapsed() { "60px" } else { "200px" };
+                let userlist_cols = if userlist_collapsed() { "40px" } else { "200px" };
+                rsx! {
+                    div {
+                        class: "body",
+                        style: "display:grid; grid-template-columns:{grid_cols} 1fr {userlist_cols}; gap:12px; flex:1; overflow:hidden;",
 
-                // Channels sidebar
-                div {
-                    class: "channels",
+                        // Channels sidebar
+                        div {
+                            class: if channels_collapsed() { "channels collapsed" } else { "channels" },
                     div {
                         class: "section-title",
-                        "Channels"
+                        style: "display:flex; justify-content:space-between; align-items:center;",
+                        if !channels_collapsed() {
+                            "Channels"
+                        }
+                        button {
+                            class: "collapse-btn",
+                            onclick: move |_| {
+                                channels_collapsed.set(!channels_collapsed());
+                            },
+                            if channels_collapsed() { "»" } else { "«" }
+                        }
                     }
                     ul {
                         // Server Log channel - only show if enabled for this profile
@@ -394,7 +551,16 @@ fn app() -> Element {
                                                     server.current_channel = "Server Log".to_string();
                                                 }
                                             },
-                                            "📋 Server Log"
+                                            title: "Server Log",
+                                            if channels_collapsed() {
+                                                div {
+                                                    class: "channel-icon",
+                                                    style: "background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);",
+                                                    "📋"
+                                                }
+                                            } else {
+                                                "📋 Server Log"
+                                            }
                                         }
                                     }
                                 })
@@ -404,25 +570,57 @@ fn app() -> Element {
                         }
                         
                         // Regular channels
-                        for channel in state.read()
-                            .servers
-                            .get(&state.read().active_profile)
-                            .map(|s| s.channels.clone())
-                            .unwrap_or_default() {
-                            li {
-                                button {
-                                    class: if state.read().servers
-                                        .get(&state.read().active_profile)
-                                        .map(|s| s.current_channel == channel)
-                                        .unwrap_or(false)
-                                    { "row active" } else { "row" },
-                                    onclick: move |_| {
-                                        let active = state.read().active_profile.clone();
-                                        if let Some(server) = state.write().servers.get_mut(&active) {
-                                            server.current_channel = channel.clone();
+                        {
+                            let channels = state.read()
+                                .servers
+                                .get(&state.read().active_profile)
+                                .map(|s| s.channels.clone())
+                                .unwrap_or_default();
+                            
+                            rsx! {
+                                for (idx, channel) in channels.into_iter().enumerate() {
+                                    {
+                                        let channel_clone = channel.clone();
+                                        let first_letter = channel.chars()
+                                            .find(|c| c.is_alphanumeric())
+                                            .unwrap_or('#')
+                                            .to_uppercase()
+                                            .to_string();
+                                        
+                                        // Generate a color based on the channel name
+                                        let hash = channel.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
+                                        let hue = hash % 360;
+                                        let color = format!("hsl({}, 65%, 55%)", hue);
+                                        
+                                        rsx! {
+                                            li {
+                                                key: "{idx}",
+                                                button {
+                                                    class: if state.read().servers
+                                                        .get(&state.read().active_profile)
+                                                        .map(|s| s.current_channel == channel)
+                                                        .unwrap_or(false)
+                                                    { "row active" } else { "row" },
+                                                    onclick: move |_| {
+                                                        let active = state.read().active_profile.clone();
+                                                        if let Some(server) = state.write().servers.get_mut(&active) {
+                                                            server.current_channel = channel_clone.clone();
+                                                        }
+                                                    },
+                                                    title: "{channel}",
+                                                    if channels_collapsed() {
+                                                        div {
+                                                            class: "channel-icon",
+                                                            style: "background: {color};",
+                                                            "{first_letter}"
+                                                        }
+                                                    } else {
+                                                        "{channel}"
+                                                    }
+                                                }
+                                            }
                                         }
-                                    },
-                                    "{channel}"
+                                    }
                                 }
                             }
                         }
@@ -507,7 +705,7 @@ fn app() -> Element {
 
                 // Who sidebar
                 div {
-                    class: "who",
+                    class: if userlist_collapsed() { "who collapsed" } else { "who" },
                     {
                         let current_channel = state.read().servers
                             .get(&state.read().active_profile)
@@ -519,12 +717,23 @@ fn app() -> Element {
                             rsx! {
                                 div {
                                     class: "section-title",
-                                    "Connection Info"
+                                    style: "display:flex; justify-content:space-between; align-items:center;",
+                                    if !userlist_collapsed() {
+                                        "Connection Info"
+                                    }
+                                    button {
+                                        class: "collapse-btn",
+                                        onclick: move |_| {
+                                            userlist_collapsed.set(!userlist_collapsed());
+                                        },
+                                        if userlist_collapsed() { "‹" } else { "›" }
+                                    }
                                 }
-                                div {
-                                    style: "padding:12px; font-size:12px;",
-                                    {
-                                        let server_state = state.read().servers.get(&state.read().active_profile).cloned();
+                                if !userlist_collapsed() {
+                                    div {
+                                        style: "padding:12px; font-size:12px;",
+                                        {
+                                            let server_state = state.read().servers.get(&state.read().active_profile).cloned();
                                         if let Some(ss) = server_state {
                                             rsx! {
                                                 div { style: "margin-bottom:8px;", strong { "Server:" } }
@@ -543,35 +752,96 @@ fn app() -> Element {
                                         } else {
                                             rsx! { div { "No info" } }
                                         }
+                                        }
                                     }
                                 }
                             }
                         } else {
                             // Show regular users list
+                            let mut users = state.read()
+                                .servers
+                                .get(&state.read().active_profile)
+                                .and_then(|s| {
+                                    s.users_by_channel.get(&current_channel).cloned()
+                                })
+                                .unwrap_or_default();
+                            
+                            // Sort users: ops (@) first, then voice (+), then regular users
+                            users.sort_by(|a, b| {
+                                let a_prefix = a.chars().next().unwrap_or(' ');
+                                let b_prefix = b.chars().next().unwrap_or(' ');
+                                
+                                let a_rank = match a_prefix {
+                                    '@' => 0, // Ops first
+                                    '+' => 1, // Voice second
+                                    _ => 2,   // Regular users last
+                                };
+                                let b_rank = match b_prefix {
+                                    '@' => 0,
+                                    '+' => 1,
+                                    _ => 2,
+                                };
+                                
+                                // First compare by rank, then alphabetically
+                                a_rank.cmp(&b_rank).then_with(|| {
+                                    let a_name = a.trim_start_matches(['@', '+']);
+                                    let b_name = b.trim_start_matches(['@', '+']);
+                                    a_name.to_lowercase().cmp(&b_name.to_lowercase())
+                                })
+                            });
+                            
                             rsx! {
                                 div {
                                     class: "section-title",
-                                    "Users"
+                                    style: "display:flex; justify-content:space-between; align-items:center; color: var(--status-connected);",
+                                    if !userlist_collapsed() {
+                                        "Users — {users.len()}"
+                                    }
+                                    button {
+                                        class: "collapse-btn",
+                                        onclick: move |_| {
+                                            userlist_collapsed.set(!userlist_collapsed());
+                                        },
+                                        if userlist_collapsed() { "‹" } else { "›" }
+                                    }
                                 }
-                                ul {
-                                    for user in state.read()
-                                        .servers
-                                        .get(&state.read().active_profile)
-                                        .and_then(|s| {
-                                            s.users_by_channel.get(&current_channel).cloned()
-                                        })
-                                        .unwrap_or_default() {
-                                        li {
-                                            div {
-                                                class: "row",
-                                                "{user}"
+                                if !userlist_collapsed() {
+                                    ul {
+                                        for user in users {
+                                        {
+                                            let first_char = user.chars().next().unwrap_or(' ');
+                                            let (symbol, color, username) = match first_char {
+                                                '@' => ("★", "#FFD700", user.trim_start_matches('@')),
+                                                '+' => ("◆", "#00CED1", user.trim_start_matches('+')),
+                                                _ => ("", "#CCCCCC", user.as_str()),
+                                            };
+                                            
+                                            rsx! {
+                                                li {
+                                                    div {
+                                                        class: "row",
+                                                        style: "display: flex; align-items: center;",
+                                                        if !symbol.is_empty() {
+                                                            span {
+                                                                style: "color: {color}; margin-right: 6px; font-weight: bold;",
+                                                                "{symbol}"
+                                                            }
+                                                        }
+                                                        span {
+                                                            "{username}"
+                                                        }
+                                                    }
+                                                }
                                             }
+                                        }
                                         }
                                     }
                                 }
                             }
                         }
                     }
+                }
+            }
                 }
             }
 
@@ -597,6 +867,8 @@ fn app() -> Element {
                                     history,
                                     history_index,
                                     cores,
+                                    profiles,
+                                    last_used,
                                 );
                             }
                             Key::ArrowUp => {
@@ -640,6 +912,8 @@ fn app() -> Element {
                             history,
                             history_index,
                             cores,
+                            profiles,
+                            last_used,
                         );
                     },
                     "Send"
@@ -706,6 +980,20 @@ fn app() -> Element {
                                 "Use TLS/SSL"
                             }
                         }
+                        div {
+                            class: "input",
+                            style: "display: flex; align-items: center; gap: 10px;",
+                            input {
+                                r#type: "checkbox",
+                                checked: "{new_auto_connect_input}",
+                                onchange: move |evt| {
+                                    new_auto_connect_input.set(evt.checked());
+                                },
+                            }
+                            label {
+                                "Auto-connect on startup"
+                            }
+                        }
                     }
                     div {
                         class: "modal-actions",
@@ -723,6 +1011,7 @@ fn app() -> Element {
                                 let nickname = new_nick_input.read().trim().to_string();
                                 let channel = new_channel_input.read().trim().to_string();
                                 let use_tls = *new_tls_input.read();
+                                let auto_connect = *new_auto_connect_input.read();
 
                                 if server.is_empty() || nickname.is_empty() {
                                     return;
@@ -735,6 +1024,7 @@ fn app() -> Element {
                                     nickname,
                                     channel,
                                     use_tls,
+                                    auto_connect,
                                 };
 
                                 let mut profs = profiles.write();
@@ -764,6 +1054,7 @@ fn app() -> Element {
                                 new_nick_input.set(String::new());
                                 new_channel_input.set(String::new());
                                 new_tls_input.set(true);
+                                new_auto_connect_input.set(true);
                                 show_new_profile.set(false);
                             },
                             "Create"
@@ -840,6 +1131,20 @@ fn app() -> Element {
                                 "Use TLS/SSL"
                             }
                         }
+                        div {
+                            class: "input",
+                            style: "display: flex; align-items: center; gap: 10px;",
+                            input {
+                                r#type: "checkbox",
+                                checked: "{edit_auto_connect_input}",
+                                onchange: move |evt| {
+                                    edit_auto_connect_input.set(evt.checked());
+                                },
+                            }
+                            label {
+                                "Auto-connect on startup"
+                            }
+                        }
                     }
                     div {
                         class: "modal-actions",
@@ -859,6 +1164,7 @@ fn app() -> Element {
                                 let nickname = edit_nick_input.read().trim().to_string();
                                 let channel = edit_channel_input.read().trim().to_string();
                                 let use_tls = *edit_tls_input.read();
+                                let auto_connect = *edit_auto_connect_input.read();
 
                                 if new_name.is_empty() || server.is_empty() || nickname.is_empty() {
                                     return;
@@ -873,6 +1179,7 @@ fn app() -> Element {
                                     profs[prof_idx].nickname = nickname.clone();
                                     profs[prof_idx].channel = channel.clone();
                                     profs[prof_idx].use_tls = use_tls;
+                                    profs[prof_idx].auto_connect = auto_connect;
                                     drop(profs);
 
                                     // Update server state with the new name and values
@@ -990,6 +1297,7 @@ fn app() -> Element {
                                             nickname: default_nick,
                                             channel: String::new(),
                                             use_tls: true,
+                                            auto_connect: true,
                                         };
 
                                         let mut profs = profiles.write();
@@ -1025,6 +1333,191 @@ fn app() -> Element {
                 }
             }
         }
+
+        // Channel Browser Modal
+        if show_channel_browser.read().clone() {
+            div {
+                class: "modal-backdrop",
+                onclick: move |_| {
+                    show_channel_browser.set(false);
+                },
+                div {
+                    class: "modal",
+                    style: "width:min(700px, 90vw); max-height:80vh;",
+                    onclick: move |evt| {
+                        evt.stop_propagation();
+                    },
+                    div {
+                        class: "modal-title",
+                        "Browse Channels"
+                    }
+                    div {
+                        class: "modal-body",
+                        style: "display:flex; flex-direction:column; gap:12px;",
+                        input {
+                            class: "input",
+                            r#type: "text",
+                            placeholder: "Search channels...",
+                            value: "{channel_search_input}",
+                            oninput: move |evt| {
+                                channel_search_input.set(evt.value());
+                            },
+                        }
+                        if *list_loading.read() {
+                            div {
+                                style: "text-align:center; padding:20px; color:var(--muted);",
+                                "Loading channel list..."
+                            }
+                        } else {
+                            div {
+                                style: "max-height:400px; overflow-y:auto;",
+                                {
+                                    let search_term = channel_search_input.read().to_lowercase();
+                                    let mut filtered_channels: Vec<_> = channel_list.read()
+                                        .iter()
+                                        .filter(|(name, _, topic)| {
+                                            if search_term.is_empty() {
+                                                true
+                                            } else {
+                                                name.to_lowercase().contains(&search_term) ||
+                                                topic.to_lowercase().contains(&search_term)
+                                            }
+                                        })
+                                        .cloned()
+                                        .collect();
+                                    
+                                    // Sort by user count descending
+                                    filtered_channels.sort_by(|a, b| b.1.cmp(&a.1));
+                                    
+                                    rsx! {
+                                        for (channel_name, user_count, topic) in filtered_channels.iter().take(100) {
+                                            {
+                                                let channel_name_clone = channel_name.clone();
+                                                let channel_name_for_join = channel_name.clone();
+                                                rsx! {
+                                                    div {
+                                                        key: "{channel_name}",
+                                                        class: "import-row",
+                                                        style: "cursor:pointer; padding:12px; border:1px solid var(--border); border-radius:8px; background:var(--panel);",
+                                                        onclick: move |_| {
+                                                            let active_profile_name = state.read().active_profile.clone();
+                                                            
+                                                            // Send JOIN command
+                                                            let cores_read = cores.read();
+                                                            if let Some(handle) = cores_read.get(&active_profile_name) {
+                                                                let cmd_tx = handle.cmd_tx.clone();
+                                                                let chan = channel_name_for_join.clone();
+                                                                drop(cores_read);
+                                                                spawn(async move {
+                                                                    let _ = cmd_tx.send(irc_client::IrcCommandEvent::Join {
+                                                                        channel: chan,
+                                                                    }).await;
+                                                                });
+                                                            } else {
+                                                                drop(cores_read);
+                                                            }
+                                                            
+                                                            // Update profile to add this channel to autojoin list
+                                                            let mut profs = profiles.write();
+                                                            if let Some(prof) = profs.iter_mut().find(|p| p.name == active_profile_name) {
+                                                                // Add channel to comma-separated list if not already present
+                                                                let channels: Vec<&str> = prof.channel.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                                                                if !channels.contains(&channel_name_clone.as_str()) {
+                                                                    if prof.channel.is_empty() {
+                                                                        prof.channel = channel_name_clone.clone();
+                                                                    } else {
+                                                                        prof.channel = format!("{},{}", prof.channel, channel_name_clone);
+                                                                    }
+                                                                }
+                                                            }
+                                                            drop(profs);
+                                                            
+                                                            // Save the store
+                                                            let store = profile::ProfileStore {
+                                                                profiles: profiles.read().clone(),
+                                                                last_used: last_used.read().clone(),
+                                                            };
+                                                            let _ = profile::save_store(&store);
+                                                            
+                                                            show_channel_browser.set(false);
+                                                        },
+                                                        div {
+                                                            class: "import-main",
+                                                            div {
+                                                                style: "display:flex; justify-content:space-between; align-items:center;",
+                                                                div {
+                                                                    class: "import-name",
+                                                                    style: "font-weight:600;",
+                                                                    "{channel_name}"
+                                                                }
+                                                                div {
+                                                                    style: "color:var(--muted); font-size:12px;",
+                                                                    "{user_count} users"
+                                                                }
+                                                            }
+                                                            if !topic.is_empty() {
+                                                                div {
+                                                                    class: "import-meta",
+                                                                    style: "margin-top:4px; font-size:12px; color:var(--muted);",
+                                                                    "{topic}"
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if filtered_channels.is_empty() && !search_term.is_empty() {
+                                            div {
+                                                style: "text-align:center; padding:20px; color:var(--muted);",
+                                                "No channels found matching \"{search_term}\""
+                                            }
+                                        }
+                                        if filtered_channels.len() > 100 {
+                                            div {
+                                                style: "text-align:center; padding:12px; color:var(--muted); font-size:12px;",
+                                                "Showing first 100 of {filtered_channels.len()} channels. Use search to refine."
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    div {
+                        class: "modal-actions",
+                        button {
+                            class: "send",
+                            onclick: move |_| {
+                                // Refresh channel list
+                                let active_profile = state.read().active_profile.clone();
+                                channel_list.set(Vec::new());
+                                list_loading.set(true);
+                                
+                                let cores_read = cores.read();
+                                if let Some(handle) = cores_read.get(&active_profile) {
+                                    let cmd_tx = handle.cmd_tx.clone();
+                                    drop(cores_read);
+                                    spawn(async move {
+                                        let _ = cmd_tx.send(irc_client::IrcCommandEvent::List).await;
+                                    });
+                                } else {
+                                    drop(cores_read);
+                                }
+                            },
+                            "Refresh"
+                        }
+                        button {
+                            class: "send",
+                            onclick: move |_| {
+                                show_channel_browser.set(false);
+                            },
+                            "Close"
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1035,6 +1528,8 @@ fn handle_send_message(
     mut history: Signal<Vec<String>>,
     mut history_index: Signal<Option<usize>>,
     cores: Signal<HashMap<String, irc_client::CoreHandle>>,
+    mut profiles: Signal<Vec<profile::Profile>>,
+    last_used: Signal<Option<String>>,
 ) {
     let text = text.trim().to_string();
     if text.is_empty() {
@@ -1087,8 +1582,32 @@ fn handle_send_message(
                     irc_client::apply_event(
                         &mut state.write(),
                         &active_profile,
-                        IrcEvent::Joined { channel: target },
+                        IrcEvent::Joined { channel: target.clone() },
                     );
+                    
+                    // Add channel to autojoin list
+                    let mut profs_mut = profiles.write();
+                    if let Some(prof) = profs_mut.iter_mut().find(|p| p.name == active_profile) {
+                        let channels: Vec<&str> = prof.channel.split(',').map(|s: &str| s.trim()).filter(|s: &&str| !s.is_empty()).collect();
+                        if !channels.contains(&target.as_str()) {
+                            if prof.channel.is_empty() {
+                                prof.channel = target.clone();
+                            } else {
+                                prof.channel = format!("{},{}", prof.channel, target);
+                            }
+                            // Save the updated profile
+                            drop(profs_mut);
+                            let store = profile::ProfileStore {
+                                profiles: profiles.read().clone(),
+                                last_used: last_used.read().clone(),
+                            };
+                            let _ = profile::save_store(&store);
+                        } else {
+                            drop(profs_mut);
+                        }
+                    } else {
+                        drop(profs_mut);
+                    }
                 }
             }
             "/part" => {
@@ -1111,8 +1630,29 @@ fn handle_send_message(
                 irc_client::apply_event(
                     &mut state.write(),
                     &active_profile,
-                    IrcEvent::Parted { channel: target },
+                    IrcEvent::Parted { channel: target.clone() },
                 );
+                
+                // Remove channel from autojoin list
+                let mut profs_mut = profiles.write();
+                if let Some(prof) = profs_mut.iter_mut().find(|p| p.name == active_profile) {
+                    let channels: Vec<String> = prof.channel
+                        .split(',')
+                        .map(|s: &str| s.trim())
+                        .filter(|s: &&str| !s.is_empty() && s != &target.as_str())
+                        .map(|s: &str| s.to_string())
+                        .collect();
+                    prof.channel = channels.join(",");
+                    drop(profs_mut);
+                    // Save the updated profile
+                    let store = profile::ProfileStore {
+                        profiles: profiles.read().clone(),
+                        last_used: last_used.read().clone(),
+                    };
+                    let _ = profile::save_store(&store);
+                } else {
+                    drop(profs_mut);
+                }
             }
             "/nick" => {
                 if arg.is_empty() {
@@ -1314,6 +1854,27 @@ fn connect_profile(
     }
 }
 
+fn username_color(username: &str) -> &'static str {
+    // 10 colors with good contrast on dark backgrounds
+    const COLORS: [&str; 10] = [
+        "#FF6B6B", // coral red
+        "#4ECDC4", // turquoise
+        "#FFE66D", // yellow
+        "#A8E6CF", // mint green
+        "#FF8B94", // pink
+        "#95E1D3", // seafoam
+        "#C7CEEA", // lavender
+        "#FFDAC1", // peach
+        "#B4A7D6", // purple
+        "#9BDEAC", // green
+    ];
+    
+    // Hash the username to get a consistent color
+    let hash = username.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
+    let index = (hash as usize) % COLORS.len();
+    COLORS[index]
+}
+
 fn message_view(msg: ChatMessage) -> Element {
     let system_class = if msg.is_system { " system" } else { "" };
     rsx! {
@@ -1329,6 +1890,7 @@ fn message_view(msg: ChatMessage) -> Element {
                     class: "message-meta",
                     span {
                         class: "user",
+                        style: "color: {username_color(&msg.user)};",
                         "{msg.user}"
                     }
                 }
@@ -1538,6 +2100,94 @@ body {
     overflow: hidden;
     min-height: 0;
     max-height: 100%;
+    transition: all 0.3s ease;
+}
+
+.channels.collapsed {
+    padding: 8px 4px;
+    align-items: center;
+}
+
+.channels.collapsed .section-title {
+    flex-direction: column;
+    align-items: center;
+    margin-bottom: 12px;
+}
+
+.channels.collapsed ul {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+}
+
+.channels.collapsed li {
+    margin-bottom: 0;
+}
+
+.channels.collapsed .row {
+    padding: 0;
+    background: transparent;
+    border: none;
+    width: auto;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.channels.collapsed .row:hover {
+    background: transparent;
+}
+
+.channel-icon {
+    width: 42px;
+    height: 42px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 600;
+    font-size: 16px;
+    color: white;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+    transition: all 0.2s;
+}
+
+.channel-icon:hover {
+    transform: scale(1.1);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.row.active .channel-icon {
+    box-shadow: 0 0 0 3px var(--accent);
+}
+
+.who.collapsed {
+    padding: 8px 4px;
+    align-items: center;
+}
+
+.who.collapsed .section-title {
+    writing-mode: vertical-rl;
+    text-orientation: mixed;
+    margin-bottom: 0;
+}
+
+.collapse-btn {
+    background: rgba(99, 102, 241, 0.1);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 4px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: bold;
+    transition: all 0.2s;
+}
+
+.collapse-btn:hover {
+    background: rgba(99, 102, 241, 0.2);
+    transform: scale(1.05);
 }
 
 .section-title {
