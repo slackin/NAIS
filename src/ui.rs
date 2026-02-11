@@ -52,10 +52,13 @@ fn app() -> Element {
     let mut new_server_input = use_signal(String::new);
     let mut new_nick_input = use_signal(String::new);
     let mut new_channel_input = use_signal(String::new);
+    let mut new_tls_input = use_signal(|| true);
 
+    let mut edit_name_input = use_signal(String::new);
     let mut edit_server_input = use_signal(String::new);
     let mut edit_nick_input = use_signal(String::new);
     let mut edit_channel_input = use_signal(String::new);
+    let mut edit_tls_input = use_signal(|| true);
 
     let mut search_input = use_signal(String::new);
 
@@ -102,7 +105,7 @@ fn app() -> Element {
         style { "{APP_STYLES}" }
 
         div {
-            style: "display:flex; flex-direction:column; min-height:100vh; background:var(--bg); color:var(--text); font-family:var(--font); gap:12px; padding:12px;",
+            style: "display:flex; flex-direction:column; height:100vh; background:var(--bg); color:var(--text); font-family:var(--font); gap:12px; padding:12px;",
 
             // Header
             div {
@@ -244,11 +247,13 @@ fn app() -> Element {
                                                 onclick: move |_| {
                                                     let prof_name_clone = prof_name_for_connect.clone();
                                                     let server_state = state.read().servers.get(&prof_name_clone).cloned();
-                                                    if let Some(ss) = server_state {
+                                                    let profile_data = profiles.read().iter().find(|p| p.name == prof_name_clone).cloned();
+                                                    if let (Some(ss), Some(prof)) = (server_state, profile_data) {
                                                         connect_profile(
                                                             ss.server.clone(),
                                                             ss.nickname.clone(),
                                                             ss.current_channel.clone(),
+                                                            prof.use_tls,
                                                             prof_name_clone.clone(),
                                                             state,
                                                             profiles,
@@ -266,24 +271,18 @@ fn app() -> Element {
                                                 class: "menu-item",
                                                 onclick: move |_| {
                                                     state.write().active_profile = prof_name_for_edit.clone();
-                                                    edit_server_input.set(
-                                                        state.read().servers
-                                                            .get(&state.read().active_profile)
-                                                            .map(|s| s.server.clone())
-                                                            .unwrap_or_default()
-                                                    );
-                                                    edit_nick_input.set(
-                                                        state.read().servers
-                                                            .get(&state.read().active_profile)
-                                                            .map(|s| s.nickname.clone())
-                                                            .unwrap_or_default()
-                                                    );
-                                                    edit_channel_input.set(
-                                                        state.read().servers
-                                                            .get(&state.read().active_profile)
-                                                            .map(|s| s.current_channel.clone())
-                                                            .unwrap_or_default()
-                                                    );
+                                                    
+                                                    // Get the current profile from profiles list
+                                                    let profs = profiles.read();
+                                                    if let Some(profile) = profs.iter().find(|p| p.name == prof_name_for_edit) {
+                                                        edit_name_input.set(profile.name.clone());
+                                                        edit_server_input.set(profile.server.clone());
+                                                        edit_nick_input.set(profile.nickname.clone());
+                                                        edit_channel_input.set(profile.channel.clone());
+                                                        edit_tls_input.set(profile.use_tls);
+                                                    }
+                                                    drop(profs);
+                                                    
                                                     show_edit_profile.set(true);
                                                     profile_menu_open.set(None);
                                                 },
@@ -693,6 +692,20 @@ fn app() -> Element {
                                 new_channel_input.set(evt.value());
                             },
                         }
+                        div {
+                            class: "input",
+                            style: "display: flex; align-items: center; gap: 10px;",
+                            input {
+                                r#type: "checkbox",
+                                checked: "{new_tls_input}",
+                                onchange: move |evt| {
+                                    new_tls_input.set(evt.checked());
+                                },
+                            }
+                            label {
+                                "Use TLS/SSL"
+                            }
+                        }
                     }
                     div {
                         class: "modal-actions",
@@ -709,6 +722,7 @@ fn app() -> Element {
                                 let server = new_server_input.read().trim().to_string();
                                 let nickname = new_nick_input.read().trim().to_string();
                                 let channel = new_channel_input.read().trim().to_string();
+                                let use_tls = *new_tls_input.read();
 
                                 if server.is_empty() || nickname.is_empty() {
                                     return;
@@ -720,6 +734,7 @@ fn app() -> Element {
                                     server,
                                     nickname,
                                     channel,
+                                    use_tls,
                                 };
 
                                 let mut profs = profiles.write();
@@ -748,6 +763,7 @@ fn app() -> Element {
                                 new_server_input.set(String::new());
                                 new_nick_input.set(String::new());
                                 new_channel_input.set(String::new());
+                                new_tls_input.set(true);
                                 show_new_profile.set(false);
                             },
                             "Create"
@@ -777,6 +793,15 @@ fn app() -> Element {
                         input {
                             class: "input",
                             r#type: "text",
+                            placeholder: "Profile Name",
+                            value: "{edit_name_input}",
+                            oninput: move |evt| {
+                                edit_name_input.set(evt.value());
+                            },
+                        }
+                        input {
+                            class: "input",
+                            r#type: "text",
                             placeholder: "Server",
                             value: "{edit_server_input}",
                             oninput: move |evt| {
@@ -801,6 +826,20 @@ fn app() -> Element {
                                 edit_channel_input.set(evt.value());
                             },
                         }
+                        div {
+                            class: "input",
+                            style: "display: flex; align-items: center; gap: 10px;",
+                            input {
+                                r#type: "checkbox",
+                                checked: "{edit_tls_input}",
+                                onchange: move |evt| {
+                                    edit_tls_input.set(evt.checked());
+                                },
+                            }
+                            label {
+                                "Use TLS/SSL"
+                            }
+                        }
                     }
                     div {
                         class: "modal-actions",
@@ -815,25 +854,75 @@ fn app() -> Element {
                             class: "send",
                             onclick: move |_| {
                                 let active_prof = state.read().active_profile.clone();
+                                let new_name = edit_name_input.read().trim().to_string();
                                 let server = edit_server_input.read().trim().to_string();
                                 let nickname = edit_nick_input.read().trim().to_string();
                                 let channel = edit_channel_input.read().trim().to_string();
+                                let use_tls = *edit_tls_input.read();
 
-                                if server.is_empty() || nickname.is_empty() {
+                                if new_name.is_empty() || server.is_empty() || nickname.is_empty() {
                                     return;
                                 }
 
                                 let prof_idx_opt = profiles.read().iter().position(|p| p.name == active_prof);
                                 if let Some(prof_idx) = prof_idx_opt {
+                                    let old_name = active_prof.clone();
                                     let mut profs = profiles.write();
+                                    profs[prof_idx].name = new_name.clone();
                                     profs[prof_idx].server = server.clone();
                                     profs[prof_idx].nickname = nickname.clone();
                                     profs[prof_idx].channel = channel.clone();
+                                    profs[prof_idx].use_tls = use_tls;
                                     drop(profs);
 
-                                    if let Some(server_state) = state.write().servers.get_mut(&active_prof) {
-                                        server_state.server = server.clone();
-                                        server_state.nickname = nickname.clone();
+                                    // Update server state with the new name and values
+                                    let mut state_mut = state.write();
+                                    if let Some(server_state) = state_mut.servers.remove(&old_name) {
+                                        let mut updated_state = server_state;
+                                        updated_state.server = server.clone();
+                                        updated_state.nickname = nickname.clone();
+                                        state_mut.servers.insert(new_name.clone(), updated_state);
+                                    }
+                                    
+                                    // Update active profile if it was the one being edited
+                                    if state_mut.active_profile == old_name {
+                                        state_mut.active_profile = new_name.clone();
+                                    }
+                                    drop(state_mut);
+                                    
+                                    // Update cores map
+                                    if old_name != new_name {
+                                        let mut cores_mut = cores.write();
+                                        if let Some(core_handle) = cores_mut.remove(&old_name) {
+                                            cores_mut.insert(new_name.clone(), core_handle);
+                                        }
+                                        drop(cores_mut);
+                                        
+                                        // Update skip_reconnect map
+                                        let mut skip_mut = skip_reconnect.write();
+                                        if let Some(skip_val) = skip_mut.remove(&old_name) {
+                                            skip_mut.insert(new_name.clone(), skip_val);
+                                        }
+                                        drop(skip_mut);
+                                        
+                                        // Update profile_status map
+                                        let mut status_mut = profile_status.write();
+                                        if let Some(status_val) = status_mut.remove(&old_name) {
+                                            status_mut.insert(new_name.clone(), status_val);
+                                        }
+                                        drop(status_mut);
+                                        
+                                        // Update show_server_log map
+                                        let mut log_mut = show_server_log.write();
+                                        if let Some(log_val) = log_mut.remove(&old_name) {
+                                            log_mut.insert(new_name.clone(), log_val);
+                                        }
+                                        drop(log_mut);
+                                    }
+
+                                    // Update last_used if it was the old name
+                                    if last_used.read().as_ref() == Some(&old_name) {
+                                        last_used.set(Some(new_name.clone()));
                                     }
 
                                     let mut store = profile::ProfileStore {
@@ -900,6 +989,7 @@ fn app() -> Element {
                                             server: server.to_string(),
                                             nickname: default_nick,
                                             channel: String::new(),
+                                            use_tls: true,
                                         };
 
                                         let mut profs = profiles.write();
@@ -1196,6 +1286,7 @@ fn connect_profile(
     server: String,
     nickname: String,
     channel: String,
+    use_tls: bool,
     profile_name: String,
     mut state: Signal<irc_client::AppState>,
     _profiles: Signal<Vec<profile::Profile>>,
@@ -1214,6 +1305,7 @@ fn connect_profile(
         server,
         nickname,
         channel,
+        use_tls,
     });
 
     let mut state_mut = state.write();
@@ -1433,6 +1525,7 @@ body {
     gap: 12px;
     flex: 1;
     overflow: hidden;
+    min-height: 0;
 }
 
 .channels, .who {
@@ -1443,6 +1536,8 @@ body {
     border-radius: 12px;
     padding: 12px;
     overflow: hidden;
+    min-height: 0;
+    max-height: 100%;
 }
 
 .section-title {
@@ -1498,6 +1593,8 @@ body {
     border-radius: 12px;
     padding: 12px;
     overflow: hidden;
+    min-height: 0;
+    max-height: 100%;
 }
 
 .chat-header {

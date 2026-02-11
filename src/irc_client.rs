@@ -48,6 +48,7 @@ pub struct ConnectInfo {
     pub server: String,
     pub nickname: String,
     pub channel: String,
+    pub use_tls: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +68,7 @@ pub enum IrcCommandEvent {
         server: String,
         nickname: String,
         channel: String,
+        use_tls: bool,
     },
     Join {
         channel: String,
@@ -263,11 +265,13 @@ async fn core_loop(cmd_rx: Receiver<IrcCommandEvent>, evt_tx: Sender<IrcEvent>) 
                 server,
                 nickname,
                 channel,
+                use_tls,
             } => {
                 if let Err(error) = handle_connection(
                     &server,
                     &nickname,
                     &channel,
+                    use_tls,
                     &command_rx,
                     &evt_tx,
                 )
@@ -302,30 +306,43 @@ async fn handle_connection(
     server: &str,
     nickname: &str,
     channel: &str,
+    use_tls: bool,
     cmd_rx: &Receiver<IrcCommandEvent>,
     evt_tx: &Sender<IrcEvent>,
 ) -> Result<(), Box<dyn Error>> {
     let self_nick = nickname.to_string();
     let default_channel = channel.to_string();
     
+    // Determine port and log connection type
+    let port = if use_tls { 6697 } else { 6667 };
+    let connection_type = if use_tls { "with TLS" } else { "without TLS (plaintext)" };
+    
     // Log connection attempt
     let _ = evt_tx
         .send(IrcEvent::System {
             channel: channel.to_string(),
-            text: format!("[IRC] Configuring connection to {}:6697 with TLS", server),
+            text: format!("[IRC] Configuring connection to {}:{} {}", server, port, connection_type),
         })
         .await;
     
     let mut config = Config::default();
     config.server = Some(server.to_string());
     config.nickname = Some(nickname.to_string());
-    config.port = Some(6697);
-    config.use_tls = Some(true);
+    config.port = Some(port);
+    config.use_tls = Some(use_tls);
+    // Set very long PING timeouts (in seconds) instead of None
+    config.ping_time = Some(300); // Send PING every 5 minutes
+    config.ping_timeout = Some(600); // Timeout after 10 minutes
+    // Set a real name to avoid potential issues
+    config.realname = Some(nickname.to_string());
+    config.username = Some(nickname.to_string());
+    // Disable ghost checking
+    config.should_ghost = false;
 
     let _ = evt_tx
         .send(IrcEvent::System {
             channel: channel.to_string(),
-            text: format!("[IRC] Attempting TLS connection to {}:6697...", server),
+            text: format!("[IRC] Attempting {} connection to {}:{}...", if use_tls { "TLS" } else { "plaintext" }, server, port),
         })
         .await;
 
@@ -334,27 +351,20 @@ async fn handle_connection(
     let _ = evt_tx
         .send(IrcEvent::System {
             channel: channel.to_string(),
-            text: format!("[IRC] TCP/TLS connection established, sending identification"),
-        })
-        .await;
-    
-    client.identify()?;
-    
-    let _ = evt_tx
-        .send(IrcEvent::System {
-            channel: channel.to_string(),
-            text: format!("[IRC] Sent: NICK {}", nickname),
-        })
-        .await;
-    
-    let _ = evt_tx
-        .send(IrcEvent::System {
-            channel: channel.to_string(),
-            text: format!("[IRC] Sent: USER {} 0 * :{}", nickname, nickname),
+            text: format!("[IRC] {} connection established, getting message stream", if use_tls { "TCP/TLS" } else { "TCP" }),
         })
         .await;
     
     let mut stream = client.stream()?;
+    
+    let _ = evt_tx
+        .send(IrcEvent::System {
+            channel: channel.to_string(),
+            text: format!("[IRC] Sending identification"),
+        })
+        .await;
+    
+    client.identify()?;
 
     evt_tx
         .send(IrcEvent::Connected {
@@ -362,14 +372,9 @@ async fn handle_connection(
         })
         .await?;
 
-    let _ = evt_tx
-        .send(IrcEvent::System {
-            channel: channel.to_string(),
-            text: format!("[IRC] Sent: JOIN {}", channel),
-        })
-        .await;
-
-    client.send_join(channel)?;
+    let mut consecutive_errors = 0;
+    const MAX_CONSECUTIVE_ERRORS: u32 = 10;
+    let mut auto_joined = false;
 
     loop {
         tokio02::select! {
@@ -475,14 +480,46 @@ async fn handle_connection(
                     break;
                 };
                 let message = match message {
-                    Ok(message) => message,
+                    Ok(message) => {
+                        consecutive_errors = 0; // Reset error count on success
+                        message
+                    }
                     Err(error) => {
+                        let error_str = error.to_string();
+                        
+                        // Connection reset is fatal - don't retry
+                        if error_str.contains("connection reset") || error_str.contains("broken pipe") {
+                            let _ = evt_tx
+                                .send(IrcEvent::System {
+                                    channel: channel.to_string(),
+                                    text: format!("Connection error: {error}"),
+                                })
+                                .await;
+                            let _ = evt_tx.send(IrcEvent::Disconnected).await;
+                            break;
+                        }
+                        
+                        consecutive_errors += 1;
                         let _ = evt_tx
                             .send(IrcEvent::System {
                                 channel: channel.to_string(),
                                 text: format!("Stream error: {error}"),
                             })
                             .await;
+                        
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                            let _ = evt_tx
+                                .send(IrcEvent::System {
+                                    channel: channel.to_string(),
+                                    text: format!("Too many consecutive errors ({}), disconnecting", consecutive_errors),
+                                })
+                                .await;
+                            let _ = evt_tx.send(IrcEvent::Disconnected).await;
+                            break;
+                        }
+                        
+                        // Add a small delay to prevent tight error loop
+                        tokio02::time::delay_for(Duration::from_millis(100)).await;
                         continue;
                     }
                 };
@@ -494,6 +531,19 @@ async fn handle_connection(
                         text: format!("[IRC] Recv: {}", message),
                     })
                     .await;
+                
+                // Handle PING/PONG immediately
+                if let IrcCommand::PING(ref server, ref server2) = message.command {
+                    let pong_target = server2.as_ref().unwrap_or(server);
+                    let _ = client.send(IrcCommand::PONG(pong_target.clone(), None));
+                    let _ = evt_tx
+                        .send(IrcEvent::System {
+                            channel: default_channel.clone(),
+                            text: format!("[IRC] Sent: PONG {}", pong_target),
+                        })
+                        .await;
+                    continue;
+                }
                 
                 match message.command {
                     IrcCommand::PRIVMSG(ref target, ref body) => {
@@ -568,6 +618,32 @@ async fn handle_connection(
                                 text: detail,
                             })
                             .await;
+                    }
+                    IrcCommand::Response(Response::RPL_UMODEIS, _) => {
+                        // User mode response (221) - we're fully connected, trigger auto-join
+                        if !auto_joined && !default_channel.is_empty() {
+                            auto_joined = true;
+                            let _ = evt_tx
+                                .send(IrcEvent::System {
+                                    channel: default_channel.clone(),
+                                    text: format!("[IRC] Sent: JOIN {}", default_channel),
+                                })
+                                .await;
+                            let _ = client.send_join(&default_channel);
+                        }
+                    }
+                    IrcCommand::Response(Response::RPL_ENDOFMOTD, _) => {
+                        // End of MOTD - now we can join the channel
+                        if !auto_joined && !default_channel.is_empty() {
+                            auto_joined = true;
+                            let _ = evt_tx
+                                .send(IrcEvent::System {
+                                    channel: default_channel.clone(),
+                                    text: format!("[IRC] Sent: JOIN {}", default_channel),
+                                })
+                                .await;
+                            let _ = client.send_join(&default_channel);
+                        }
                     }
                     IrcCommand::Response(Response::RPL_NAMREPLY, ref args) => {
                         if args.len() >= 4 {
@@ -672,7 +748,6 @@ async fn handle_connection(
                 }
             }
         }
-        tokio02::time::delay_for(Duration::from_millis(10)).await;
     }
 
     Ok(())

@@ -8,6 +8,12 @@ pub struct Profile {
     pub server: String,
     pub nickname: String,
     pub channel: String,
+    #[serde(default = "default_use_tls")]
+    pub use_tls: bool,
+}
+
+fn default_use_tls() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -27,6 +33,7 @@ impl Default for Profile {
             server,
             nickname,
             channel,
+            use_tls: true,
         }
     }
 }
@@ -68,6 +75,7 @@ pub fn load_store() -> ProfileStore {
             server: legacy.server,
             nickname: legacy.nickname,
             channel: legacy.channel,
+            use_tls: legacy.use_tls,
         };
         store.profiles = vec![profile.clone()];
         store.last_used = Some(profile.name.clone());
