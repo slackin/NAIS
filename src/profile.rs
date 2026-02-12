@@ -2,6 +2,21 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+// Get system username as default nickname
+fn get_system_username() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "nais".to_string())
+}
+
+// Generate fallback nicknames
+pub fn generate_fallback_nicknames(base: &str) -> Vec<String> {
+    vec![
+        format!("{}_", base),
+        format!("{}`", base),
+    ]
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Profile {
     pub name: String,
@@ -12,6 +27,12 @@ pub struct Profile {
     pub use_tls: bool,
     #[serde(default = "default_auto_connect")]
     pub auto_connect: bool,
+    #[serde(default = "default_enable_logging")]
+    pub enable_logging: bool,
+    #[serde(default = "default_scrollback_limit")]
+    pub scrollback_limit: usize,
+    #[serde(default = "default_log_buffer_size")]
+    pub log_buffer_size: usize,
 }
 
 fn default_use_tls() -> bool {
@@ -22,16 +43,35 @@ fn default_auto_connect() -> bool {
     true
 }
 
+fn default_enable_logging() -> bool {
+    true
+}
+
+fn default_scrollback_limit() -> usize {
+    1000
+}
+
+fn default_log_buffer_size() -> usize {
+    1000
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProfileStore {
     pub profiles: Vec<Profile>,
     pub last_used: Option<String>,
+    #[serde(default)]
+    pub default_nickname: Option<String>,
 }
 
 impl Default for Profile {
     fn default() -> Self {
+        Self::with_nickname(get_system_username())
+    }
+}
+
+impl Profile {
+    pub fn with_nickname(nickname: String) -> Self {
         let server = "irc.libera.chat".to_string();
-        let nickname = "nais".to_string();
         let channel = "#general".to_string();
         let name = profile_name(&server, &nickname, &channel);
         Self {
@@ -41,6 +81,9 @@ impl Default for Profile {
             channel,
             use_tls: true,
             auto_connect: true,
+            enable_logging: true,
+            scrollback_limit: 1000,
+            log_buffer_size: 1000,
         }
     }
 }
@@ -51,6 +94,7 @@ impl Default for ProfileStore {
         Self {
             profiles: vec![profile.clone()],
             last_used: Some(profile.name.clone()),
+            default_nickname: None,
         }
     }
 }
@@ -84,6 +128,9 @@ pub fn load_store() -> ProfileStore {
             channel: legacy.channel,
             use_tls: legacy.use_tls,
             auto_connect: legacy.auto_connect,
+            enable_logging: legacy.enable_logging,
+            scrollback_limit: legacy.scrollback_limit,
+            log_buffer_size: legacy.log_buffer_size,
         };
         store.profiles = vec![profile.clone()];
         store.last_used = Some(profile.name.clone());
