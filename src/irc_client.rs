@@ -40,7 +40,9 @@ pub struct ServerState {
     pub channels: Vec<String>,
     pub users_by_channel: HashMap<String, Vec<String>>,
     pub messages: Vec<ChatMessage>,
+    #[allow(dead_code)]
     pub auto_reconnect: bool,
+    #[allow(dead_code)]
     pub last_connect: Option<ConnectInfo>,
     pub connection_log: Vec<String>,
     pub cached_channel_list: Vec<(String, u32, String)>,
@@ -53,6 +55,7 @@ pub struct AppState {
     pub servers: HashMap<String, ServerState>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ConnectInfo {
     pub server: String,
@@ -134,6 +137,7 @@ pub enum IrcCommandEvent {
     Away {
         message: Option<String>,
     },
+    #[allow(dead_code)]
     Disconnect,
 }
 
@@ -1265,7 +1269,7 @@ async fn handle_connection(
                     IrcCommand::Response(Response::RPL_LISTEND, _) => {
                         let _ = evt_tx.send(IrcEvent::ChannelListEnd).await;
                     }
-                    IrcCommand::Response(Response::ERR_NICKNAMEINUSE, ref args) => {
+                    IrcCommand::Response(Response::ERR_NICKNAMEINUSE, ref _args) => {
                         // Nickname is already in use, try a fallback
                         if nick_attempt < fallback_nicks.len() {
                             let new_nick = fallback_nicks[nick_attempt].clone();

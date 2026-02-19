@@ -1,0 +1,16 @@
+[application]
+name = "nais_client"
+default_platform = "desktop"
+
+[application.desktop]
+window_title = "NAIS Client"
+
+[application.mobile]
+android_min_sdk = 24
+android_target_sdk = 34
+
+[application.mobile.android]
+permissions = [
+    "android.permission.INTERNET",
+    "android.permission.ACCESS_NETWORK_STATE",
+]

@@ -158,6 +158,7 @@ pub fn select_profile(store: &ProfileStore) -> Profile {
     store.profiles.first().cloned().unwrap_or_default()
 }
 
+#[allow(dead_code)]
 pub fn upsert_profile(store: &mut ProfileStore, profile: Profile) {
     if let Some(existing) = store
         .profiles
@@ -171,6 +172,7 @@ pub fn upsert_profile(store: &mut ProfileStore, profile: Profile) {
     store.last_used = Some(profile.name);
 }
 
+#[allow(dead_code)]
 pub fn remove_profile(store: &mut ProfileStore, name: &str) {
     store.profiles.retain(|profile| profile.name != name);
     if store.profiles.is_empty() {

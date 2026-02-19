@@ -3,25 +3,32 @@ name = "nais_client"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["desktop"]
+desktop = ["dioxus/desktop", "dep:rfd", "dep:arboard"]
+mobile = ["dioxus/mobile"]
+
 [dependencies]
 tokio02 = { package = "tokio", version = "0.2", features = ["rt-threaded", "macros", "time"] }
 irc = "0.14"
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
-env_logger = "0.10"
-dioxus = { version = "0.5", features = ["desktop"] }
+env_logger = "0.11"
+dioxus = "0.7"
 async-channel = "2"
 futures = "0.3"
 futures-timer = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-dirs = "5"
+dirs = "6"
 chrono = "0.4"
-reqwest = { version = "0.11", features = ["multipart", "json"] }
-scraper = "0.19"
-lazy_static = "1.4"
+reqwest = { version = "0.12", features = ["multipart", "json"] }
+scraper = "0.25"
+lazy_static = "1.5"
 url = "2"
-rfd = "0.14"
-arboard = "3"
-image = "0.24"
+image = "0.25"
 base64 = "0.22"
+
+# Desktop-only dependencies
+rfd = { version = "0.17", optional = true }
+arboard = { version = "3.6", optional = true }

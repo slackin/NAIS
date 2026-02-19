@@ -1,11 +1,11 @@
-use dioxus::events::Key;
 use dioxus::prelude::*;
+use dioxus::document;
 use futures_timer::Delay;
 use std::collections::HashMap;
 use std::time::Duration;
 use scraper::{Html, Selector};
 use std::sync::{Arc, Mutex};
-use arboard::Clipboard;
+#[allow(unused_imports)]
 use image::ImageBuffer;
 use std::fs;
 use std::path::PathBuf;
@@ -17,6 +17,45 @@ use crate::profile;
 
 pub fn run() {
     dioxus::launch(app);
+}
+
+// Desktop-only file picker button component
+#[cfg(feature = "desktop")]
+fn file_picker_button(input: Signal<String>) -> Element {
+    rsx! {
+        button {
+            class: "send",
+            style: "padding: 8px 12px; min-width: unset;",
+            onclick: move |_| {
+                if let Some(result) = rfd::FileDialog::new()
+                    .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp"])
+                    .pick_file() {
+                    let mut input_clone = input.clone();
+                    spawn(async move {
+                        if let Ok(bytes) = std::fs::read(&result) {
+                            println!("Uploading image: {} bytes", bytes.len());
+                            if let Some(url) = upload_simple_image(bytes).await {
+                                let current = input_clone.read().clone();
+                                let new_text = if current.is_empty() {
+                                    url
+                                } else {
+                                    format!("{} {}", current, url)
+                                };
+                                input_clone.set(new_text);
+                            }
+                        }
+                    });
+                }
+            },
+            "📎"
+        }
+    }
+}
+
+// Mobile stub for file picker (not yet implemented)
+#[cfg(not(feature = "desktop"))]
+fn file_picker_button(_input: Signal<String>) -> Element {
+    rsx! {}
 }
 
 // Helper function to apply IRC event with profile-specific config
@@ -37,7 +76,7 @@ fn apply_event_with_config(
 fn app() -> Element {
     let store = profile::load_store();
     let initial_profile = profile::select_profile(&store);
-    let mut default_nick = use_signal(|| store.default_nickname.clone());
+    let default_nick = use_signal(|| store.default_nickname.clone());
 
     let mut state = use_signal(|| {
         let mut servers = HashMap::new();
@@ -65,7 +104,7 @@ fn app() -> Element {
     let mut show_server_log: Signal<HashMap<String, bool>> = use_signal(HashMap::new);
 
     let mut input = use_signal(|| String::new());
-    let mut history = use_signal(Vec::new);
+    let history = use_signal(Vec::new);
     let mut history_index = use_signal(|| None::<usize>);
 
     let mut show_new_profile = use_signal(|| false);
@@ -94,7 +133,7 @@ fn app() -> Element {
         if show_first_run_setup() {
             spawn(async move {
                 Delay::new(Duration::from_millis(100)).await;
-                let _ = eval(
+                let _ = document::eval(
                     r#"
                     const input = document.getElementById('first-run-nick-input');
                     if (input) {
@@ -157,7 +196,7 @@ fn app() -> Element {
         if should_scroll {
             spawn(async move {
                 Delay::new(Duration::from_millis(10)).await;
-                let _ = eval(
+                let _ = document::eval(
                     r#"
                     const messagesDiv = document.querySelector('.messages');
                     if (messagesDiv) {
@@ -395,7 +434,7 @@ fn app() -> Element {
                     { 
                         let profile_list: Vec<_> = profiles.read().iter().cloned().collect();
                         rsx! {
-                            for (idx, prof) in profile_list.into_iter().enumerate() {
+                            for (_idx, prof) in profile_list.into_iter().enumerate() {
                                 {
                                     let prof_name = prof.name.clone();
                                     let prof_name_for_menu = prof.name.clone();
@@ -425,7 +464,7 @@ fn app() -> Element {
                                                     state.write().active_profile = prof_name.clone();
                                                     profile_menu_open.set(None);
                                                     // Focus the chat input
-                                                    let _ = eval(
+                                                    let _ = document::eval(
                                                         r#"
                                                         const input = document.getElementById('chat-input');
                                                         if (input) input.focus();
@@ -605,7 +644,7 @@ fn app() -> Element {
                                                         }
                                                         drop(state_mut);
 
-                                                        let mut store = profile::ProfileStore {
+                                                        let store = profile::ProfileStore {
                                                             profiles: profiles.read().clone(),
                                                             last_used: last_used.read().clone(),
                                                             default_nickname: default_nick.read().clone(),
@@ -743,7 +782,7 @@ fn app() -> Element {
                                                         // Force scroll to bottom on channel change
                                                         force_scroll_to_bottom.set(true);
                                                         // Focus the chat input
-                                                        let _ = eval(
+                                                        let _ = document::eval(
                                                             r#"
                                                             const input = document.getElementById('chat-input');
                                                             if (input) input.focus();
@@ -837,7 +876,7 @@ fn app() -> Element {
                         onscroll: move |_evt| {
                             // Detect if user is at the bottom of scroll
                             spawn(async move {
-                                if let Ok(result) = eval(
+                                if let Ok(result) = document::eval(
                                     r#"
                                     const messagesDiv = document.querySelector('.messages');
                                     if (messagesDiv) {
@@ -845,7 +884,7 @@ fn app() -> Element {
                                         dioxus.send(isAtBottom);
                                     }
                                     "#
-                                ).recv().await {
+                                ).recv::<serde_json::Value>().await {
                                     if let Some(is_bottom) = result.as_bool() {
                                         is_at_bottom.set(is_bottom);
                                     }
@@ -1084,7 +1123,7 @@ fn app() -> Element {
                                 );
                             }
                             Key::ArrowUp => {
-                                let mut hist = history.read();
+                                let hist = history.read();
                                 let current_idx = *history_index.read();
                                 let next_idx = match current_idx {
                                     None => hist.len().saturating_sub(1),
@@ -1112,62 +1151,9 @@ fn app() -> Element {
                             _ => {}
                         }
                     },
-                    onpaste: move |_| {
-                        let mut input_signal = input.clone();
-                        spawn(async move {
-                            if let Ok(mut clipboard) = Clipboard::new() {
-                                if let Ok(img) = clipboard.get_image() {
-                                    let width = img.width as u32;
-                                    let height = img.height as u32;
-                                    let rgba_data = img.bytes.into_owned();
-                                    
-                                    if let Some(img_buffer) = ImageBuffer::<image::Rgba<u8>, _>::from_raw(width, height, rgba_data) {
-                                        let mut png_bytes = Vec::new();
-                                        if image::DynamicImage::ImageRgba8(img_buffer)
-                                            .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
-                                            .is_ok() {
-                                            if let Some(url) = upload_simple_image(png_bytes).await {
-                                                let current = input_signal.read().clone();
-                                                let new_text = if current.is_empty() {
-                                                    url
-                                                } else {
-                                                    format!("{} {}", current, url)
-                                                };
-                                                input_signal.set(new_text);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                    },
                 }
-                button {
-                    class: "send",
-                    style: "padding: 8px 12px; min-width: unset;",
-                    onclick: move |_| {
-                        // Trigger file picker
-                        if let Some(result) = rfd::FileDialog::new()
-                            .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp"])
-                            .pick_file() {
-                            let mut input_clone = input.clone();
-                            spawn(async move {
-                                if let Ok(bytes) = std::fs::read(&result) {
-                                    println!("Uploading image: {} bytes", bytes.len());
-                                    if let Some(url) = upload_simple_image(bytes).await {
-                                        let current = input_clone.read().clone();
-                                        let new_text = if current.is_empty() {
-                                            url
-                                        } else {
-                                            format!("{} {}", current, url)
-                                        };
-                                        input_clone.set(new_text);
-                                    }
-                                }
-                            });
-                        }
-                    },
-                    "📎"
+                if cfg!(feature = "desktop") {
+                    {file_picker_button(input)}
                 }
                 button {
                     class: "send",
@@ -1228,7 +1214,7 @@ fn app() -> Element {
                                 first_run_nick_input.set(evt.value());
                             },
                             onkeydown: move |evt| {
-                                if evt.key() == dioxus::events::Key::Enter {
+                                if evt.key() == Key::Enter {
                                     let nick = first_run_nick_input.read().trim().to_string();
                                     if !nick.is_empty() {
                                         let mut store_mut = profile::ProfileStore {
@@ -1246,14 +1232,14 @@ fn app() -> Element {
                                         profiles.set(store_mut.profiles.clone());
                                         
                                         // Update state with new nicknames
-                                        for (profile_name, server_state) in state.write().servers.iter_mut() {
+                                        for (_profile_name, server_state) in state.write().servers.iter_mut() {
                                             server_state.nickname = nick.clone();
                                         }
                                         
                                         show_first_run_setup.set(false);
                                         
                                         // Focus the chat input
-                                        let _ = eval(
+                                        let _ = document::eval(
                                             r#"
                                             const input = document.getElementById('chat-input');
                                             if (input) input.focus();
@@ -1286,14 +1272,14 @@ fn app() -> Element {
                                     profiles.set(store_mut.profiles.clone());
                                     
                                     // Update state with new nicknames
-                                    for (profile_name, server_state) in state.write().servers.iter_mut() {
+                                    for (_profile_name, server_state) in state.write().servers.iter_mut() {
                                         server_state.nickname = nick.clone();
                                     }
                                     
                                     show_first_run_setup.set(false);
                                     
                                     // Focus the chat input
-                                    let _ = eval(
+                                    let _ = document::eval(
                                         r#"
                                         const input = document.getElementById('chat-input');
                                         if (input) input.focus();
@@ -1433,7 +1419,7 @@ fn app() -> Element {
                                 );
                                 drop(state_mut);
 
-                                let mut store = profile::ProfileStore {
+                                let store = profile::ProfileStore {
                                     profiles: profiles.read().clone(),
                                     last_used: last_used.read().clone(),
                                     default_nickname: default_nick.read().clone(),
@@ -1622,7 +1608,7 @@ fn app() -> Element {
                                         last_used.set(Some(new_name.clone()));
                                     }
 
-                                    let mut store = profile::ProfileStore {
+                                    let store = profile::ProfileStore {
                                         profiles: profiles.read().clone(),
                                         last_used: last_used.read().clone(),
                                         default_nickname: default_nick.read().clone(),
@@ -1711,7 +1697,7 @@ fn app() -> Element {
                                         );
                                         drop(state_mut);
 
-                                        let mut store = profile::ProfileStore {
+                                        let store = profile::ProfileStore {
                                             profiles: profiles.read().clone(),
                                             last_used: last_used.read().clone(),
                                             default_nickname: Some(default_nick.clone()),
@@ -3201,6 +3187,7 @@ fn extract_youtube_id(url: &str) -> Option<String> {
 }
 
 // Upload image using simple file hosting (no API key needed)
+#[allow(dead_code)]
 async fn upload_simple_image(image_data: Vec<u8>) -> Option<String> {
     println!("Starting image upload, size: {} bytes", image_data.len());
     
@@ -3416,23 +3403,33 @@ fn extract_media_content(text: &str) -> Vec<MediaItem> {
     
     // Simple URL extraction - look for http(s):// followed by non-whitespace
     for word in text.split_whitespace() {
-        if word.starts_with("http://") || word.starts_with("https://") {
+        // Strip common punctuation/wrapping characters from URLs
+        let cleaned_word = word
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .trim_end_matches(',')
+            .trim_end_matches('.')
+            .trim_end_matches(';')
+            .trim_end_matches(')')
+            .trim_start_matches('(');
+        
+        if cleaned_word.starts_with("http://") || cleaned_word.starts_with("https://") {
             // Check for YouTube videos first
-            if word.contains("youtube.com") || word.contains("youtu.be") {
-                if let Some(video_id) = extract_youtube_id(word) {
+            if cleaned_word.contains("youtube.com") || cleaned_word.contains("youtu.be") {
+                if let Some(video_id) = extract_youtube_id(cleaned_word) {
                     items.push(MediaItem::YouTubeVideo {
                         video_id,
-                        source_url: word.to_string(),
+                        source_url: cleaned_word.to_string(),
                     });
                     continue;
                 }
             }
             
             // Check if it's a pasteboard.co URL
-            if word.contains("pasteboard.co") {
-                if let Some(resolved) = get_or_resolve_pasteboard_url(word) {
+            if cleaned_word.contains("pasteboard.co") {
+                if let Some(resolved) = get_or_resolve_pasteboard_url(cleaned_word) {
                     items.push(MediaItem::Image {
-                        source_url: word.to_string(),
+                        source_url: cleaned_word.to_string(),
                         image_url: resolved,
                     });
                 }
@@ -3440,10 +3437,10 @@ fn extract_media_content(text: &str) -> Vec<MediaItem> {
             }
             
             // Check if it's a Discourse forum link
-            if is_discourse_url(word) {
-                if let Some(data) = get_or_fetch_discourse_data(word) {
+            if is_discourse_url(cleaned_word) {
+                if let Some(data) = get_or_fetch_discourse_data(cleaned_word) {
                     items.push(MediaItem::DiscoursePost {
-                        source_url: word.to_string(),
+                        source_url: cleaned_word.to_string(),
                         data,
                     });
                 }
@@ -3452,24 +3449,24 @@ fn extract_media_content(text: &str) -> Vec<MediaItem> {
             }
             
             // Check if it's a tmpfiles.org URL and convert to /dl/ version
-            let image_url = if word.contains("tmpfiles.org/") && !word.contains("/dl/") {
-                word.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+            let image_url = if cleaned_word.contains("tmpfiles.org/") && !cleaned_word.contains("/dl/") {
+                cleaned_word.replace("tmpfiles.org/", "tmpfiles.org/dl/")
             } else {
-                word.to_string()
+                cleaned_word.to_string()
             };
             
             // For non-pasteboard URLs, check if it ends with an image extension
-            let word_lower = word.to_lowercase();
+            let word_lower = cleaned_word.to_lowercase();
             if image_extensions.iter().any(|ext| word_lower.ends_with(ext)) {
                 items.push(MediaItem::Image {
-                    source_url: word.to_string(),
+                    source_url: cleaned_word.to_string(),
                     image_url,
                 });
             } else {
                 // Not a direct image link - try to fetch OG image
-                if let Some(og_image) = get_or_fetch_og_image(word) {
+                if let Some(og_image) = get_or_fetch_og_image(cleaned_word) {
                     items.push(MediaItem::Image {
-                        source_url: word.to_string(),
+                        source_url: cleaned_word.to_string(),
                         image_url: og_image,
                     });
                 }
@@ -3481,7 +3478,7 @@ fn extract_media_content(text: &str) -> Vec<MediaItem> {
 }
 
 fn unique_profile_label(
-    label: &str,
+    _label: &str,
     server: &str,
     nickname: &str,
     existing_profiles: &[profile::Profile],
