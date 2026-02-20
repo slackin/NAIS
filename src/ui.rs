@@ -3346,7 +3346,7 @@ fn app() -> Element {
                             {
                                 let is_cross_network = {
                                     let state_read = state.read();
-                                    !state_read.servers.values().any(|s| s.server == invite.server)
+                                    !state_read.servers.values().any(|s| crate::profile::servers_match(&s.server, &invite.server))
                                 };
                                 
                                 if is_cross_network {
@@ -3389,9 +3389,10 @@ fn app() -> Element {
                                             let channel = invite_data.channel.clone();
                                             
                                             // Check if we already have a profile for this server
+                                            // Use servers_match for fuzzy comparison (ignores port, case-insensitive)
                                             let existing_profile = {
                                                 let profs = profiles.read();
-                                                profs.iter().find(|p| p.server == server).cloned()
+                                                profs.iter().find(|p| crate::profile::servers_match(&p.server, &server)).cloned()
                                             };
                                             
                                             if let Some(profile) = existing_profile {

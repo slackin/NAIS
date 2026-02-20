@@ -2,6 +2,33 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// Normalize a server address for comparison purposes.
+/// Removes port numbers and converts to lowercase.
+/// Example: "irc.libera.chat:6697" -> "irc.libera.chat"
+pub fn normalize_server(server: &str) -> String {
+    // Remove port number if present (handles both :6667 and :+6697 formats)
+    let without_port = if let Some(colon_pos) = server.rfind(':') {
+        // Make sure the part after colon looks like a port (all digits or +digits)
+        let port_part = &server[colon_pos + 1..];
+        let port_part_trimmed = port_part.trim_start_matches('+');
+        if !port_part_trimmed.is_empty() && port_part_trimmed.chars().all(|c| c.is_ascii_digit()) {
+            &server[..colon_pos]
+        } else {
+            server
+        }
+    } else {
+        server
+    };
+    
+    without_port.to_lowercase()
+}
+
+/// Check if two server addresses refer to the same server.
+/// Uses normalized comparison (case-insensitive, ignores port).
+pub fn servers_match(server1: &str, server2: &str) -> bool {
+    normalize_server(server1) == normalize_server(server2)
+}
+
 // Get system username as default nickname
 fn get_system_username() -> String {
     std::env::var("USER")
