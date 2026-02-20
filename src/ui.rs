@@ -173,7 +173,9 @@ fn app() -> Element {
     let mut voice_incoming_call: Signal<Option<(String, String, u16, String)>> = use_signal(|| None); // (from, ip, port, session_id)
     let mut voice_current_peer: Signal<Option<String>> = use_signal(|| None);
     let mut voice_session_id: Signal<Option<String>> = use_signal(|| None);
-    let voice_local_port: Signal<u16> = use_signal(|| 0);
+    let mut voice_local_port: Signal<u16> = use_signal(|| 0);
+    let mut voice_event_rx: Signal<Option<async_channel::Receiver<crate::voice_chat::VoiceEvent>>> = use_signal(|| None);
+    let voice_muted_arc: Signal<std::sync::Arc<std::sync::Mutex<bool>>> = use_signal(|| std::sync::Arc::new(std::sync::Mutex::new(false)));
     
     // Voice debug state
     let mut voice_mic_level: Signal<f32> = use_signal(|| 0.0);
@@ -183,6 +185,17 @@ fn app() -> Element {
     let mut voice_selected_device: Signal<Option<String>> = use_signal(|| None);
     let mut voice_debug_expanded = use_signal(|| true);
     let mut voice_level_monitor: Signal<Option<std::sync::Arc<crate::voice_chat::AudioLevelMonitor>>> = use_signal(|| None);
+    
+    // Voice output debug state
+    let mut voice_output_level: Signal<f32> = use_signal(|| 0.0);
+    let mut voice_output_devices: Signal<Vec<crate::voice_chat::AudioOutputDevice>> = use_signal(|| {
+        crate::voice_chat::list_audio_output_devices()
+    });
+    let mut voice_selected_output_device: Signal<Option<String>> = use_signal(|| None);
+    let mut voice_output_monitor: Signal<Option<std::sync::Arc<crate::voice_chat::AudioOutputLevelMonitor>>> = use_signal(|| None);
+    
+    // Voice network stats
+    let mut voice_network_stats: Signal<crate::voice_chat::VoiceNetworkStats> = use_signal(|| crate::voice_chat::VoiceNetworkStats::new());
 
     // Scroll behavior state
     let mut is_at_bottom = use_signal(|| true);
@@ -260,13 +273,13 @@ fn app() -> Element {
         let is_active = matches!(voice_state(), crate::voice_chat::VoiceState::Active { .. });
         
         if is_active && voice_level_monitor.read().is_none() {
-            // Start monitoring when call becomes active
+            // Start input monitoring when call becomes active
             let device_name = voice_selected_device.read().clone();
             if let Some(monitor) = crate::voice_chat::AudioLevelMonitor::start(device_name.as_deref()) {
                 let monitor_arc = std::sync::Arc::new(monitor);
                 voice_level_monitor.set(Some(monitor_arc.clone()));
                 
-                // Spawn a task to periodically update the level
+                // Spawn a task to periodically update the input level
                 spawn(async move {
                     loop {
                         Delay::new(Duration::from_millis(50)).await;
@@ -279,11 +292,59 @@ fn app() -> Element {
                     }
                 });
             }
+            
+            // Start output monitoring - this tracks audio being played
+            let output_monitor = crate::voice_chat::AudioOutputLevelMonitor::new();
+            voice_output_monitor.set(Some(std::sync::Arc::new(output_monitor)));
+            
+            // Reset network stats for new call
+            voice_network_stats.set(crate::voice_chat::VoiceNetworkStats::new());
         } else if !is_active && voice_level_monitor.read().is_some() {
             // Stop monitoring when call ends
             voice_level_monitor.set(None);
             voice_mic_level.set(0.0);
+            voice_output_monitor.set(None);
+            voice_output_level.set(0.0);
         }
+    });
+
+    // Voice event polling effect - receive events from voice system
+    use_effect(move || {
+        spawn(async move {
+            loop {
+                Delay::new(Duration::from_millis(50)).await;
+                
+                // Check if we have an event receiver
+                let rx_opt = voice_event_rx.read().clone();
+                if let Some(ref rx) = rx_opt {
+                    // Try to receive voice events
+                    while let Ok(event) = rx.try_recv() {
+                        match event {
+                            crate::voice_chat::VoiceEvent::NetworkStats { stats } => {
+                                voice_network_stats.set(stats);
+                            }
+                            crate::voice_chat::VoiceEvent::OutputLevel { level } => {
+                                voice_output_level.set(level);
+                            }
+                            crate::voice_chat::VoiceEvent::AudioLevel { is_local: true, level } => {
+                                voice_mic_level.set(level);
+                            }
+                            crate::voice_chat::VoiceEvent::CallEnded { peer: _, reason } => {
+                                log::info!("Voice call ended: {}", reason);
+                                voice_state.set(crate::voice_chat::VoiceState::Idle);
+                                voice_current_peer.set(None);
+                                voice_session_id.set(None);
+                                voice_event_rx.set(None);
+                            }
+                            crate::voice_chat::VoiceEvent::Error { message } => {
+                                log::error!("Voice error: {}", message);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
     });
 
     // Main event loop to poll cores for IRC events
@@ -1201,20 +1262,30 @@ fn app() -> Element {
                                                                                 // Generate session ID and get local IP
                                                                                 let session_id = crate::voice_chat::VoiceChatManager::generate_session_id();
                                                                                 let local_ip = crate::voice_chat::get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
-                                                                                let local_port = voice_local_port();
                                                                                 
-                                                                                // Update voice state
-                                                                                voice_state.set(crate::voice_chat::VoiceState::Outgoing { peer: nick.clone() });
-                                                                                voice_session_id.set(Some(session_id.clone()));
-                                                                                voice_current_peer.set(Some(nick.clone()));
+                                                                                // Start voice listener to get a port
+                                                                                let config = crate::voice_chat::VoiceConfig::default();
+                                                                                let muted_arc_clone = voice_muted_arc.read().clone();
                                                                                 
-                                                                                // Send CTCP VOICE_CALL via IRC
-                                                                                let ctcp_msg = crate::voice_chat::create_voice_call_ctcp(&local_ip, if local_port > 0 { local_port } else { 5000 }, &session_id);
-                                                                                if let Some(core) = cores.read().get(&state.read().active_profile) {
-                                                                                    let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
-                                                                                        target: nick.clone(),
-                                                                                        message: ctcp_msg,
-                                                                                    });
+                                                                                if let Some((port, evt_rx)) = crate::voice_chat::start_voice_listener(config, muted_arc_clone) {
+                                                                                    voice_local_port.set(port);
+                                                                                    voice_event_rx.set(Some(evt_rx));
+                                                                                    
+                                                                                    // Update voice state
+                                                                                    voice_state.set(crate::voice_chat::VoiceState::Outgoing { peer: nick.clone() });
+                                                                                    voice_session_id.set(Some(session_id.clone()));
+                                                                                    voice_current_peer.set(Some(nick.clone()));
+                                                                                    
+                                                                                    // Send CTCP VOICE_CALL via IRC
+                                                                                    let ctcp_msg = crate::voice_chat::create_voice_call_ctcp(&local_ip, port, &session_id);
+                                                                                    if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                                                            target: nick.clone(),
+                                                                                            message: ctcp_msg,
+                                                                                        });
+                                                                                    }
+                                                                                } else {
+                                                                                    log::error!("Failed to start voice listener");
                                                                                 }
                                                                             }
                                                                         },
@@ -1257,28 +1328,44 @@ fn app() -> Element {
                             style: "background: #4CAF50; color: white; border: none; padding: 12px 24px; border-radius: 8px; cursor: pointer; font-size: 16px;",
                             onclick: {
                                 let from_user = from.clone();
-                                let _caller_ip = ip.clone();
-                                let _caller_port = port;
+                                let caller_ip = ip.clone();
+                                let caller_port = port;
                                 let sid = session_id.clone();
                                 move |_| {
-                                    // Accept the call
+                                    // Accept the call and connect to caller
                                     let local_ip = crate::voice_chat::get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
-                                    let local_port = voice_local_port();
                                     
-                                    // Send CTCP VOICE_ACCEPT
-                                    let ctcp_msg = crate::voice_chat::create_voice_accept_ctcp(&local_ip, if local_port > 0 { local_port } else { 5000 }, &sid);
-                                    if let Some(core) = cores.read().get(&state.read().active_profile) {
-                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
-                                            target: from_user.clone(),
-                                            message: ctcp_msg,
-                                        });
+                                    // Start voice listener for our port (in case caller initiates)
+                                    let config = crate::voice_chat::VoiceConfig::default();
+                                    let muted_arc_clone = voice_muted_arc.read().clone();
+                                    
+                                    // Connect to the caller's listener
+                                    if let Some(evt_rx) = crate::voice_chat::connect_voice_call(
+                                        &caller_ip,
+                                        caller_port,
+                                        config.clone(),
+                                        muted_arc_clone.clone(),
+                                    ) {
+                                        voice_event_rx.set(Some(evt_rx));
+                                        
+                                        // Send CTCP VOICE_ACCEPT with our port (may not be needed if we're connecting outbound)
+                                        let local_port = voice_local_port();
+                                        let ctcp_msg = crate::voice_chat::create_voice_accept_ctcp(&local_ip, if local_port > 0 { local_port } else { 5000 }, &sid);
+                                        if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                            let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                target: from_user.clone(),
+                                                message: ctcp_msg,
+                                            });
+                                        }
+                                        
+                                        // Update state to active
+                                        voice_state.set(crate::voice_chat::VoiceState::Active { peer: from_user.clone() });
+                                        voice_current_peer.set(Some(from_user.clone()));
+                                        voice_session_id.set(Some(sid.clone()));
+                                        voice_incoming_call.set(None);
+                                    } else {
+                                        log::error!("Failed to connect voice call to {}:{}", caller_ip, caller_port);
                                     }
-                                    
-                                    // Update state to active
-                                    voice_state.set(crate::voice_chat::VoiceState::Active { peer: from_user.clone() });
-                                    voice_current_peer.set(Some(from_user.clone()));
-                                    voice_session_id.set(Some(sid.clone()));
-                                    voice_incoming_call.set(None);
                                 }
                             },
                             "✓ Accept"
@@ -1450,12 +1537,191 @@ fn app() -> Element {
                             
                             // Refresh devices button
                             button {
-                                style: "width: 100%; padding: 4px 8px; background: #333; color: var(--text-muted); border: 1px solid var(--border-color); border-radius: 4px; font-size: 11px; cursor: pointer;",
+                                style: "width: 100%; padding: 4px 8px; background: #333; color: var(--text-muted); border: 1px solid var(--border-color); border-radius: 4px; font-size: 11px; cursor: pointer; margin-bottom: 12px;",
                                 onclick: move |_| {
                                     let devices = crate::voice_chat::list_audio_input_devices();
                                     voice_available_devices.set(devices);
+                                    let output_devices = crate::voice_chat::list_audio_output_devices();
+                                    voice_output_devices.set(output_devices);
                                 },
                                 "🔄 Refresh Devices"
+                            }
+                            
+                            // Output Level Meter
+                            div {
+                                style: "margin-bottom: 12px;",
+                                div {
+                                    style: "font-size: 11px; color: var(--text-muted); margin-bottom: 4px;",
+                                    "Output Level"
+                                }
+                                div {
+                                    style: "background: #222; border-radius: 4px; height: 20px; position: relative; overflow: hidden;",
+                                    // Level bar
+                                    {
+                                        let level = voice_output_level();
+                                        let width_pct = (level * 100.0).min(100.0);
+                                        let color = if level > 0.8 {
+                                            "#f44336" // Red for clipping
+                                        } else if level > 0.5 {
+                                            "#ff9800" // Orange for loud
+                                        } else if level > 0.1 {
+                                            "#2196F3" // Blue for good (different from input)
+                                        } else {
+                                            "#666" // Gray for quiet
+                                        };
+                                        rsx! {
+                                            div {
+                                                style: "position: absolute; left: 0; top: 0; bottom: 0; width: {width_pct}%; background: {color}; transition: width 0.05s ease-out;"
+                                            }
+                                        }
+                                    }
+                                    // Level markers
+                                    div {
+                                        style: "position: absolute; top: 0; bottom: 0; left: 50%; width: 1px; background: #444;"
+                                    }
+                                    div {
+                                        style: "position: absolute; top: 0; bottom: 0; left: 80%; width: 1px; background: #644;"
+                                    }
+                                }
+                                // Level value
+                                div {
+                                    style: "font-size: 10px; color: var(--text-muted); margin-top: 2px; text-align: right;",
+                                    {
+                                        let level = voice_output_level();
+                                        let db = if level > 0.0 { (level * 100.0).log10() * 20.0 } else { -60.0 };
+                                        format!("{:.1} dB", db.max(-60.0))
+                                    }
+                                }
+                            }
+                            
+                            // Output Device Selector
+                            div {
+                                style: "margin-bottom: 12px;",
+                                div {
+                                    style: "font-size: 11px; color: var(--text-muted); margin-bottom: 4px;",
+                                    "Output Device"
+                                }
+                                select {
+                                    style: "width: 100%; padding: 6px; background: var(--input-bg); color: var(--text-color); border: 1px solid var(--border-color); border-radius: 4px; font-size: 12px;",
+                                    onchange: move |evt| {
+                                        let value = evt.value();
+                                        let new_device = if value == "__default__" {
+                                            None
+                                        } else {
+                                            Some(value)
+                                        };
+                                        voice_selected_output_device.set(new_device);
+                                    },
+                                    option {
+                                        value: "__default__",
+                                        selected: voice_selected_output_device.read().is_none(),
+                                        "System Default"
+                                    }
+                                    {
+                                        voice_output_devices.read().iter().map(|device| {
+                                            let name = device.name.clone();
+                                            let is_selected = voice_selected_output_device.read().as_ref() == Some(&name);
+                                            let display_name = if device.is_default {
+                                                format!("{} (default)", name)
+                                            } else {
+                                                name.clone()
+                                            };
+                                            rsx! {
+                                                option {
+                                                    value: "{name}",
+                                                    selected: is_selected,
+                                                    "{display_name}"
+                                                }
+                                            }
+                                        })
+                                    }
+                                }
+                            }
+                            
+                            // Network Statistics
+                            div {
+                                style: "border-top: 1px solid var(--border-color); padding-top: 8px; margin-top: 8px;",
+                                div {
+                                    style: "font-size: 11px; color: var(--text-muted); margin-bottom: 8px; font-weight: bold;",
+                                    "📡 Network Stats"
+                                }
+                                
+                                // TX/RX bytes
+                                div {
+                                    style: "display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 10px; margin-bottom: 8px;",
+                                    div {
+                                        style: "background: #1a2a1a; padding: 6px; border-radius: 4px;",
+                                        div {
+                                            style: "color: #4CAF50; font-weight: bold;",
+                                            "⬆ TX"
+                                        }
+                                        div {
+                                            style: "color: var(--text-color);",
+                                            {
+                                                let stats = voice_network_stats.read();
+                                                crate::voice_chat::VoiceNetworkStats::format_bytes(stats.bytes_tx)
+                                            }
+                                        }
+                                        div {
+                                            style: "color: var(--text-muted);",
+                                            {
+                                                let stats = voice_network_stats.read();
+                                                crate::voice_chat::VoiceNetworkStats::format_bitrate(stats.bitrate_tx)
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        style: "background: #1a1a2a; padding: 6px; border-radius: 4px;",
+                                        div {
+                                            style: "color: #2196F3; font-weight: bold;",
+                                            "⬇ RX"
+                                        }
+                                        div {
+                                            style: "color: var(--text-color);",
+                                            {
+                                                let stats = voice_network_stats.read();
+                                                crate::voice_chat::VoiceNetworkStats::format_bytes(stats.bytes_rx)
+                                            }
+                                        }
+                                        div {
+                                            style: "color: var(--text-muted);",
+                                            {
+                                                let stats = voice_network_stats.read();
+                                                crate::voice_chat::VoiceNetworkStats::format_bitrate(stats.bitrate_rx)
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                // Packet stats
+                                div {
+                                    style: "display: flex; justify-content: space-between; font-size: 10px; color: var(--text-muted);",
+                                    div {
+                                        {
+                                            let stats = voice_network_stats.read();
+                                            format!("Pkts: {}/{}", stats.packets_tx, stats.packets_rx)
+                                        }
+                                    }
+                                    div {
+                                        {
+                                            let stats = voice_network_stats.read();
+                                            let loss = stats.packet_loss_percent();
+                                            let color = if loss > 5.0 { "#f44336" } else if loss > 1.0 { "#ff9800" } else { "#4CAF50" };
+                                            rsx! {
+                                                span {
+                                                    style: "color: {color};",
+                                                    "Loss: {loss:.1}%"
+                                                }
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        {
+                                            let stats = voice_network_stats.read();
+                                            format!("Jitter: {}ms", stats.jitter_ms)
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1468,7 +1734,12 @@ fn app() -> Element {
                                 button {
                                     style: "background: {mute_bg}; color: white; border: none; padding: 8px 16px; border-radius: 8px; cursor: pointer;",
                                     onclick: move |_| {
-                                        voice_muted.set(!voice_muted());
+                                        let new_muted = !voice_muted();
+                                        voice_muted.set(new_muted);
+                                        // Also update the Arc so audio capture knows about mute state
+                                        if let Ok(mut m) = voice_muted_arc.read().lock() {
+                                            *m = new_muted;
+                                        }
                                     },
                                     if voice_muted() { "🔇 Unmute" } else { "🎤 Mute" }
                                 }
@@ -1493,6 +1764,7 @@ fn app() -> Element {
                                     voice_state.set(crate::voice_chat::VoiceState::Idle);
                                     voice_current_peer.set(None);
                                     voice_session_id.set(None);
+                                    voice_event_rx.set(None);
                                 }
                             },
                             "📵 End Call"
@@ -1531,6 +1803,7 @@ fn app() -> Element {
                                     voice_state.set(crate::voice_chat::VoiceState::Idle);
                                     voice_current_peer.set(None);
                                     voice_session_id.set(None);
+                                    voice_event_rx.set(None);
                                 }
                             },
                             "Cancel"
@@ -1710,6 +1983,8 @@ fn app() -> Element {
                                                 voice_session_id,
                                                 voice_current_peer,
                                                 voice_local_port,
+                                                voice_muted_arc,
+                                                voice_event_rx,
                                             );
                                         }
                                     }
@@ -1797,6 +2072,8 @@ fn app() -> Element {
                                         voice_session_id,
                                         voice_current_peer,
                                         voice_local_port,
+                                        voice_muted_arc,
+                                        voice_event_rx,
                                     );
                                 }
                             }
@@ -2551,7 +2828,9 @@ fn handle_send_message(
     mut voice_state: Signal<crate::voice_chat::VoiceState>,
     mut voice_session_id: Signal<Option<String>>,
     mut voice_current_peer: Signal<Option<String>>,
-    voice_local_port: Signal<u16>,
+    mut voice_local_port: Signal<u16>,
+    voice_muted_arc: Signal<std::sync::Arc<std::sync::Mutex<bool>>>,
+    mut voice_event_rx: Signal<Option<async_channel::Receiver<crate::voice_chat::VoiceEvent>>>,
 ) {
     let text = text.trim().to_string();
     if text.is_empty() {
@@ -3029,31 +3308,49 @@ fn handle_send_message(
                         // Generate session ID and get local IP
                         let session_id = crate::voice_chat::VoiceChatManager::generate_session_id();
                         let local_ip = crate::voice_chat::get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
-                        let local_port = voice_local_port();
                         
-                        // Update voice state
-                        voice_state.set(crate::voice_chat::VoiceState::Outgoing { peer: target_nick.clone() });
-                        voice_session_id.set(Some(session_id.clone()));
-                        voice_current_peer.set(Some(target_nick.clone()));
+                        // Start voice listener to get a port
+                        let config = crate::voice_chat::VoiceConfig::default();
+                        let muted_arc_clone = voice_muted_arc.read().clone();
                         
-                        // Send CTCP VOICE_CALL via IRC
-                        let ctcp_msg = crate::voice_chat::create_voice_call_ctcp(&local_ip, if local_port > 0 { local_port } else { 5000 }, &session_id);
-                        if let Some(h) = handle.as_ref() {
-                            let _ = h.cmd_tx.try_send(IrcCommandEvent::Ctcp {
-                                target: target_nick.clone(),
-                                message: ctcp_msg,
-                            });
+                        if let Some((port, evt_rx)) = crate::voice_chat::start_voice_listener(config, muted_arc_clone) {
+                            voice_local_port.set(port);
+                            voice_event_rx.set(Some(evt_rx));
+                            
+                            // Update voice state
+                            voice_state.set(crate::voice_chat::VoiceState::Outgoing { peer: target_nick.clone() });
+                            voice_session_id.set(Some(session_id.clone()));
+                            voice_current_peer.set(Some(target_nick.clone()));
+                            
+                            // Send CTCP VOICE_CALL via IRC
+                            let ctcp_msg = crate::voice_chat::create_voice_call_ctcp(&local_ip, port, &session_id);
+                            if let Some(h) = handle.as_ref() {
+                                let _ = h.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                    target: target_nick.clone(),
+                                    message: ctcp_msg,
+                                });
+                            }
+                            
+                            apply_event_with_config(
+                                &mut state.write(),
+                                &profiles.read(),
+                                &active_profile,
+                                IrcEvent::System {
+                                    channel: channel.clone(),
+                                    text: format!("Calling {}...", target_nick),
+                                },
+                            );
+                        } else {
+                            apply_event_with_config(
+                                &mut state.write(),
+                                &profiles.read(),
+                                &active_profile,
+                                IrcEvent::System {
+                                    channel: channel.clone(),
+                                    text: "Failed to start voice listener".to_string(),
+                                },
+                            );
                         }
-                        
-                        apply_event_with_config(
-                            &mut state.write(),
-                            &profiles.read(),
-                            &active_profile,
-                            IrcEvent::System {
-                                channel: channel.clone(),
-                                text: format!("Calling {}...", target_nick),
-                            },
-                        );
                     }
                 }
             }
@@ -3077,6 +3374,7 @@ fn handle_send_message(
                         voice_state.set(crate::voice_chat::VoiceState::Idle);
                         voice_current_peer.set(None);
                         voice_session_id.set(None);
+                        voice_event_rx.set(None);
                         
                         apply_event_with_config(
                             &mut state.write(),
