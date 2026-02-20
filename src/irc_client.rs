@@ -682,6 +682,7 @@ async fn handle_connection(
     let mut config = Config::default();
     config.server = Some(server.to_string());
     config.nickname = Some(nickname.to_string());
+    config.alt_nicks = fallback_nicks.clone(); // Use library's built-in nick rollover
     config.port = Some(port);
     config.use_tls = Some(use_tls);
     // Set very long PING timeouts (in seconds) instead of None
@@ -1300,6 +1301,22 @@ async fn handle_connection(
                     }
                     IrcCommand::Response(Response::RPL_UMODEIS, _) => {
                         // User mode response (221) - we're fully connected, trigger auto-join
+                        // Sync our nick with what the library actually registered
+                        let actual_nick = client.current_nickname().to_string();
+                        if actual_nick != self_nick {
+                            let _ = evt_tx
+                                .send(IrcEvent::System {
+                                    channel: default_channel.clone(),
+                                    text: format!("[IRC] Registered with nickname '{}' (was '{}')", actual_nick, self_nick),
+                                })
+                                .await;
+                            self_nick = actual_nick.clone();
+                            let _ = evt_tx
+                                .send(IrcEvent::NickChanged {
+                                    new_nick: actual_nick,
+                                })
+                                .await;
+                        }
                         if !auto_joined && !default_channel.is_empty() {
                             // Send MODE +x to hide host if enabled and not yet sent
                             if !hide_host_sent {
@@ -1328,6 +1345,22 @@ async fn handle_connection(
                     }
                     IrcCommand::Response(Response::RPL_ENDOFMOTD, _) => {
                         // End of MOTD - now we can join the channel
+                        // Sync our nick with what the library actually registered
+                        let actual_nick = client.current_nickname().to_string();
+                        if actual_nick != self_nick {
+                            let _ = evt_tx
+                                .send(IrcEvent::System {
+                                    channel: default_channel.clone(),
+                                    text: format!("[IRC] Registered with nickname '{}' (was '{}')", actual_nick, self_nick),
+                                })
+                                .await;
+                            self_nick = actual_nick.clone();
+                            let _ = evt_tx
+                                .send(IrcEvent::NickChanged {
+                                    new_nick: actual_nick,
+                                })
+                                .await;
+                        }
                         if !auto_joined && !default_channel.is_empty() {
                             // Send MODE +x to hide host if enabled and not yet sent
                             if !hide_host_sent {
@@ -1617,27 +1650,19 @@ async fn handle_connection(
                     IrcCommand::Response(Response::RPL_LISTEND, _) => {
                         let _ = evt_tx.send(IrcEvent::ChannelListEnd).await;
                     }
-                    IrcCommand::Response(Response::ERR_NICKNAMEINUSE, ref _args) => {
-                        // Nickname is already in use, try a fallback
-                        if nick_attempt < fallback_nicks.len() {
-                            let new_nick = fallback_nicks[nick_attempt].clone();
-                            nick_attempt += 1;
-                            
+                    IrcCommand::Response(Response::ERR_NICKNAMEINUSE, ref args) => {
+                        // Nickname is already in use - library handles rollover via alt_nicks
+                        // Just inform the user about the rollover
+                        let rejected_nick = if args.len() >= 2 { &args[1] } else { &self_nick };
+                        nick_attempt += 1;
+                        
+                        if nick_attempt <= fallback_nicks.len() {
                             let _ = evt_tx
                                 .send(IrcEvent::System {
                                     channel: default_channel.clone(),
-                                    text: format!("[IRC] Nickname '{}' is in use, trying '{}'...", self_nick, new_nick),
+                                    text: format!("[IRC] Nickname '{}' is in use, trying fallback...", rejected_nick),
                                 })
                                 .await;
-                            
-                            self_nick = new_nick.clone();
-                            // Notify UI of the nick change so state is updated
-                            let _ = evt_tx
-                                .send(IrcEvent::NickChanged {
-                                    new_nick: self_nick.clone(),
-                                })
-                                .await;
-                            let _ = client.send(IrcCommand::NICK(new_nick));
                         } else {
                             let _ = evt_tx
                                 .send(IrcEvent::System {

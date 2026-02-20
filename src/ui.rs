@@ -15,6 +15,42 @@ use serde::{Serialize, Deserialize};
 use crate::irc_client::{self, ChatMessage, ConnectionStatus, IrcCommandEvent, IrcEvent};
 use crate::profile;
 
+/// Global registry of IRC command senders for graceful shutdown
+/// Maps profile names to their command channel senders
+static SHUTDOWN_HANDLES: std::sync::LazyLock<Mutex<HashMap<String, async_channel::Sender<IrcCommandEvent>>>> = 
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Register an IRC connection for graceful shutdown
+fn register_shutdown_handle(profile: &str, cmd_tx: async_channel::Sender<IrcCommandEvent>) {
+    if let Ok(mut handles) = SHUTDOWN_HANDLES.lock() {
+        handles.insert(profile.to_string(), cmd_tx);
+    }
+}
+
+/// Unregister an IRC connection (called when disconnecting)
+#[allow(dead_code)]
+fn unregister_shutdown_handle(profile: &str) {
+    if let Ok(mut handles) = SHUTDOWN_HANDLES.lock() {
+        handles.remove(profile);
+    }
+}
+
+/// Send QUIT to all connected IRC servers for graceful shutdown
+fn graceful_shutdown() {
+    log::info!("Initiating graceful shutdown of IRC connections...");
+    if let Ok(handles) = SHUTDOWN_HANDLES.lock() {
+        for (profile, cmd_tx) in handles.iter() {
+            log::info!("Sending QUIT to profile: {}", profile);
+            let _ = cmd_tx.try_send(IrcCommandEvent::Quit {
+                message: Some("Client closing".to_string()),
+            });
+        }
+    }
+    // Give a brief moment for QUIT messages to be sent
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    log::info!("Graceful shutdown complete");
+}
+
 /// Accumulated WHOIS information for popup display
 #[derive(Clone, Default, Debug)]
 struct WhoisInfo {
@@ -89,7 +125,35 @@ struct InviteChannelOption {
 }
 
 pub fn run() {
-    dioxus::launch(app);
+    #[cfg(feature = "desktop")]
+    {
+        use dioxus::desktop::Config;
+        use tao::event::{Event, WindowEvent};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        
+        // Track whether we've already initiated shutdown
+        static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
+        
+        // Configure desktop with a custom event handler to intercept close
+        let config = Config::new()
+            .with_custom_event_handler(move |event, _target| {
+                if let Event::WindowEvent { event: WindowEvent::CloseRequested, .. } = event {
+                    // Only run graceful shutdown once
+                    if !SHUTDOWN_STARTED.swap(true, Ordering::SeqCst) {
+                        graceful_shutdown();
+                    }
+                }
+            });
+        
+        dioxus::LaunchBuilder::desktop()
+            .with_cfg(config)
+            .launch(app);
+    }
+    
+    #[cfg(not(feature = "desktop"))]
+    {
+        dioxus::launch(app);
+    }
 }
 
 // Desktop-only file picker button component
@@ -3349,6 +3413,7 @@ fn app() -> Element {
                                                     // Create core if not exists
                                                     if !cores.read().contains_key(&profile.name) {
                                                         let core = irc_client::start_core();
+                                                        register_shutdown_handle(&profile.name, core.cmd_tx.clone());
                                                         cores.write().insert(profile.name.clone(), core);
                                                     }
                                                     
@@ -3425,6 +3490,7 @@ fn app() -> Element {
                                                 
                                                 // Create IRC core
                                                 let core = irc_client::start_core();
+                                                register_shutdown_handle(&new_profile_name, core.cmd_tx.clone());
                                                 cores.write().insert(new_profile_name.clone(), core);
                                                 
                                                 // Connect
@@ -6490,6 +6556,7 @@ fn connect_profile(
     mut skip_reconnect: Signal<HashMap<String, bool>>,
 ) {
     let core = irc_client::start_core();
+    register_shutdown_handle(&profile_name, core.cmd_tx.clone());
     cores.write().insert(profile_name.clone(), core.clone());
     skip_reconnect.write().insert(profile_name.clone(), false);
     profile_status.write().insert(profile_name.clone(), ConnectionStatus::Connecting);
