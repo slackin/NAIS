@@ -70,6 +70,12 @@ pub enum IrcEvent {
     Disconnected,
     Joined { channel: String },
     Parted { channel: String },
+    /// Another user joined a channel
+    UserJoined { channel: String, user: String },
+    /// Another user parted a channel
+    UserParted { channel: String, user: String },
+    /// A user quit IRC (affects all channels)
+    UserQuit { user: String },
     Users { channel: String, users: Vec<String> },
     Message { channel: String, user: String, text: String },
     Action { channel: String, user: String, text: String },
@@ -334,6 +340,25 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent, enable_lo
                 }
             }
         }
+        IrcEvent::UserJoined { channel, user } => {
+            // Add the user to the channel's user list (no message, that comes via System event)
+            let user_list = state.users_by_channel.entry(channel).or_insert_with(Vec::new);
+            if !user_list.contains(&user) {
+                user_list.push(user);
+            }
+        }
+        IrcEvent::UserParted { channel, user } => {
+            // Remove the user from the channel's user list (no message, that comes via System event)
+            if let Some(user_list) = state.users_by_channel.get_mut(&channel) {
+                user_list.retain(|u| u != &user && u.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~') != user);
+            }
+        }
+        IrcEvent::UserQuit { user } => {
+            // Remove the user from all channels (no message, that comes via System event)
+            for user_list in state.users_by_channel.values_mut() {
+                user_list.retain(|u| u != &user && u.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~') != user);
+            }
+        }
         IrcEvent::Message { channel, user, text } => {
             state.messages.push(ChatMessage {
                 channel,
@@ -425,7 +450,7 @@ pub fn start_core() -> CoreHandle {
     let (evt_tx, evt_rx) = async_channel::unbounded();
 
     std::thread::spawn(move || {
-        let mut runtime = Runtime::new().expect("tokio runtime");
+        let runtime = Runtime::new().expect("tokio runtime");
         runtime.block_on(async move {
             let _ = core_loop(cmd_rx, evt_tx).await;
         });
@@ -970,6 +995,14 @@ async fn handle_connection(
                                 })
                                 .await;
                         } else {
+                            // Update user list
+                            let _ = evt_tx
+                                .send(IrcEvent::UserJoined {
+                                    channel: channel.to_string(),
+                                    user: user.to_string(),
+                                })
+                                .await;
+                            // Show join message
                             let _ = evt_tx
                                 .send(IrcEvent::System {
                                     channel: channel.to_string(),
@@ -988,6 +1021,14 @@ async fn handle_connection(
                                 })
                                 .await;
                         } else {
+                            // Update user list
+                            let _ = evt_tx
+                                .send(IrcEvent::UserParted {
+                                    channel: channel.to_string(),
+                                    user: user.to_string(),
+                                })
+                                .await;
+                            // Show part message
                             let detail = if note.is_empty() {
                                 format!("{user} left.")
                             } else {
@@ -1003,6 +1044,13 @@ async fn handle_connection(
                     }
                     IrcCommand::QUIT(ref reason) => {
                         let user = message.source_nickname().unwrap_or("unknown");
+                        // Update user list (removes from all channels)
+                        let _ = evt_tx
+                            .send(IrcEvent::UserQuit {
+                                user: user.to_string(),
+                            })
+                            .await;
+                        // Show quit message
                         let note = reason.clone().unwrap_or_default();
                         let detail = if note.is_empty() {
                             format!("{user} quit.")
@@ -1030,11 +1078,20 @@ async fn handle_connection(
                                 text: detail,
                             })
                             .await;
-                        // If we were kicked, part the channel
+                        // Update user list
                         if kicked_user.as_str() == self_nick {
+                            // We were kicked - part the channel
                             let _ = evt_tx
                                 .send(IrcEvent::Parted {
                                     channel: channel.clone(),
+                                })
+                                .await;
+                        } else {
+                            // Someone else was kicked - remove them from user list (no extra message needed)
+                            let _ = evt_tx
+                                .send(IrcEvent::UserParted {
+                                    channel: channel.clone(),
+                                    user: kicked_user.clone(),
                                 })
                                 .await;
                         }

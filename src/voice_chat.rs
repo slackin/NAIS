@@ -1,4 +1,5 @@
 //! Peer-to-peer voice chat module with CTCP negotiation and socket-based audio streaming.
+#![allow(dead_code)]
 
 use async_channel::{Receiver, Sender};
 use std::collections::HashMap;
@@ -450,8 +451,8 @@ impl VoiceChatCore {
             CTCP_VOICE_ACCEPT => {
                 // Format: VOICE_ACCEPT <ip> <port> <session_id>
                 if args.len() >= 3 {
-                    let ip = args[0].clone();
-                    let port = args[1].parse::<u16>().unwrap_or(0);
+                    let _ip = args[0].clone();
+                    let _port = args[1].parse::<u16>().unwrap_or(0);
                     let session_id = args[2].clone();
                     
                     // Check if this is a response to our call
@@ -479,7 +480,7 @@ impl VoiceChatCore {
             CTCP_VOICE_REJECT => {
                 // Format: VOICE_REJECT <session_id> <reason>
                 if !args.is_empty() {
-                    let session_id = args[0].clone();
+                    let _session_id = args[0].clone();
                     let reason = if args.len() > 1 {
                         args[1..].join(" ")
                     } else {
@@ -532,7 +533,7 @@ pub fn start_voice_chat(config: VoiceConfig) -> VoiceChatHandle {
     
     // Spawn voice chat task
     std::thread::spawn(move || {
-        let mut runtime = tokio::runtime::Runtime::new().expect("tokio runtime for voice chat");
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime for voice chat");
         runtime.block_on(async move {
             let core = VoiceChatCore::new(config, cmd_rx, evt_tx.clone());
             let _ = voice_chat_loop(core).await;
@@ -545,7 +546,7 @@ pub fn start_voice_chat(config: VoiceConfig) -> VoiceChatHandle {
 /// Main voice chat event loop
 async fn voice_chat_loop(core: VoiceChatCore) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Start TCP listener for incoming voice connections
-    let mut listener = TcpListener::bind(format!("0.0.0.0:{}", core.config.listen_port)).await?;
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", core.config.listen_port)).await?;
     let local_addr = listener.local_addr()?;
     
     log::info!("Voice chat listening on {}", local_addr);
@@ -741,6 +742,173 @@ pub fn calculate_audio_level(samples: &[f32]) -> f32 {
     
     let sum: f32 = samples.iter().map(|s| s * s).sum();
     (sum / samples.len() as f32).sqrt()
+}
+
+/// Audio input device info
+#[derive(Clone, Debug)]
+pub struct AudioInputDevice {
+    pub name: String,
+    pub is_default: bool,
+}
+
+/// Get list of available audio input devices
+pub fn list_audio_input_devices() -> Vec<AudioInputDevice> {
+    use cpal::traits::{HostTrait, DeviceTrait};
+    
+    let mut devices = Vec::new();
+    
+    let host = cpal::default_host();
+    let default_device_name = host.default_input_device()
+        .and_then(|d| d.name().ok());
+    
+    if let Ok(input_devices) = host.input_devices() {
+        for device in input_devices {
+            if let Ok(name) = device.name() {
+                let is_default = default_device_name.as_ref() == Some(&name);
+                devices.push(AudioInputDevice { name, is_default });
+            }
+        }
+    }
+    
+    devices
+}
+
+/// Get audio input device by name
+pub fn get_audio_input_device(name: &str) -> Option<cpal::Device> {
+    use cpal::traits::{HostTrait, DeviceTrait};
+    
+    let host = cpal::default_host();
+    if let Ok(devices) = host.input_devices() {
+        for device in devices {
+            if let Ok(device_name) = device.name() {
+                if device_name == name {
+                    return Some(device);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Get the default audio input device
+pub fn get_default_input_device() -> Option<cpal::Device> {
+    use cpal::traits::HostTrait;
+    cpal::default_host().default_input_device()
+}
+
+/// Audio level monitor handle
+pub struct AudioLevelMonitor {
+    stop_flag: Arc<Mutex<bool>>,
+    level: Arc<Mutex<f32>>,
+    _stream: Option<cpal::Stream>,
+}
+
+impl AudioLevelMonitor {
+    /// Start monitoring audio input levels from the specified device (or default if None)
+    pub fn start(device_name: Option<&str>) -> Option<Self> {
+        use cpal::traits::{DeviceTrait, StreamTrait};
+        
+        let device = if let Some(name) = device_name {
+            get_audio_input_device(name)?
+        } else {
+            get_default_input_device()?
+        };
+        
+        let config = device.default_input_config().ok()?;
+        let level = Arc::new(Mutex::new(0.0f32));
+        let stop_flag = Arc::new(Mutex::new(false));
+        
+        let level_clone = level.clone();
+        let stop_clone = stop_flag.clone();
+        
+        let stream = match config.sample_format() {
+            cpal::SampleFormat::F32 => {
+                device.build_input_stream(
+                    &config.into(),
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        if *stop_clone.lock().unwrap() {
+                            return;
+                        }
+                        let rms = calculate_audio_level(data);
+                        // Convert to dB-like scale (0.0 to 1.0)
+                        let level_db = (rms * 10.0).min(1.0);
+                        *level_clone.lock().unwrap() = level_db;
+                    },
+                    |err| {
+                        log::error!("Audio input stream error: {}", err);
+                    },
+                    None,
+                ).ok()?
+            }
+            cpal::SampleFormat::I16 => {
+                let level_clone = level.clone();
+                let stop_clone = stop_flag.clone();
+                device.build_input_stream(
+                    &config.into(),
+                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                        if *stop_clone.lock().unwrap() {
+                            return;
+                        }
+                        // Convert i16 to f32
+                        let samples: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
+                        let rms = calculate_audio_level(&samples);
+                        let level_db = (rms * 10.0).min(1.0);
+                        *level_clone.lock().unwrap() = level_db;
+                    },
+                    |err| {
+                        log::error!("Audio input stream error: {}", err);
+                    },
+                    None,
+                ).ok()?
+            }
+            cpal::SampleFormat::U16 => {
+                let level_clone = level.clone();
+                let stop_clone = stop_flag.clone();
+                device.build_input_stream(
+                    &config.into(),
+                    move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                        if *stop_clone.lock().unwrap() {
+                            return;
+                        }
+                        // Convert u16 to f32
+                        let samples: Vec<f32> = data.iter().map(|&s| (s as f32 - 32768.0) / 32768.0).collect();
+                        let rms = calculate_audio_level(&samples);
+                        let level_db = (rms * 10.0).min(1.0);
+                        *level_clone.lock().unwrap() = level_db;
+                    },
+                    |err| {
+                        log::error!("Audio input stream error: {}", err);
+                    },
+                    None,
+                ).ok()?
+            }
+            _ => return None,
+        };
+        
+        stream.play().ok()?;
+        
+        Some(Self {
+            stop_flag,
+            level,
+            _stream: Some(stream),
+        })
+    }
+    
+    /// Get the current audio level (0.0 to 1.0)
+    pub fn get_level(&self) -> f32 {
+        *self.level.lock().unwrap()
+    }
+    
+    /// Stop monitoring
+    pub fn stop(&self) {
+        *self.stop_flag.lock().unwrap() = true;
+    }
+}
+
+impl Drop for AudioLevelMonitor {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 /// Get local IP address that should be reachable by peers

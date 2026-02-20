@@ -174,6 +174,15 @@ fn app() -> Element {
     let mut voice_current_peer: Signal<Option<String>> = use_signal(|| None);
     let mut voice_session_id: Signal<Option<String>> = use_signal(|| None);
     let voice_local_port: Signal<u16> = use_signal(|| 0);
+    
+    // Voice debug state
+    let mut voice_mic_level: Signal<f32> = use_signal(|| 0.0);
+    let mut voice_available_devices: Signal<Vec<crate::voice_chat::AudioInputDevice>> = use_signal(|| {
+        crate::voice_chat::list_audio_input_devices()
+    });
+    let mut voice_selected_device: Signal<Option<String>> = use_signal(|| None);
+    let mut voice_debug_expanded = use_signal(|| true);
+    let mut voice_level_monitor: Signal<Option<std::sync::Arc<crate::voice_chat::AudioLevelMonitor>>> = use_signal(|| None);
 
     // Scroll behavior state
     let mut is_at_bottom = use_signal(|| true);
@@ -244,6 +253,37 @@ fn app() -> Element {
                 }
             }
         });
+    });
+    
+    // Voice level monitor effect - start/stop based on call state
+    use_effect(move || {
+        let is_active = matches!(voice_state(), crate::voice_chat::VoiceState::Active { .. });
+        
+        if is_active && voice_level_monitor.read().is_none() {
+            // Start monitoring when call becomes active
+            let device_name = voice_selected_device.read().clone();
+            if let Some(monitor) = crate::voice_chat::AudioLevelMonitor::start(device_name.as_deref()) {
+                let monitor_arc = std::sync::Arc::new(monitor);
+                voice_level_monitor.set(Some(monitor_arc.clone()));
+                
+                // Spawn a task to periodically update the level
+                spawn(async move {
+                    loop {
+                        Delay::new(Duration::from_millis(50)).await;
+                        if let Some(ref m) = *voice_level_monitor.read() {
+                            let level = m.get_level();
+                            voice_mic_level.set(level);
+                        } else {
+                            break;
+                        }
+                    }
+                });
+            }
+        } else if !is_active && voice_level_monitor.read().is_some() {
+            // Stop monitoring when call ends
+            voice_level_monitor.set(None);
+            voice_mic_level.set(0.0);
+        }
     });
 
     // Main event loop to poll cores for IRC events
@@ -1272,7 +1312,7 @@ fn app() -> Element {
             if let crate::voice_chat::VoiceState::Active { peer } = voice_state() {
                 div {
                     class: "voice-active-call",
-                    style: "position: fixed; bottom: 80px; right: 20px; background: var(--input-bg); border: 1px solid var(--accent-color); border-radius: 12px; padding: 16px; z-index: 999; min-width: 200px; box-shadow: 0 4px 16px rgba(0,0,0,0.3);",
+                    style: "position: fixed; bottom: 80px; right: 20px; background: var(--input-bg); border: 1px solid var(--accent-color); border-radius: 12px; padding: 16px; z-index: 999; min-width: 280px; box-shadow: 0 4px 16px rgba(0,0,0,0.3);",
                     div {
                         style: "display: flex; align-items: center; gap: 8px; margin-bottom: 12px;",
                         span {
@@ -1284,6 +1324,142 @@ fn app() -> Element {
                             "Voice call with {peer}"
                         }
                     }
+                    
+                    // Audio Debug Panel
+                    div {
+                        style: "margin-bottom: 12px; border-top: 1px solid var(--border-color); padding-top: 12px;",
+                        
+                        // Collapsible header
+                        div {
+                            style: "display: flex; align-items: center; justify-content: space-between; cursor: pointer; margin-bottom: 8px;",
+                            onclick: move |_| {
+                                voice_debug_expanded.set(!voice_debug_expanded());
+                            },
+                            span {
+                                style: "font-size: 12px; color: var(--text-muted); font-weight: bold;",
+                                "🔧 Audio Debug"
+                            }
+                            span {
+                                style: "font-size: 10px; color: var(--text-muted);",
+                                if voice_debug_expanded() { "▼" } else { "▶" }
+                            }
+                        }
+                        
+                        if voice_debug_expanded() {
+                            // Mic Input Level Meter
+                            div {
+                                style: "margin-bottom: 12px;",
+                                div {
+                                    style: "font-size: 11px; color: var(--text-muted); margin-bottom: 4px;",
+                                    "Mic Input Level"
+                                }
+                                div {
+                                    style: "background: #222; border-radius: 4px; height: 20px; position: relative; overflow: hidden;",
+                                    // Level bar
+                                    {
+                                        let level = voice_mic_level();
+                                        let width_pct = (level * 100.0).min(100.0);
+                                        let color = if level > 0.8 {
+                                            "#f44336" // Red for clipping
+                                        } else if level > 0.5 {
+                                            "#ff9800" // Orange for loud
+                                        } else if level > 0.1 {
+                                            "#4CAF50" // Green for good
+                                        } else {
+                                            "#666" // Gray for quiet
+                                        };
+                                        rsx! {
+                                            div {
+                                                style: "position: absolute; left: 0; top: 0; bottom: 0; width: {width_pct}%; background: {color}; transition: width 0.05s ease-out;"
+                                            }
+                                        }
+                                    }
+                                    // Level markers
+                                    div {
+                                        style: "position: absolute; top: 0; bottom: 0; left: 50%; width: 1px; background: #444;"
+                                    }
+                                    div {
+                                        style: "position: absolute; top: 0; bottom: 0; left: 80%; width: 1px; background: #644;"
+                                    }
+                                }
+                                // Level value
+                                div {
+                                    style: "font-size: 10px; color: var(--text-muted); margin-top: 2px; text-align: right;",
+                                    {
+                                        let level = voice_mic_level();
+                                        let db = if level > 0.0 { (level * 100.0).log10() * 20.0 } else { -60.0 };
+                                        format!("{:.1} dB", db.max(-60.0))
+                                    }
+                                }
+                            }
+                            
+                            // Mic Input Device Selector
+                            div {
+                                style: "margin-bottom: 8px;",
+                                div {
+                                    style: "font-size: 11px; color: var(--text-muted); margin-bottom: 4px;",
+                                    "Input Device"
+                                }
+                                select {
+                                    style: "width: 100%; padding: 6px; background: var(--input-bg); color: var(--text-color); border: 1px solid var(--border-color); border-radius: 4px; font-size: 12px;",
+                                    onchange: move |evt| {
+                                        let value = evt.value();
+                                        let new_device = if value == "__default__" {
+                                            None
+                                        } else {
+                                            Some(value)
+                                        };
+                                        voice_selected_device.set(new_device.clone());
+                                        
+                                        // Restart monitor with new device
+                                        if let Some(device_name) = new_device.as_deref() {
+                                            if let Some(monitor) = crate::voice_chat::AudioLevelMonitor::start(Some(device_name)) {
+                                                voice_level_monitor.set(Some(std::sync::Arc::new(monitor)));
+                                            }
+                                        } else {
+                                            if let Some(monitor) = crate::voice_chat::AudioLevelMonitor::start(None) {
+                                                voice_level_monitor.set(Some(std::sync::Arc::new(monitor)));
+                                            }
+                                        }
+                                    },
+                                    option {
+                                        value: "__default__",
+                                        selected: voice_selected_device.read().is_none(),
+                                        "System Default"
+                                    }
+                                    {
+                                        voice_available_devices.read().iter().map(|device| {
+                                            let name = device.name.clone();
+                                            let is_selected = voice_selected_device.read().as_ref() == Some(&name);
+                                            let display_name = if device.is_default {
+                                                format!("{} (default)", name)
+                                            } else {
+                                                name.clone()
+                                            };
+                                            rsx! {
+                                                option {
+                                                    value: "{name}",
+                                                    selected: is_selected,
+                                                    "{display_name}"
+                                                }
+                                            }
+                                        })
+                                    }
+                                }
+                            }
+                            
+                            // Refresh devices button
+                            button {
+                                style: "width: 100%; padding: 4px 8px; background: #333; color: var(--text-muted); border: 1px solid var(--border-color); border-radius: 4px; font-size: 11px; cursor: pointer;",
+                                onclick: move |_| {
+                                    let devices = crate::voice_chat::list_audio_input_devices();
+                                    voice_available_devices.set(devices);
+                                },
+                                "🔄 Refresh Devices"
+                            }
+                        }
+                    }
+                    
                     div {
                         style: "display: flex; gap: 8px; justify-content: center;",
                         {
