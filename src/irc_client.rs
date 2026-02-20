@@ -91,6 +91,10 @@ pub enum IrcEvent {
     WhoisChannels { nick: String, channels: String },
     WhoisIdle { nick: String, idle_secs: String },
     WhoisEnd { nick: String },
+    /// CTCP response received (from a NOTICE with CTCP content)
+    CtcpResponse { from: String, command: String, response: String },
+    /// NAIS channel CTCP message received
+    NaisCtcp { from: String, command: String, args: Vec<String> },
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +104,7 @@ pub enum IrcCommandEvent {
         nickname: String,
         channel: String,
         use_tls: bool,
+        hide_host: bool,
     },
     Join {
         channel: String,
@@ -155,6 +160,14 @@ pub enum IrcCommandEvent {
     Ctcp {
         target: String,
         message: String,
+    },
+    /// Quit IRC with an optional message
+    Quit {
+        message: Option<String>,
+    },
+    /// Send a raw IRC command
+    Raw {
+        command: String,
     },
     #[allow(dead_code)]
     Disconnect,
@@ -429,6 +442,12 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent, enable_lo
         IrcEvent::WhoisUser { .. } | IrcEvent::WhoisServer { .. } | IrcEvent::WhoisChannels { .. } | IrcEvent::WhoisIdle { .. } | IrcEvent::WhoisEnd { .. } => {
             // WHOIS events are handled in the UI event loop for popup display
         }
+        IrcEvent::CtcpResponse { .. } => {
+            // CTCP response events are handled in the UI event loop for popup display
+        }
+        IrcEvent::NaisCtcp { .. } => {
+            // NAIS CTCP events are handled in the UI event loop
+        }
     }
     
     // Apply scrollback limit - keep only the most recent messages in memory
@@ -492,12 +511,14 @@ async fn core_loop(cmd_rx: Receiver<IrcCommandEvent>, evt_tx: Sender<IrcEvent>) 
                 nickname,
                 channel,
                 use_tls,
+                hide_host,
             } => {
                 if let Err(error) = handle_connection(
                     &server,
                     &nickname,
                     &channel,
                     use_tls,
+                    hide_host,
                     &command_rx,
                     &evt_tx,
                 )
@@ -564,7 +585,7 @@ fn handle_ctcp_query(command: &str, args: &str) -> Option<String> {
             Some(create_ctcp_response("VERSION", "NAIS-client v0.1.0 (Rust)"))
         }
         "CLIENTINFO" => {
-            Some(create_ctcp_response("CLIENTINFO", "ACTION VERSION CLIENTINFO TIME PING VOICE_CALL VOICE_ACCEPT VOICE_REJECT VOICE_CANCEL"))
+            Some(create_ctcp_response("CLIENTINFO", "ACTION VERSION CLIENTINFO TIME PING FINGER SOURCE USERINFO VOICE_CALL VOICE_ACCEPT VOICE_REJECT VOICE_CANCEL NAIS_PROBE NAIS_INFO NAIS_JOIN NAIS_ACCEPT NAIS_CONNECT NAIS_LEAVE"))
         }
         "TIME" => {
             let now = chrono::Local::now();
@@ -573,8 +594,20 @@ fn handle_ctcp_query(command: &str, args: &str) -> Option<String> {
         "PING" => {
             Some(create_ctcp_response("PING", args))
         }
+        "FINGER" => {
+            // Return user information (in a real client, this might include idle time)
+            Some(create_ctcp_response("FINGER", "NAIS-client user"))
+        }
+        "SOURCE" => {
+            Some(create_ctcp_response("SOURCE", "https://github.com/nais-client"))
+        }
+        "USERINFO" => {
+            Some(create_ctcp_response("USERINFO", "NAIS IRC Client"))
+        }
         // Voice CTCP commands are handled separately - return None to let them be forwarded to voice system
         "VOICE_CALL" | "VOICE_ACCEPT" | "VOICE_REJECT" | "VOICE_CANCEL" => None,
+        // NAIS channel CTCP commands are handled separately
+        "NAIS_PROBE" | "NAIS_INFO" | "NAIS_JOIN" | "NAIS_ACCEPT" | "NAIS_CONNECT" | "NAIS_LEAVE" => None,
         _ => None,
     }
 }
@@ -584,11 +617,17 @@ fn is_voice_ctcp(command: &str) -> bool {
     matches!(command, "VOICE_CALL" | "VOICE_ACCEPT" | "VOICE_REJECT" | "VOICE_CANCEL")
 }
 
+/// Check if a CTCP command is NAIS channel-related
+fn is_nais_ctcp(command: &str) -> bool {
+    matches!(command, "NAIS_PROBE" | "NAIS_INFO" | "NAIS_JOIN" | "NAIS_ACCEPT" | "NAIS_CONNECT" | "NAIS_LEAVE")
+}
+
 async fn handle_connection(
     server: &str,
     nickname: &str,
     channel: &str,
     use_tls: bool,
+    hide_host: bool,
     cmd_rx: &Receiver<IrcCommandEvent>,
     evt_tx: &Sender<IrcEvent>,
 ) -> Result<(), Box<dyn Error>> {
@@ -596,6 +635,7 @@ async fn handle_connection(
     let default_channel = channel.to_string();
     let fallback_nicks = crate::profile::generate_fallback_nicknames(nickname);
     let mut nick_attempt = 0;
+    let mut hide_host_sent = !hide_host; // Mark as "sent" if disabled to skip sending
     
     // Determine port and log connection type
     let port = if use_tls { 6697 } else { 6667 };
@@ -840,6 +880,27 @@ async fn handle_connection(
                             .await;
                         let _ = client.send_privmsg(&target, &message);
                     }
+                    IrcCommandEvent::Quit { message } => {
+                        let quit_msg = message.as_ref().map(|m| m.as_str()).unwrap_or("NAIS-client");
+                        let _ = evt_tx
+                            .send(IrcEvent::System {
+                                channel: default_channel.clone(),
+                                text: format!("[IRC] Sent: QUIT :{}", quit_msg),
+                            })
+                            .await;
+                        let _ = client.send_quit(quit_msg);
+                        let _ = evt_tx.send(IrcEvent::Disconnected).await;
+                        break;
+                    }
+                    IrcCommandEvent::Raw { command } => {
+                        let _ = evt_tx
+                            .send(IrcEvent::System {
+                                channel: default_channel.clone(),
+                                text: format!("[IRC] Sent RAW: {}", command),
+                            })
+                            .await;
+                        let _ = client.send(IrcCommand::Raw(command, vec![]));
+                    }
                     IrcCommandEvent::Disconnect => {
                         let _ = evt_tx
                             .send(IrcEvent::System {
@@ -973,6 +1034,26 @@ async fn handle_connection(
                                         args: args_vec,
                                     })
                                     .await;
+                            } else if is_nais_ctcp(&command) {
+                                // NAIS channel CTCP command - forward to NAIS system
+                                let args_vec: Vec<String> = args.split_whitespace()
+                                    .map(|s| s.to_string())
+                                    .collect();
+                                
+                                let _ = evt_tx
+                                    .send(IrcEvent::System {
+                                        channel: default_channel.clone(),
+                                        text: format!("[NAIS] {} from {}", command, user),
+                                    })
+                                    .await;
+                                
+                                let _ = evt_tx
+                                    .send(IrcEvent::NaisCtcp {
+                                        from: user,
+                                        command,
+                                        args: args_vec,
+                                    })
+                                    .await;
                             } else {
                                 // This is a CTCP query - send response
                                 if let Some(response) = handle_ctcp_query(&command, &args) {
@@ -1013,12 +1094,54 @@ async fn handle_connection(
                         }
                     }
                     IrcCommand::NOTICE(ref target, ref body) => {
-                        let _ = evt_tx
-                            .send(IrcEvent::System {
-                                channel: target.to_string(),
-                                text: body.to_string(),
-                            })
-                            .await;
+                        let user = message.source_nickname().unwrap_or("unknown").to_string();
+                        
+                        // Check if this is a CTCP response
+                        if let Some((command, response)) = parse_ctcp(body) {
+                            // Check if this is a NAIS CTCP response
+                            if is_nais_ctcp(&command) {
+                                let args_vec: Vec<String> = response.split_whitespace()
+                                    .map(|s| s.to_string())
+                                    .collect();
+                                
+                                let _ = evt_tx
+                                    .send(IrcEvent::System {
+                                        channel: target.to_string(),
+                                        text: format!("[NAIS] {} response from {}", command, user),
+                                    })
+                                    .await;
+                                
+                                let _ = evt_tx
+                                    .send(IrcEvent::NaisCtcp {
+                                        from: user,
+                                        command,
+                                        args: args_vec,
+                                    })
+                                    .await;
+                            } else {
+                                // This is a CTCP response - emit special event for popup
+                                let _ = evt_tx
+                                    .send(IrcEvent::CtcpResponse {
+                                        from: user.clone(),
+                                        command: command.clone(),
+                                        response: response.clone(),
+                                    })
+                                    .await;
+                                let _ = evt_tx
+                                    .send(IrcEvent::System {
+                                        channel: target.to_string(),
+                                        text: format!("[CTCP {}] {} reply from {}", command, response, user),
+                                    })
+                                    .await;
+                            }
+                        } else {
+                            let _ = evt_tx
+                                .send(IrcEvent::System {
+                                    channel: target.to_string(),
+                                    text: body.to_string(),
+                                })
+                                .await;
+                        }
                     }
                     IrcCommand::JOIN(ref channel, ..) => {
                         let user = message.source_nickname().unwrap_or("unknown");
@@ -1147,6 +1270,18 @@ async fn handle_connection(
                     IrcCommand::Response(Response::RPL_UMODEIS, _) => {
                         // User mode response (221) - we're fully connected, trigger auto-join
                         if !auto_joined && !default_channel.is_empty() {
+                            // Send MODE +x to hide host if enabled and not yet sent
+                            if !hide_host_sent {
+                                hide_host_sent = true;
+                                let _ = evt_tx
+                                    .send(IrcEvent::System {
+                                        channel: default_channel.clone(),
+                                        text: format!("[IRC] Sent: MODE {} +x", self_nick),
+                                    })
+                                    .await;
+                                let mode_str = format!("MODE {} +x", self_nick);
+                                let _ = client.send(IrcCommand::Raw(mode_str, vec![]));
+                            }
                             auto_joined = true;
                             // Join all comma-separated channels
                             for channel in default_channel.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -1163,6 +1298,18 @@ async fn handle_connection(
                     IrcCommand::Response(Response::RPL_ENDOFMOTD, _) => {
                         // End of MOTD - now we can join the channel
                         if !auto_joined && !default_channel.is_empty() {
+                            // Send MODE +x to hide host if enabled and not yet sent
+                            if !hide_host_sent {
+                                hide_host_sent = true;
+                                let _ = evt_tx
+                                    .send(IrcEvent::System {
+                                        channel: default_channel.clone(),
+                                        text: format!("[IRC] Sent: MODE {} +x", self_nick),
+                                    })
+                                    .await;
+                                let mode_str = format!("MODE {} +x", self_nick);
+                                let _ = client.send(IrcCommand::Raw(mode_str, vec![]));
+                            }
                             auto_joined = true;
                             // Join all comma-separated channels
                             for channel in default_channel.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {

@@ -28,6 +28,40 @@ struct WhoisInfo {
     idle_secs: Option<String>,
 }
 
+/// CTCP response information for popup display
+#[derive(Clone, Debug)]
+struct CtcpResponseInfo {
+    from: String,
+    command: String,
+    response: String,
+}
+
+/// Information for channel invite popup
+#[derive(Clone, Debug)]
+struct ChannelInviteInfo {
+    /// Target user to invite
+    target_nick: String,
+    /// Whether the target is a NAIS client
+    is_nais_client: bool,
+    /// Current server/profile name
+    current_profile: String,
+}
+
+/// A channel option for the invite selector
+#[derive(Clone, Debug)]
+struct InviteChannelOption {
+    /// Display name for the channel
+    display_name: String,
+    /// IRC channel name (e.g., #channel)
+    channel: String,
+    /// Server/profile name (for cross-server invites)
+    profile: String,
+    /// Server address
+    server: String,
+    /// Whether this is a NAIS channel
+    is_nais: bool,
+}
+
 pub fn run() {
     dioxus::launch(app);
 }
@@ -160,6 +194,7 @@ fn app() -> Element {
     let mut new_channel_input = use_signal(String::new);
     let mut new_tls_input = use_signal(|| true);
     let mut new_auto_connect_input = use_signal(|| true);
+    let mut new_hide_host_input = use_signal(|| true);
     
     let mut first_run_nick_input = use_signal(|| {
         store.default_nickname.clone().unwrap_or_else(|| {
@@ -193,6 +228,7 @@ fn app() -> Element {
     let mut edit_channel_input = use_signal(String::new);
     let mut edit_tls_input = use_signal(|| true);
     let mut edit_auto_connect_input = use_signal(|| true);
+    let mut edit_hide_host_input = use_signal(|| true);
 
     let mut search_input = use_signal(String::new);
     let mut channel_list: Signal<Vec<(String, u32, String)>> = use_signal(Vec::new);
@@ -202,10 +238,21 @@ fn app() -> Element {
     let mut userlist_collapsed = use_signal(|| false);
     let mut topic_collapsed = use_signal(|| false);
     let mut user_menu_open: Signal<Option<String>> = use_signal(|| None);
+    let mut ctcp_submenu_open: Signal<bool> = use_signal(|| false);
 
     // WHOIS popup state
     let mut whois_popup: Signal<Option<WhoisInfo>> = use_signal(|| None);
     let whois_building: Signal<Option<WhoisInfo>> = use_signal(|| None);
+    
+    // CTCP response popup state
+    let mut ctcp_response_popup: Signal<Option<CtcpResponseInfo>> = use_signal(|| None);
+
+    // Channel invite popup state
+    let mut channel_invite_popup: Signal<Option<ChannelInviteInfo>> = use_signal(|| None);
+    // Known NAIS users (nick -> true means confirmed NAIS client)
+    let known_nais_users: Signal<HashMap<String, bool>> = use_signal(HashMap::new);
+    // Pending VERSION probes for invite detection (nick -> true means waiting)  
+    let mut pending_invite_probes: Signal<HashMap<String, bool>> = use_signal(HashMap::new);
 
     // Voice chat state
     let mut voice_state: Signal<crate::voice_chat::VoiceState> = use_signal(|| crate::voice_chat::VoiceState::Idle);
@@ -406,6 +453,10 @@ fn app() -> Element {
         let voice_external_ip_handle = voice_external_ip;
         let mut whois_building_handle = whois_building;
         let mut whois_popup_handle = whois_popup;
+        let mut ctcp_response_popup_handle = ctcp_response_popup;
+        let mut channel_invite_popup_handle = channel_invite_popup;
+        let mut known_nais_users_handle = known_nais_users;
+        let mut pending_invite_probes_handle = pending_invite_probes;
         spawn(async move {
             let mut channel_buffer: Vec<(String, u32, String)> = Vec::new();
             const BATCH_SIZE: usize = 200;
@@ -598,6 +649,195 @@ fn app() -> Element {
                                         }
                                     }
                                 }
+                                IrcEvent::CtcpResponse { from, command, response } => {
+                                    // Check if this is a VERSION response for a pending invite probe
+                                    let is_pending_invite = pending_invite_probes_handle.read().contains_key(from);
+                                    
+                                    if is_pending_invite && command == "VERSION" {
+                                        // Remove from pending probes
+                                        pending_invite_probes_handle.write().remove(from);
+                                        
+                                        // Check if this is a NAIS client
+                                        let is_nais = response.to_uppercase().contains("NAIS");
+                                        
+                                        // Track known NAIS users
+                                        known_nais_users_handle.write().insert(from.clone(), is_nais);
+                                        
+                                        // Show channel invite popup
+                                        channel_invite_popup_handle.set(Some(ChannelInviteInfo {
+                                            target_nick: from.clone(),
+                                            is_nais_client: is_nais,
+                                            current_profile: profile_name.clone(),
+                                        }));
+                                    } else {
+                                        // Show CTCP response in popup (normal behavior)
+                                        ctcp_response_popup_handle.set(Some(CtcpResponseInfo {
+                                            from: from.clone(),
+                                            command: command.clone(),
+                                            response: response.clone(),
+                                        }));
+                                    }
+                                }
+                                IrcEvent::NaisCtcp { from, command, args } => {
+                                    // Handle NAIS channel CTCP commands
+                                    match command.as_str() {
+                                        crate::nais_channel::CTCP_NAIS_PROBE => {
+                                            // Someone is probing us for NAIS capability
+                                            // Respond with our info if we're in that channel
+                                            if let Some(irc_channel) = args.first() {
+                                                // Get our info from state
+                                                let state_read = state_handle.read();
+                                                if let Some(server) = state_read.servers.get(&profile_name) {
+                                                    // Check if we're in this channel and it's a NAIS channel
+                                                    if server.channels.contains(&irc_channel.to_string()) {
+                                                        if let Some(topic) = server.topics_by_channel.get(irc_channel) {
+                                                            if let Some((_version, channel_id, _fp)) = crate::nais_channel::parse_nais_topic(topic) {
+                                                                // We're in a NAIS channel - respond with our info
+                                                                let our_fingerprint = crate::nais_channel::generate_fingerprint();
+                                                                let info_msg = crate::nais_channel::create_info_ctcp(
+                                                                    &channel_id,
+                                                                    &our_fingerprint,
+                                                                    "0.0.0.0", // Would be our external IP
+                                                                    0, // Would be our listening port
+                                                                );
+                                                                
+                                                                // Send response via NOTICE (CTCP response)
+                                                                if let Some(core) = cores.read().get(&profile_name) {
+                                                                    let _ = core.cmd_tx.try_send(IrcCommandEvent::Notice {
+                                                                        target: from.clone(),
+                                                                        text: info_msg,
+                                                                    });
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                drop(state_read);
+                                            }
+                                        }
+                                        crate::nais_channel::CTCP_NAIS_INFO => {
+                                            // Received NAIS info from a peer
+                                            // Format: channel_id fingerprint ip port
+                                            if args.len() >= 4 {
+                                                let channel_id = &args[0];
+                                                let fingerprint = &args[1];
+                                                let ip = &args[2];
+                                                let port = &args[3];
+                                                
+                                                // Get current channel before borrowing state mutably
+                                                let current_channel = state_handle.read().servers.get(&profile_name)
+                                                    .map(|s| s.current_channel.clone())
+                                                    .unwrap_or_default();
+                                                
+                                                // Add system message about discovered peer
+                                                let mut state_mut = state_handle.write();
+                                                let profiles_read = profiles.read();
+                                                apply_event_with_config(
+                                                    &mut state_mut,
+                                                    &profiles_read,
+                                                    &profile_name,
+                                                    IrcEvent::System {
+                                                        channel: current_channel,
+                                                        text: format!("[NAIS] Discovered peer: {} ({}:{}) in channel {}", 
+                                                            from, ip, port, &channel_id[..8.min(channel_id.len())]),
+                                                    },
+                                                );
+                                                drop(state_mut);
+                                                
+                                                log::info!("NAIS peer discovered: {} fingerprint={} at {}:{}", 
+                                                    from, fingerprint, ip, port);
+                                            }
+                                        }
+                                        crate::nais_channel::CTCP_NAIS_JOIN | 
+                                        crate::nais_channel::CTCP_NAIS_ACCEPT |
+                                        crate::nais_channel::CTCP_NAIS_CONNECT |
+                                        crate::nais_channel::CTCP_NAIS_LEAVE => {
+                                            // Log other NAIS commands for debugging
+                                            log::info!("NAIS {} from {}: {:?}", command, from, args);
+                                        }
+                                        crate::nais_channel::CTCP_NAIS_CHANNEL_INVITE => {
+                                            // Someone is inviting us to a channel
+                                            // Format: channel server type(nais|irc)
+                                            if args.len() >= 3 {
+                                                let channel = &args[0];
+                                                let server = &args[1];
+                                                let channel_type = &args[2];
+                                                
+                                                // Get current channel before borrowing state mutably
+                                                let current_channel = state_handle.read().servers.get(&profile_name)
+                                                    .map(|s| s.current_channel.clone())
+                                                    .unwrap_or_default();
+                                                
+                                                // Add system message about the invite
+                                                let mut state_mut = state_handle.write();
+                                                let profiles_read = profiles.read();
+                                                let type_indicator = if channel_type == "nais" { "🔒" } else { "" };
+                                                apply_event_with_config(
+                                                    &mut state_mut,
+                                                    &profiles_read,
+                                                    &profile_name,
+                                                    IrcEvent::System {
+                                                        channel: current_channel,
+                                                        text: format!("[NAIS] {} {} invites you to join {}{} on {}", 
+                                                            type_indicator, from, channel, 
+                                                            if channel_type == "nais" { " (NAIS encrypted)" } else { "" },
+                                                            server),
+                                                    },
+                                                );
+                                                drop(state_mut);
+                                                
+                                                log::info!("NAIS channel invite from {}: channel={} server={} type={}", 
+                                                    from, channel, server, channel_type);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                IrcEvent::Topic { channel, topic } => {
+                                    // Check if this is a NAIS channel topic
+                                    if crate::nais_channel::is_nais_topic(topic) {
+                                        if let Some((_version, channel_id, _fingerprint)) = crate::nais_channel::parse_nais_topic(topic) {
+                                            // This is a NAIS channel - auto-probe users
+                                            let state_read = state_handle.read();
+                                            if let Some(server) = state_read.servers.get(&profile_name) {
+                                                if let Some(users) = server.users_by_channel.get(channel.as_str()) {
+                                                    let our_nick = server.nickname.clone();
+                                                    let probe_msg = crate::nais_channel::create_probe_ctcp(channel);
+                                                    
+                                                    // Probe each user in the channel
+                                                    for user in users {
+                                                        let clean_user = user.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~');
+                                                        if clean_user == our_nick {
+                                                            continue;
+                                                        }
+                                                        
+                                                        if let Some(core) = cores.read().get(&profile_name) {
+                                                            let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                                target: clean_user.to_string(),
+                                                                message: probe_msg.clone(),
+                                                            });
+                                                        }
+                                                    }
+                                                    
+                                                    // Add system message
+                                                    drop(state_read);
+                                                    let mut state_mut = state_handle.write();
+                                                    let profiles_read = profiles.read();
+                                                    apply_event_with_config(
+                                                        &mut state_mut,
+                                                        &profiles_read,
+                                                        &profile_name,
+                                                        IrcEvent::System {
+                                                            channel: channel.clone(),
+                                                            text: format!("[NAIS] Detected secure channel (ID: {}). Probing for peers...", 
+                                                                &channel_id[..8.min(channel_id.len())]),
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 _ => {}
                             }
                             
@@ -644,6 +884,7 @@ fn app() -> Element {
                                 ss.nickname.clone(),
                                 ss.current_channel.clone(),
                                 profile.use_tls,
+                                profile.hide_host,
                                 prof_name,
                                 state,
                                 profiles,
@@ -892,6 +1133,7 @@ fn app() -> Element {
                                                             ss.nickname.clone(),
                                                             ss.current_channel.clone(),
                                                             prof.use_tls,
+                                                            prof.hide_host,
                                                             prof_name_clone.clone(),
                                                             state,
                                                             profiles,
@@ -919,6 +1161,7 @@ fn app() -> Element {
                                                         edit_channel_input.set(profile.channel.clone());
                                                         edit_tls_input.set(profile.use_tls);
                                                         edit_auto_connect_input.set(profile.auto_connect);
+                                                        edit_hide_host_input.set(profile.hide_host);
                                                     }
                                                     drop(profs);
                                                     
@@ -1614,8 +1857,10 @@ fn app() -> Element {
                                                                         e.stop_propagation();
                                                                         if user_menu_open.read().as_ref() == Some(&key) {
                                                                             user_menu_open.set(None);
+                                                                            ctcp_submenu_open.set(false);
                                                                         } else {
                                                                             user_menu_open.set(Some(key.clone()));
+                                                                            ctcp_submenu_open.set(false);
                                                                         }
                                                                     }
                                                                 },
@@ -1635,6 +1880,7 @@ fn app() -> Element {
                                                                             let nick = user_nick.clone();
                                                                             move |_| {
                                                                                 user_menu_open.set(None);
+                                                                                ctcp_submenu_open.set(false);
                                                                                 // Open private message tab with this user
                                                                                 let active = state.read().active_profile.clone();
                                                                                 {
@@ -1672,6 +1918,7 @@ fn app() -> Element {
                                                                                     let nick = user_nick.clone();
                                                                                     move |_| {
                                                                                         user_menu_open.set(None);
+                                                                                        ctcp_submenu_open.set(false);
                                                                                         if !can_invite { return; }
                                                                                         
                                                                                         // Send voice channel invite using stored external IP
@@ -1705,6 +1952,7 @@ fn app() -> Element {
                                                                                     let nick = user_nick.clone();
                                                                                     move |_| {
                                                                                         user_menu_open.set(None);
+                                                                                        ctcp_submenu_open.set(false);
                                                                                         if !can_call { return; }
                                                                                         
                                                                                         // Generate session ID and get local IP
@@ -1750,21 +1998,37 @@ fn app() -> Element {
                                                                             let nick = user_nick.clone();
                                                                             move |_| {
                                                                                 user_menu_open.set(None);
-                                                                                // Set input to /invite command (user will need to add channel)
-                                                                                let mut input_clone = input.clone();
-                                                                                input_clone.set(format!("/invite {} ", nick));
+                                                                                ctcp_submenu_open.set(false);
+                                                                                
+                                                                                // Add to pending invite probes
+                                                                                pending_invite_probes.write().insert(nick.clone(), true);
+                                                                                
+                                                                                // Send VERSION probe to detect if they're a NAIS client
+                                                                                if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                    let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                                                        target: nick.clone(),
+                                                                                        message: "\x01VERSION\x01".to_string(),
+                                                                                    });
+                                                                                }
                                                                             }
                                                                         },
                                                                         "📨 Invite to Channel"
                                                                     }
-                                                                    // Whois option (advanced only)
+                                                                    // Advanced options (hidden unless advanced mode is enabled)
                                                                     if *settings_show_advanced.read() {
+                                                                        // Separator
+                                                                        div {
+                                                                            class: "menu-separator",
+                                                                            style: "height: 1px; background: var(--border); margin: 4px 8px;"
+                                                                        }
+                                                                        // Whois option
                                                                         button {
                                                                             class: "menu-item",
                                                                             onclick: {
                                                                                 let nick = user_nick.clone();
                                                                                 move |_| {
                                                                                     user_menu_open.set(None);
+                                                                                    ctcp_submenu_open.set(false);
                                                                                     // Send /whois command directly
                                                                                     if let Some(core) = cores.read().get(&state.read().active_profile) {
                                                                                         let _ = core.cmd_tx.try_send(IrcCommandEvent::Whois { nickname: nick.clone() });
@@ -1772,6 +2036,302 @@ fn app() -> Element {
                                                                                 }
                                                                             },
                                                                             "🔍 Whois"
+                                                                        }
+                                                                        // CTCP Submenu
+                                                                        div {
+                                                                            class: "menu-submenu-container",
+                                                                            style: "position: relative;",
+                                                                            button {
+                                                                                class: "menu-item submenu-trigger",
+                                                                                onclick: move |e: Event<MouseData>| {
+                                                                                    e.stop_propagation();
+                                                                                    ctcp_submenu_open.set(!ctcp_submenu_open());
+                                                                                },
+                                                                                "📡 CTCP"
+                                                                                span {
+                                                                                    style: "font-size: 10px; margin-left: auto;",
+                                                                                    if ctcp_submenu_open() { "▲" } else { "▼" }
+                                                                                }
+                                                                            }
+                                                                            if ctcp_submenu_open() {
+                                                                                div {
+                                                                                    class: "ctcp-submenu",
+                                                                                    onclick: move |e: Event<MouseData>| {
+                                                                                        e.stop_propagation();
+                                                                                    },
+                                                                                    // VERSION
+                                                                                    button {
+                                                                                        class: "menu-item",
+                                                                                        title: "Request client name and version",
+                                                                                        onclick: {
+                                                                                            let nick = user_nick.clone();
+                                                                                            move |_| {
+                                                                                                user_menu_open.set(None);
+                                                                                                ctcp_submenu_open.set(false);
+                                                                                                if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                                    let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                                                                        target: nick.clone(),
+                                                                                                        message: "\x01VERSION\x01".to_string(),
+                                                                                                    });
+                                                                                                }
+                                                                                            }
+                                                                                        },
+                                                                                        "VERSION"
+                                                                                    }
+                                                                                    // PING
+                                                                                    button {
+                                                                                        class: "menu-item",
+                                                                                        title: "Measure latency to user",
+                                                                                        onclick: {
+                                                                                            let nick = user_nick.clone();
+                                                                                            move |_| {
+                                                                                                user_menu_open.set(None);
+                                                                                                ctcp_submenu_open.set(false);
+                                                                                                let timestamp = chrono::Utc::now().timestamp().to_string();
+                                                                                                if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                                    let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                                                                        target: nick.clone(),
+                                                                                                        message: format!("\x01PING {}\x01", timestamp),
+                                                                                                    });
+                                                                                                }
+                                                                                            }
+                                                                                        },
+                                                                                        "PING"
+                                                                                    }
+                                                                                    // TIME
+                                                                                    button {
+                                                                                        class: "menu-item",
+                                                                                        title: "Request local time",
+                                                                                        onclick: {
+                                                                                            let nick = user_nick.clone();
+                                                                                            move |_| {
+                                                                                                user_menu_open.set(None);
+                                                                                                ctcp_submenu_open.set(false);
+                                                                                                if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                                    let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                                                                        target: nick.clone(),
+                                                                                                        message: "\x01TIME\x01".to_string(),
+                                                                                                    });
+                                                                                                }
+                                                                                            }
+                                                                                        },
+                                                                                        "TIME"
+                                                                                    }
+                                                                                    // FINGER
+                                                                                    button {
+                                                                                        class: "menu-item",
+                                                                                        title: "Request user info and idle time",
+                                                                                        onclick: {
+                                                                                            let nick = user_nick.clone();
+                                                                                            move |_| {
+                                                                                                user_menu_open.set(None);
+                                                                                                ctcp_submenu_open.set(false);
+                                                                                                if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                                    let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                                                                        target: nick.clone(),
+                                                                                                        message: "\x01FINGER\x01".to_string(),
+                                                                                                    });
+                                                                                                }
+                                                                                            }
+                                                                                        },
+                                                                                        "FINGER"
+                                                                                    }
+                                                                                    // CLIENTINFO
+                                                                                    button {
+                                                                                        class: "menu-item",
+                                                                                        title: "List supported CTCP commands",
+                                                                                        onclick: {
+                                                                                            let nick = user_nick.clone();
+                                                                                            move |_| {
+                                                                                                user_menu_open.set(None);
+                                                                                                ctcp_submenu_open.set(false);
+                                                                                                if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                                    let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                                                                        target: nick.clone(),
+                                                                                                        message: "\x01CLIENTINFO\x01".to_string(),
+                                                                                                    });
+                                                                                                }
+                                                                                            }
+                                                                                        },
+                                                                                        "CLIENTINFO"
+                                                                                    }
+                                                                                    // SOURCE
+                                                                                    button {
+                                                                                        class: "menu-item",
+                                                                                        title: "Request client source URL",
+                                                                                        onclick: {
+                                                                                            let nick = user_nick.clone();
+                                                                                            move |_| {
+                                                                                                user_menu_open.set(None);
+                                                                                                ctcp_submenu_open.set(false);
+                                                                                                if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                                    let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                                                                        target: nick.clone(),
+                                                                                                        message: "\x01SOURCE\x01".to_string(),
+                                                                                                    });
+                                                                                                }
+                                                                                            }
+                                                                                        },
+                                                                                        "SOURCE"
+                                                                                    }
+                                                                                    // USERINFO
+                                                                                    button {
+                                                                                        class: "menu-item",
+                                                                                        title: "Request user-defined info string",
+                                                                                        onclick: {
+                                                                                            let nick = user_nick.clone();
+                                                                                            move |_| {
+                                                                                                user_menu_open.set(None);
+                                                                                                ctcp_submenu_open.set(false);
+                                                                                                if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                                    let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                                                                        target: nick.clone(),
+                                                                                                        message: "\x01USERINFO\x01".to_string(),
+                                                                                                    });
+                                                                                                }
+                                                                                            }
+                                                                                        },
+                                                                                        "USERINFO"
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        // Separator before channel ops
+                                                                        div {
+                                                                            class: "menu-separator",
+                                                                            style: "height: 1px; background: var(--border); margin: 4px 8px;"
+                                                                        }
+                                                                        // Op
+                                                                        button {
+                                                                            class: "menu-item",
+                                                                            title: "Give operator status (+o)",
+                                                                            onclick: {
+                                                                                let nick = user_nick.clone();
+                                                                                let chan = current_channel.clone();
+                                                                                move |_| {
+                                                                                    user_menu_open.set(None);
+                                                                                    ctcp_submenu_open.set(false);
+                                                                                    if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Mode {
+                                                                                            target: chan.clone(),
+                                                                                            modes: "+o".to_string(),
+                                                                                            args: Some(nick.clone()),
+                                                                                        });
+                                                                                    }
+                                                                                }
+                                                                            },
+                                                                            "👑 Op"
+                                                                        }
+                                                                        // Deop
+                                                                        button {
+                                                                            class: "menu-item",
+                                                                            title: "Remove operator status (-o)",
+                                                                            onclick: {
+                                                                                let nick = user_nick.clone();
+                                                                                let chan = current_channel.clone();
+                                                                                move |_| {
+                                                                                    user_menu_open.set(None);
+                                                                                    ctcp_submenu_open.set(false);
+                                                                                    if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Mode {
+                                                                                            target: chan.clone(),
+                                                                                            modes: "-o".to_string(),
+                                                                                            args: Some(nick.clone()),
+                                                                                        });
+                                                                                    }
+                                                                                }
+                                                                            },
+                                                                            "👑 Deop"
+                                                                        }
+                                                                        // Voice
+                                                                        button {
+                                                                            class: "menu-item",
+                                                                            title: "Give voice (+v)",
+                                                                            onclick: {
+                                                                                let nick = user_nick.clone();
+                                                                                let chan = current_channel.clone();
+                                                                                move |_| {
+                                                                                    user_menu_open.set(None);
+                                                                                    ctcp_submenu_open.set(false);
+                                                                                    if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Mode {
+                                                                                            target: chan.clone(),
+                                                                                            modes: "+v".to_string(),
+                                                                                            args: Some(nick.clone()),
+                                                                                        });
+                                                                                    }
+                                                                                }
+                                                                            },
+                                                                            "🎤 Voice"
+                                                                        }
+                                                                        // Devoice
+                                                                        button {
+                                                                            class: "menu-item",
+                                                                            title: "Remove voice (-v)",
+                                                                            onclick: {
+                                                                                let nick = user_nick.clone();
+                                                                                let chan = current_channel.clone();
+                                                                                move |_| {
+                                                                                    user_menu_open.set(None);
+                                                                                    ctcp_submenu_open.set(false);
+                                                                                    if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Mode {
+                                                                                            target: chan.clone(),
+                                                                                            modes: "-v".to_string(),
+                                                                                            args: Some(nick.clone()),
+                                                                                        });
+                                                                                    }
+                                                                                }
+                                                                            },
+                                                                            "🔇 Devoice"
+                                                                        }
+                                                                        // Separator before kick/ban
+                                                                        div {
+                                                                            class: "menu-separator",
+                                                                            style: "height: 1px; background: var(--border); margin: 4px 8px;"
+                                                                        }
+                                                                        // Kick
+                                                                        button {
+                                                                            class: "menu-item danger",
+                                                                            title: "Kick user from channel",
+                                                                            onclick: {
+                                                                                let nick = user_nick.clone();
+                                                                                let chan = current_channel.clone();
+                                                                                move |_| {
+                                                                                    user_menu_open.set(None);
+                                                                                    ctcp_submenu_open.set(false);
+                                                                                    if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Kick {
+                                                                                            channel: chan.clone(),
+                                                                                            user: nick.clone(),
+                                                                                            reason: None,
+                                                                                        });
+                                                                                    }
+                                                                                }
+                                                                            },
+                                                                            "🚪 Kick"
+                                                                        }
+                                                                        // Ban
+                                                                        button {
+                                                                            class: "menu-item danger",
+                                                                            title: "Ban user from channel (+b)",
+                                                                            onclick: {
+                                                                                let nick = user_nick.clone();
+                                                                                let chan = current_channel.clone();
+                                                                                move |_| {
+                                                                                    user_menu_open.set(None);
+                                                                                    ctcp_submenu_open.set(false);
+                                                                                    let ban_mask = format!("{}!*@*", nick);
+                                                                                    if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Mode {
+                                                                                            target: chan.clone(),
+                                                                                            modes: "+b".to_string(),
+                                                                                            args: Some(ban_mask),
+                                                                                        });
+                                                                                    }
+                                                                                }
+                                                                            },
+                                                                            "🚫 Ban"
                                                                         }
                                                                     }
                                                                 }
@@ -2293,6 +2853,233 @@ fn app() -> Element {
                 }
             }
 
+            // CTCP response popup
+            if let Some(info) = ctcp_response_popup() {
+                div {
+                    class: "ctcp-popup-overlay",
+                    onclick: move |_| {
+                        ctcp_response_popup.set(None);
+                    },
+                    div {
+                        class: "ctcp-popup",
+                        onclick: move |e: Event<MouseData>| {
+                            e.stop_propagation();
+                        },
+                        div {
+                            class: "ctcp-popup-header",
+                            h3 {
+                                "📡 CTCP {info.command}"
+                            }
+                            button {
+                                class: "ctcp-popup-close",
+                                onclick: move |_| {
+                                    ctcp_response_popup.set(None);
+                                },
+                                "✕"
+                            }
+                        }
+                        div {
+                            class: "ctcp-popup-content",
+                            div {
+                                class: "ctcp-row",
+                                span { class: "ctcp-label", "From" }
+                                span { class: "ctcp-value", "{info.from}" }
+                            }
+                            div {
+                                class: "ctcp-row",
+                                span { class: "ctcp-label", "Command" }
+                                span { class: "ctcp-value ctcp-command", "{info.command}" }
+                            }
+                            div {
+                                class: "ctcp-row",
+                                span { class: "ctcp-label", "Response" }
+                                span { class: "ctcp-value ctcp-response-text", "{info.response}" }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Channel invite popup
+            if let Some(info) = channel_invite_popup() {
+                {
+                    // Collect available channels based on whether target is NAIS client
+                    let channels: Vec<InviteChannelOption> = if info.is_nais_client {
+                        // NAIS client: show all channels from all servers
+                        let state_read = state.read();
+                        state_read.servers.iter().flat_map(|(profile_name, server_state)| {
+                            server_state.channels.iter()
+                                .filter(|ch| ch.starts_with('#')) // Only real channels, not PMs
+                                .map(|ch| {
+                                    let is_nais = server_state.topics_by_channel.get(ch)
+                                        .map(|t| crate::nais_channel::is_nais_topic(t))
+                                        .unwrap_or(false);
+                                    InviteChannelOption {
+                                        display_name: if profile_name == &info.current_profile {
+                                            ch.clone()
+                                        } else {
+                                            format!("{} ({})", ch, server_state.server)
+                                        },
+                                        channel: ch.clone(),
+                                        profile: profile_name.clone(),
+                                        server: server_state.server.clone(),
+                                        is_nais,
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        }).collect()
+                    } else {
+                        // Non-NAIS client: show only non-NAIS IRC channels on the same server
+                        let state_read = state.read();
+                        if let Some(server_state) = state_read.servers.get(&info.current_profile) {
+                            server_state.channels.iter()
+                                .filter(|ch| ch.starts_with('#')) // Only real channels
+                                .filter(|ch| {
+                                    // Exclude NAIS channels
+                                    !server_state.topics_by_channel.get(*ch)
+                                        .map(|t| crate::nais_channel::is_nais_topic(t))
+                                        .unwrap_or(false)
+                                })
+                                .map(|ch| InviteChannelOption {
+                                    display_name: ch.clone(),
+                                    channel: ch.clone(),
+                                    profile: info.current_profile.clone(),
+                                    server: server_state.server.clone(),
+                                    is_nais: false,
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    
+                    rsx! {
+                        div {
+                            class: "channel-invite-overlay",
+                            style: "position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 999; display: flex; align-items: center; justify-content: center;",
+                            onclick: move |_| {
+                                channel_invite_popup.set(None);
+                            },
+                            div {
+                                class: "channel-invite-popup",
+                                style: "background: var(--input-bg); border: 2px solid var(--accent-color); border-radius: 12px; padding: 20px; min-width: 350px; max-width: 500px; max-height: 70vh; display: flex; flex-direction: column; box-shadow: 0 8px 32px rgba(0,0,0,0.5);",
+                                onclick: move |e: Event<MouseData>| {
+                                    e.stop_propagation();
+                                },
+                                // Header
+                                div {
+                                    style: "display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;",
+                                    h3 {
+                                        style: "margin: 0; color: var(--accent-color);",
+                                        "📨 Invite {info.target_nick} to Channel"
+                                    }
+                                    button {
+                                        style: "background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 18px;",
+                                        onclick: move |_| {
+                                            channel_invite_popup.set(None);
+                                        },
+                                        "✕"
+                                    }
+                                }
+                                // Status indicator
+                                div {
+                                    style: "margin-bottom: 12px; padding: 8px 12px; background: var(--bg); border-radius: 6px; font-size: 13px;",
+                                    if info.is_nais_client {
+                                        span {
+                                            style: "color: #4CAF50;",
+                                            "✓ NAIS client detected - showing all channels across servers"
+                                        }
+                                    } else {
+                                        span {
+                                            style: "color: var(--text-muted);",
+                                            "Standard IRC client - showing channels on this server"
+                                        }
+                                    }
+                                }
+                                // Channel list
+                                div {
+                                    style: "flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px;",
+                                    if channels.is_empty() {
+                                        div {
+                                            style: "color: var(--text-muted); text-align: center; padding: 20px;",
+                                            "No channels available to invite to"
+                                        }
+                                    } else {
+                                        for channel_opt in channels.iter() {
+                                            {
+                                                let channel = channel_opt.channel.clone();
+                                                let profile = channel_opt.profile.clone();
+                                                let server = channel_opt.server.clone();
+                                                let target_nick = info.target_nick.clone();
+                                                let is_nais_channel = channel_opt.is_nais;
+                                                let is_cross_server = profile != info.current_profile;
+                                                let is_nais_client = info.is_nais_client;
+                                                
+                                                rsx! {
+                                                    button {
+                                                        style: "display: flex; align-items: center; gap: 8px; padding: 10px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; text-align: left; width: 100%; transition: background 0.15s;",
+                                                        onclick: move |_| {
+                                                            channel_invite_popup.set(None);
+                                                            
+                                                            if is_nais_client && (is_cross_server || is_nais_channel) {
+                                                                // Send NAIS channel invite CTCP with full info
+                                                                let invite_msg = format!(
+                                                                    "\x01NAIS_CHANNEL_INVITE {} {} {}\x01",
+                                                                    channel,
+                                                                    server,
+                                                                    if is_nais_channel { "nais" } else { "irc" }
+                                                                );
+                                                                if let Some(core) = cores.read().get(&profile) {
+                                                                    let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                                        target: target_nick.clone(),
+                                                                        message: invite_msg,
+                                                                    });
+                                                                }
+                                                            } else {
+                                                                // Standard IRC invite
+                                                                if let Some(core) = cores.read().get(&profile) {
+                                                                    let _ = core.cmd_tx.try_send(IrcCommandEvent::Invite {
+                                                                        nickname: target_nick.clone(),
+                                                                        channel: channel.clone(),
+                                                                    });
+                                                                }
+                                                            }
+                                                        },
+                                                        span {
+                                                            style: "font-size: 14px;",
+                                                            if is_nais_channel { "🔒" } else { "#" }
+                                                        }
+                                                        div {
+                                                            style: "flex: 1; display: flex; flex-direction: column;",
+                                                            span {
+                                                                style: "font-weight: 500;",
+                                                                "{channel_opt.display_name}"
+                                                            }
+                                                            if is_cross_server {
+                                                                span {
+                                                                    style: "font-size: 11px; color: var(--text-muted);",
+                                                                    "Cross-server invite via NAIS"
+                                                                }
+                                                            }
+                                                        }
+                                                        if is_nais_channel {
+                                                            span {
+                                                                style: "font-size: 11px; color: #4CAF50; background: rgba(76,175,80,0.1); padding: 2px 6px; border-radius: 4px;",
+                                                                "NAIS"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Input composer
             div {
                 class: "composer",
@@ -2754,6 +3541,22 @@ fn app() -> Element {
                                 "Use TLS/SSL"
                             }
                         }
+                        if *settings_show_advanced.read() {
+                            div {
+                                class: "input",
+                                style: "display: flex; align-items: center; gap: 10px;",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: "{new_hide_host_input}",
+                                    onchange: move |evt| {
+                                        new_hide_host_input.set(evt.checked());
+                                    },
+                                }
+                                label {
+                                    "Hide hostname (MODE +x)"
+                                }
+                            }
+                        }
                         div {
                             class: "input",
                             style: "display: flex; align-items: center; gap: 10px;",
@@ -2786,6 +3589,7 @@ fn app() -> Element {
                                 let channel = new_channel_input.read().trim().to_string();
                                 let use_tls = *new_tls_input.read();
                                 let auto_connect = *new_auto_connect_input.read();
+                                let hide_host = *new_hide_host_input.read();
 
                                 if server.is_empty() || nickname.is_empty() {
                                     return;
@@ -2802,6 +3606,7 @@ fn app() -> Element {
                                     enable_logging: true,
                                     scrollback_limit: 1000,
                                     log_buffer_size: 1000,
+                                    hide_host,
                                 };
 
                                 let mut profs = profiles.write();
@@ -2835,6 +3640,7 @@ fn app() -> Element {
                                 new_channel_input.set(String::new());
                                 new_tls_input.set(true);
                                 new_auto_connect_input.set(true);
+                                new_hide_host_input.set(true);
                                 show_new_profile.set(false);
                             },
                             "Create"
@@ -2914,6 +3720,20 @@ fn app() -> Element {
                                     "Use TLS/SSL"
                                 }
                             }
+                            div {
+                                class: "input",
+                                style: "display: flex; align-items: center; gap: 10px;",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: "{edit_hide_host_input}",
+                                    onchange: move |evt| {
+                                        edit_hide_host_input.set(evt.checked());
+                                    },
+                                }
+                                label {
+                                    "Hide hostname (MODE +x)"
+                                }
+                            }
                         }
                         div {
                             class: "input",
@@ -2949,6 +3769,7 @@ fn app() -> Element {
                                 let channel = edit_channel_input.read().trim().to_string();
                                 let use_tls = *edit_tls_input.read();
                                 let auto_connect = *edit_auto_connect_input.read();
+                                let hide_host = *edit_hide_host_input.read();
 
                                 if new_name.is_empty() || server.is_empty() || nickname.is_empty() {
                                     return;
@@ -2964,6 +3785,7 @@ fn app() -> Element {
                                     profs[prof_idx].channel = channel.clone();
                                     profs[prof_idx].use_tls = use_tls;
                                     profs[prof_idx].auto_connect = auto_connect;
+                                    profs[prof_idx].hide_host = hide_host;
                                     drop(profs);
 
                                     // Update server state with the new name and values
@@ -3092,6 +3914,7 @@ fn app() -> Element {
                                             enable_logging: true,
                                             scrollback_limit: 1000,
                                             log_buffer_size: 1000,
+                                            hide_host: true,
                                         };
 
                                         let mut profs = profiles.write();
@@ -4431,6 +5254,716 @@ fn handle_send_message(
                     }
                 }
             }
+            "/quit" | "/disconnect" => {
+                let message = if arg.is_empty() { None } else { Some(arg.clone()) };
+                if let Some(handle) = handle.as_ref() {
+                    let _ = handle.cmd_tx.try_send(IrcCommandEvent::Quit {
+                        message: message.clone(),
+                    });
+                }
+                let quit_text = message
+                    .map(|m| format!("Disconnecting: {}", m))
+                    .unwrap_or_else(|| "Disconnecting...".to_string());
+                apply_event_with_config(
+                    &mut state.write(),
+                    &profiles.read(),
+                    &active_profile,
+                    IrcEvent::System {
+                        channel,
+                        text: quit_text,
+                    },
+                );
+            }
+            "/list" => {
+                if let Some(handle) = handle.as_ref() {
+                    let _ = handle.cmd_tx.try_send(IrcCommandEvent::List);
+                }
+                apply_event_with_config(
+                    &mut state.write(),
+                    &profiles.read(),
+                    &active_profile,
+                    IrcEvent::System {
+                        channel,
+                        text: "Fetching channel list...".to_string(),
+                    },
+                );
+            }
+            "/ctcp" => {
+                let mut ctcp_parts = arg.splitn(3, ' ');
+                let target = ctcp_parts.next().unwrap_or("").trim().to_string();
+                let ctcp_cmd = ctcp_parts.next().unwrap_or("").trim().to_uppercase();
+                let ctcp_args = ctcp_parts.next().unwrap_or("").trim().to_string();
+                
+                if target.is_empty() || ctcp_cmd.is_empty() {
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: "Usage: /ctcp <target> <command> [args]".to_string(),
+                        },
+                    );
+                } else {
+                    let ctcp_msg = if ctcp_args.is_empty() {
+                        format!("\x01{}\x01", ctcp_cmd)
+                    } else {
+                        format!("\x01{} {}\x01", ctcp_cmd, ctcp_args)
+                    };
+                    if let Some(handle) = handle.as_ref() {
+                        let _ = handle.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                            target: target.clone(),
+                            message: ctcp_msg,
+                        });
+                    }
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: format!("CTCP {} sent to {}", ctcp_cmd, target),
+                        },
+                    );
+                }
+            }
+            "/ping" => {
+                if arg.is_empty() {
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: "Usage: /ping <nickname>".to_string(),
+                        },
+                    );
+                } else {
+                    let timestamp = chrono::Utc::now().timestamp().to_string();
+                    let ctcp_msg = format!("\x01PING {}\x01", timestamp);
+                    if let Some(handle) = handle.as_ref() {
+                        let _ = handle.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                            target: arg.clone(),
+                            message: ctcp_msg,
+                        });
+                    }
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: format!("PING sent to {}...", arg),
+                        },
+                    );
+                }
+            }
+            "/version" => {
+                if arg.is_empty() {
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: "Usage: /version <nickname>".to_string(),
+                        },
+                    );
+                } else {
+                    let ctcp_msg = "\x01VERSION\x01".to_string();
+                    if let Some(handle) = handle.as_ref() {
+                        let _ = handle.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                            target: arg.clone(),
+                            message: ctcp_msg,
+                        });
+                    }
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: format!("VERSION request sent to {}...", arg),
+                        },
+                    );
+                }
+            }
+            "/time" => {
+                if arg.is_empty() {
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: "Usage: /time <nickname>".to_string(),
+                        },
+                    );
+                } else {
+                    let ctcp_msg = "\x01TIME\x01".to_string();
+                    if let Some(handle) = handle.as_ref() {
+                        let _ = handle.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                            target: arg.clone(),
+                            message: ctcp_msg,
+                        });
+                    }
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: format!("TIME request sent to {}...", arg),
+                        },
+                    );
+                }
+            }
+            "/raw" | "/quote" => {
+                if arg.is_empty() {
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: "Usage: /raw <irc command>".to_string(),
+                        },
+                    );
+                } else {
+                    if let Some(handle) = handle.as_ref() {
+                        let _ = handle.cmd_tx.try_send(IrcCommandEvent::Raw {
+                            command: arg.clone(),
+                        });
+                    }
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: format!("Sent: {}", arg),
+                        },
+                    );
+                }
+            }
+            "/op" => {
+                if arg.is_empty() {
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: "Usage: /op <nickname>".to_string(),
+                        },
+                    );
+                } else {
+                    if let Some(handle) = handle.as_ref() {
+                        let _ = handle.cmd_tx.try_send(IrcCommandEvent::Mode {
+                            target: channel.clone(),
+                            modes: "+o".to_string(),
+                            args: Some(arg.clone()),
+                        });
+                    }
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: format!("Giving operator status to {}...", arg),
+                        },
+                    );
+                }
+            }
+            "/deop" => {
+                if arg.is_empty() {
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: "Usage: /deop <nickname>".to_string(),
+                        },
+                    );
+                } else {
+                    if let Some(handle) = handle.as_ref() {
+                        let _ = handle.cmd_tx.try_send(IrcCommandEvent::Mode {
+                            target: channel.clone(),
+                            modes: "-o".to_string(),
+                            args: Some(arg.clone()),
+                        });
+                    }
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: format!("Removing operator status from {}...", arg),
+                        },
+                    );
+                }
+            }
+            "/devoice" => {
+                if arg.is_empty() {
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: "Usage: /devoice <nickname>".to_string(),
+                        },
+                    );
+                } else {
+                    if let Some(handle) = handle.as_ref() {
+                        let _ = handle.cmd_tx.try_send(IrcCommandEvent::Mode {
+                            target: channel.clone(),
+                            modes: "-v".to_string(),
+                            args: Some(arg.clone()),
+                        });
+                    }
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: format!("Removing voice from {}...", arg),
+                        },
+                    );
+                }
+            }
+            "/ban" => {
+                if arg.is_empty() {
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: "Usage: /ban <nick!user@host or nickname>".to_string(),
+                        },
+                    );
+                } else {
+                    // If it's just a nickname, convert to *!*@nick.* pattern
+                    let ban_mask = if arg.contains('!') || arg.contains('@') {
+                        arg.clone()
+                    } else {
+                        format!("{}!*@*", arg)
+                    };
+                    if let Some(handle) = handle.as_ref() {
+                        let _ = handle.cmd_tx.try_send(IrcCommandEvent::Mode {
+                            target: channel.clone(),
+                            modes: "+b".to_string(),
+                            args: Some(ban_mask.clone()),
+                        });
+                    }
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: format!("Banning {}...", ban_mask),
+                        },
+                    );
+                }
+            }
+            "/unban" => {
+                if arg.is_empty() {
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: "Usage: /unban <nick!user@host or nickname>".to_string(),
+                        },
+                    );
+                } else {
+                    let ban_mask = if arg.contains('!') || arg.contains('@') {
+                        arg.clone()
+                    } else {
+                        format!("{}!*@*", arg)
+                    };
+                    if let Some(handle) = handle.as_ref() {
+                        let _ = handle.cmd_tx.try_send(IrcCommandEvent::Mode {
+                            target: channel.clone(),
+                            modes: "-b".to_string(),
+                            args: Some(ban_mask.clone()),
+                        });
+                    }
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: format!("Unbanning {}...", ban_mask),
+                        },
+                    );
+                }
+            }
+            "/kickban" | "/kb" => {
+                let mut kb_parts = arg.splitn(2, ' ');
+                let user = kb_parts.next().unwrap_or("").trim().to_string();
+                let reason = kb_parts.next().map(|val| val.trim().to_string());
+                
+                if user.is_empty() {
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: "Usage: /kickban <nickname> [reason]".to_string(),
+                        },
+                    );
+                } else {
+                    // Ban first
+                    let ban_mask = format!("{}!*@*", user);
+                    if let Some(handle) = handle.as_ref() {
+                        let _ = handle.cmd_tx.try_send(IrcCommandEvent::Mode {
+                            target: channel.clone(),
+                            modes: "+b".to_string(),
+                            args: Some(ban_mask),
+                        });
+                        // Then kick
+                        let _ = handle.cmd_tx.try_send(IrcCommandEvent::Kick {
+                            channel: channel.clone(),
+                            user: user.clone(),
+                            reason,
+                        });
+                    }
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: format!("Kick-banning {}...", user),
+                        },
+                    );
+                }
+            }
+            "/names" => {
+                // Request names list for current or specified channel
+                let target = if arg.is_empty() {
+                    channel.clone()
+                } else if arg.starts_with('#') {
+                    arg.clone()
+                } else {
+                    format!("#{}", arg)
+                };
+                if let Some(handle) = handle.as_ref() {
+                    let _ = handle.cmd_tx.try_send(IrcCommandEvent::Raw {
+                        command: format!("NAMES {}", target),
+                    });
+                }
+                apply_event_with_config(
+                    &mut state.write(),
+                    &profiles.read(),
+                    &active_profile,
+                    IrcEvent::System {
+                        channel,
+                        text: format!("Requesting names for {}...", target),
+                    },
+                );
+            }
+            "/clear" => {
+                // Clear messages for current channel
+                {
+                    let mut state_write = state.write();
+                    if let Some(server) = state_write.servers.get_mut(&active_profile) {
+                        server.messages.retain(|m| m.channel != channel);
+                    }
+                }
+                apply_event_with_config(
+                    &mut state.write(),
+                    &profiles.read(),
+                    &active_profile,
+                    IrcEvent::System {
+                        channel,
+                        text: "Chat cleared.".to_string(),
+                    },
+                );
+            }
+            "/help" => {
+                let help_text = if arg.is_empty() {
+                    "Available commands: /join /part /nick /me /msg /query /notice /whois /who /topic /mode /kick /invite /away /quit /list /ctcp /ping /version /time /raw /op /deop /devoice /ban /unban /kickban /names /clear /voice /hangup /naiscreate /naisjoin /naisleave /naislist /naisprobe /help\n\nUse /help <command> for more info."
+                } else {
+                    match arg.trim_start_matches('/').to_lowercase().as_str() {
+                        "join" => "/join <#channel> - Join a channel",
+                        "part" => "/part [#channel] [reason] - Leave a channel",
+                        "nick" => "/nick <newname> - Change your nickname",
+                        "me" => "/me <action> - Send an action message",
+                        "msg" | "query" => "/msg <target> <message> - Send a private message\n/query <target> - Open a private message window",
+                        "notice" => "/notice <target> <message> - Send a notice",
+                        "whois" => "/whois <nickname> - Get information about a user",
+                        "who" => "/who [target] - List users in channel",
+                        "topic" => "/topic [#channel] [new topic] - View or set channel topic",
+                        "mode" => "/mode [target] <modes> [args] - Set channel/user modes",
+                        "kick" => "/kick <nickname> [reason] - Kick a user from the channel",
+                        "invite" => "/invite <nickname> [#channel] - Invite a user to a channel",
+                        "away" => "/away [message] - Set/clear away status",
+                        "quit" | "disconnect" => "/quit [message] - Disconnect from the server",
+                        "list" => "/list - List available channels on the server",
+                        "ctcp" => "/ctcp <target> <command> [args] - Send a CTCP command",
+                        "ping" => "/ping <nickname> - Ping a user",
+                        "version" => "/version <nickname> - Request client version from user",
+                        "time" => "/time <nickname> - Request time from user",
+                        "raw" | "quote" => "/raw <command> - Send a raw IRC command",
+                        "op" => "/op <nickname> - Give operator status (+o)",
+                        "deop" => "/deop <nickname> - Remove operator status (-o)",
+                        "ban" => "/ban <mask> - Ban a user from the channel (+b)",
+                        "unban" => "/unban <mask> - Remove a ban (-b)",
+                        "kickban" | "kb" => "/kickban <nickname> [reason] - Ban and kick a user",
+                        "names" => "/names [#channel] - List users in a channel",
+                        "clear" => "/clear - Clear chat messages for current channel",
+                        "voice" | "call" => "/voice <nickname> - Start a voice call\n(For channel voice mode, use: /mode +v nickname)",
+                        "devoice" => "/devoice <nickname> - Remove voice mode (-v) from a user",
+                        "hangup" | "endcall" => "/hangup - End the current voice call",
+                        "naiscreate" => "/naiscreate [name] - Create a new NAIS secure P2P channel\nCreates a moderated IRC channel for discovery with encrypted P2P messaging",
+                        "naisjoin" => "/naisjoin <#channel> - Join a NAIS secure channel\nJoins an existing NAIS channel and connects to peers",
+                        "naisleave" => "/naisleave [channel_id] - Leave a NAIS secure channel",
+                        "naislist" => "/naislist - List active NAIS channels and their peers",
+                        "naisprobe" => "/naisprobe [#channel] - Manually probe users in channel for NAIS capability",
+                        "help" => "/help [command] - Show help information",
+                        _ => "Unknown command. Use /help for a list of commands.",
+                    }
+                };
+                apply_event_with_config(
+                    &mut state.write(),
+                    &profiles.read(),
+                    &active_profile,
+                    IrcEvent::System {
+                        channel,
+                        text: help_text.to_string(),
+                    },
+                );
+            }
+            "/naiscreate" => {
+                // Create a new NAIS secure P2P channel
+                let channel_name = if arg.is_empty() { None } else { Some(arg.clone()) };
+                let channel_id = crate::nais_channel::generate_channel_id();
+                let irc_channel = crate::nais_channel::create_nais_irc_channel(&channel_id);
+                let fingerprint = crate::nais_channel::generate_fingerprint();
+                let topic = crate::nais_channel::create_nais_topic(&channel_id, &fingerprint);
+                
+                // Join the IRC channel
+                if let Some(handle) = handle.as_ref() {
+                    let _ = handle.cmd_tx.try_send(IrcCommandEvent::Join {
+                        channel: irc_channel.clone(),
+                    });
+                }
+                
+                apply_event_with_config(
+                    &mut state.write(),
+                    &profiles.read(),
+                    &active_profile,
+                    IrcEvent::System {
+                        channel: channel.clone(),
+                        text: format!("Creating NAIS channel: {} ({})", 
+                            channel_name.as_deref().unwrap_or("unnamed"), 
+                            irc_channel),
+                    },
+                );
+                
+                // Set the topic (this requires op status, which we should have as channel creator)
+                // We'll set it after a short delay to allow JOIN to complete
+                let irc_channel_clone = irc_channel.clone();
+                let topic_clone = topic.clone();
+                let handle_clone = handle.clone();
+                spawn(async move {
+                    Delay::new(Duration::from_millis(500)).await;
+                    if let Some(handle) = handle_clone.as_ref() {
+                        let _ = handle.cmd_tx.try_send(IrcCommandEvent::Topic {
+                            channel: irc_channel_clone.clone(),
+                            topic: Some(topic_clone),
+                        });
+                        // Set channel modes: +mnt (moderated, no external messages, topic lock)
+                        let _ = handle.cmd_tx.try_send(IrcCommandEvent::Mode {
+                            target: irc_channel_clone,
+                            modes: "+mnt".to_string(),
+                            args: None,
+                        });
+                    }
+                });
+                
+                apply_event_with_config(
+                    &mut state.write(),
+                    &profiles.read(),
+                    &active_profile,
+                    IrcEvent::System {
+                        channel: channel.clone(),
+                        text: format!("NAIS channel created. Channel ID: {}\nOther NAIS clients joining {} will auto-discover and connect P2P.", 
+                            channel_id, irc_channel),
+                    },
+                );
+            }
+            "/naisjoin" => {
+                // Join an existing NAIS channel
+                if arg.is_empty() {
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: "Usage: /naisjoin <#channel> - Join a NAIS P2P channel\nThe channel must have a NAIS topic (NAIS:v1:...)".to_string(),
+                        },
+                    );
+                } else {
+                    let target = if arg.starts_with('#') {
+                        arg.clone()
+                    } else {
+                        format!("#{arg}")
+                    };
+                    
+                    // Join the IRC channel to discover peers
+                    if let Some(handle) = handle.as_ref() {
+                        let _ = handle.cmd_tx.try_send(IrcCommandEvent::Join {
+                            channel: target.clone(),
+                        });
+                    }
+                    
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel: channel.clone(),
+                            text: format!("Joining {} to discover NAIS peers...\nIf this is a NAIS channel, peers will be probed automatically.", target),
+                        },
+                    );
+                }
+            }
+            "/naisleave" => {
+                // Leave a NAIS channel
+                let target = if arg.is_empty() {
+                    channel.clone()
+                } else {
+                    arg.clone()
+                };
+                
+                // Part the IRC channel
+                if let Some(handle) = handle.as_ref() {
+                    let _ = handle.cmd_tx.try_send(IrcCommandEvent::Part {
+                        channel: target.clone(),
+                        reason: Some("Leaving NAIS channel".to_string()),
+                    });
+                }
+                
+                apply_event_with_config(
+                    &mut state.write(),
+                    &profiles.read(),
+                    &active_profile,
+                    IrcEvent::System {
+                        channel: channel.clone(),
+                        text: format!("Left NAIS channel: {}", target),
+                    },
+                );
+            }
+            "/naislist" => {
+                // List active NAIS channels
+                // Check which channels have NAIS topics
+                let server_state = state.read().servers.get(&active_profile).cloned();
+                if let Some(ss) = server_state {
+                    let mut nais_channels = Vec::new();
+                    for (ch, topic) in &ss.topics_by_channel {
+                        if crate::nais_channel::is_nais_topic(topic) {
+                            if let Some((version, channel_id, _fingerprint)) = crate::nais_channel::parse_nais_topic(topic) {
+                                let user_count = ss.users_by_channel.get(ch).map(|u| u.len()).unwrap_or(0);
+                                nais_channels.push(format!("  {} [{}] - {} users (ID: {})", ch, version, user_count, &channel_id[..8.min(channel_id.len())]));
+                            }
+                        }
+                    }
+                    
+                    let list_text = if nais_channels.is_empty() {
+                        "No active NAIS channels.\n\nUse /naiscreate [name] to create a new NAIS channel\nUse /naisjoin #channel to join an existing NAIS channel".to_string()
+                    } else {
+                        format!("Active NAIS channels:\n{}", nais_channels.join("\n"))
+                    };
+                    
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: list_text,
+                        },
+                    );
+                } else {
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: "Not connected to server.".to_string(),
+                        },
+                    );
+                }
+            }
+            "/naisprobe" => {
+                // Manually probe users in current channel for NAIS capability
+                let target_channel = if arg.is_empty() {
+                    channel.clone()
+                } else if arg.starts_with('#') {
+                    arg.clone()
+                } else {
+                    format!("#{}", arg)
+                };
+                
+                let server_state = state.read().servers.get(&active_profile).cloned();
+                if let Some(ss) = server_state {
+                    if let Some(users) = ss.users_by_channel.get(&target_channel) {
+                        let our_nick = ss.nickname.clone();
+                        let probe_msg = crate::nais_channel::create_probe_ctcp(&target_channel);
+                        
+                        let mut probed_count = 0;
+                        for user in users {
+                            // Strip mode prefixes
+                            let clean_user = user.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~');
+                            if clean_user == our_nick {
+                                continue;
+                            }
+                            
+                            if let Some(handle) = handle.as_ref() {
+                                let _ = handle.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                    target: clean_user.to_string(),
+                                    message: probe_msg.clone(),
+                                });
+                                probed_count += 1;
+                            }
+                        }
+                        
+                        apply_event_with_config(
+                            &mut state.write(),
+                            &profiles.read(),
+                            &active_profile,
+                            IrcEvent::System {
+                                channel: channel.clone(),
+                                text: format!("Probing {} users in {} for NAIS capability...", probed_count, target_channel),
+                            },
+                        );
+                    } else {
+                        apply_event_with_config(
+                            &mut state.write(),
+                            &profiles.read(),
+                            &active_profile,
+                            IrcEvent::System {
+                                channel,
+                                text: format!("No users found in {}", target_channel),
+                            },
+                        );
+                    }
+                }
+            }
             _ => {
                 apply_event_with_config(
                     &mut state.write(),
@@ -4479,6 +6012,7 @@ fn connect_profile(
     nickname: String,
     channel: String,
     use_tls: bool,
+    hide_host: bool,
     profile_name: String,
     mut state: Signal<irc_client::AppState>,
     _profiles: Signal<Vec<profile::Profile>>,
@@ -4498,6 +6032,7 @@ fn connect_profile(
         nickname,
         channel,
         use_tls,
+        hide_host,
     });
 
     let mut state_mut = state.write();
@@ -6056,7 +7591,43 @@ body {
     min-width: 160px;
     z-index: 1000;
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
-    backdrop-filter: blur(12px);
+    overflow: visible;
+}
+
+/* CTCP Submenu styles */
+.menu-submenu-container {
+    position: relative;
+    z-index: 1;
+}
+
+.submenu-trigger {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.ctcp-submenu {
+    position: absolute;
+    right: 0;
+    top: 100%;
+    margin-top: 4px;
+    background: rgba(20, 25, 45, 0.98);
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    padding: 4px;
+    min-width: 140px;
+    z-index: 9999;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+/* Danger menu items (kick/ban) */
+.menu-item.danger {
+    color: #ff6b6b;
+}
+
+.menu-item.danger:hover {
+    background: rgba(255, 107, 107, 0.15);
+    color: #ff5252;
 }
 
 /* WHOIS popup styles */
@@ -6150,6 +7721,109 @@ body {
 .whois-channels {
     font-family: monospace;
     font-size: 13px;
+}
+
+/* CTCP response popup styles */
+.ctcp-popup-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1001;
+    backdrop-filter: blur(4px);
+}
+
+.ctcp-popup {
+    background: rgba(20, 25, 45, 0.98);
+    border: 1px solid #10b981;
+    border-radius: 16px;
+    min-width: 360px;
+    max-width: 500px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    overflow: hidden;
+}
+
+.ctcp-popup-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 20px;
+    background: rgba(16, 185, 129, 0.1);
+    border-bottom: 1px solid var(--border);
+}
+
+.ctcp-popup-header h3 {
+    margin: 0;
+    color: #10b981;
+    font-size: 18px;
+    font-weight: 600;
+}
+
+.ctcp-popup-close {
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 18px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    transition: all 0.2s;
+}
+
+.ctcp-popup-close:hover {
+    color: var(--text);
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.ctcp-popup-content {
+    padding: 16px 20px;
+}
+
+.ctcp-row {
+    display: flex;
+    align-items: flex-start;
+    padding: 10px 0;
+    border-bottom: 1px solid rgba(16, 185, 129, 0.1);
+}
+
+.ctcp-row:last-child {
+    border-bottom: none;
+}
+
+.ctcp-label {
+    min-width: 100px;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.ctcp-value {
+    flex: 1;
+    color: var(--text);
+    font-size: 14px;
+    word-break: break-word;
+}
+
+.ctcp-command {
+    font-family: monospace;
+    color: #10b981;
+    font-weight: 600;
+}
+
+.ctcp-response-text {
+    font-family: monospace;
+    font-size: 13px;
+    background: rgba(16, 185, 129, 0.05);
+    padding: 8px 12px;
+    border-radius: 6px;
+    white-space: pre-wrap;
 }
 
 .body {

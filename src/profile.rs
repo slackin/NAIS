@@ -33,6 +33,8 @@ pub struct Profile {
     pub scrollback_limit: usize,
     #[serde(default = "default_log_buffer_size")]
     pub log_buffer_size: usize,
+    #[serde(default = "default_hide_host")]
+    pub hide_host: bool,
 }
 
 fn default_use_tls() -> bool {
@@ -53,6 +55,10 @@ fn default_scrollback_limit() -> usize {
 
 fn default_log_buffer_size() -> usize {
     1000
+}
+
+fn default_hide_host() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -88,6 +94,7 @@ impl Profile {
             enable_logging: true,
             scrollback_limit: 1000,
             log_buffer_size: 1000,
+            hide_host: true,
         }
     }
 
@@ -104,6 +111,7 @@ impl Profile {
             enable_logging: true,
             scrollback_limit: 1000,
             log_buffer_size: 1000,
+            hide_host: true,
         }
     }
 }
@@ -153,6 +161,7 @@ pub fn load_store() -> ProfileStore {
             enable_logging: legacy.enable_logging,
             scrollback_limit: legacy.scrollback_limit,
             log_buffer_size: legacy.log_buffer_size,
+            hide_host: legacy.hide_host,
         };
         store.profiles = vec![profile.clone()];
         store.last_used = Some(profile.name.clone());

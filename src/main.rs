@@ -1,4 +1,5 @@
 mod irc_client;
+mod nais_channel;
 mod profile;
 mod ui;
 mod voice_chat;
