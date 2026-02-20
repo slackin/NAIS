@@ -1869,25 +1869,33 @@ pub fn start_voice_listener(
                 Ok(listener) => {
                     let local_addr = listener.local_addr().unwrap();
                     let local_port = local_addr.port();
-                    log::info!("Voice listener started on local port {}", local_port);
+                    log::info!("Voice listener bound to local address: {}", local_addr);
                     
                     // Set up UPnP and get external address
-                    let (external_ip, external_port, _upnp_mapping) = setup_voice_address(local_port);
-                    log::info!("Voice listener address: {}:{} (local port {})", 
-                        external_ip, external_port, local_port);
+                    let (external_ip, external_port, upnp_mapping) = setup_voice_address(local_port);
+                    
+                    let upnp_status = if upnp_mapping.is_some() { 
+                        "UPnP ACTIVE" 
+                    } else { 
+                        "NO UPnP (connection may fail due to NAT)" 
+                    };
+                    log::info!("Voice listener: external={}:{}, local=0.0.0.0:{}, status={}", 
+                        external_ip, external_port, local_port, upnp_status);
                     
                     // Give UPnP mapping a moment to propagate through the router
                     // Some routers need a brief delay before the mapping is active
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                    log::info!("Voice listener ready to accept connections");
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                    log::info!("Voice listener now accepting connections on port {} (external: {}:{})", 
+                        local_port, external_ip, external_port);
                     
                     // Send the address info back
-                    let _ = addr_tx.send((external_ip, external_port, local_port));
+                    let _ = addr_tx.send((external_ip.clone(), external_port, local_port));
                     
-                    // Wait for one incoming connection
+                    // Wait for one incoming connection with logging
+                    log::info!("Waiting for incoming voice connection from remote peer...");
                     match listener.accept().await {
                         Ok((stream, addr)) => {
-                            log::info!("Voice connection from {}", addr);
+                            log::info!("Voice connection accepted from {}", addr);
                             let _ = handle_voice_connection(
                                 stream,
                                 addr,
@@ -3176,17 +3184,18 @@ pub fn setup_upnp_mapping(local_port: u16, description: &str) -> Result<UPnPMapp
     use igd_next::{SearchOptions, PortMappingProtocol};
     use std::net::SocketAddrV4;
     
-    log::info!("Setting up UPnP port mapping for port {}", local_port);
+    log::info!("Attempting UPnP port mapping for local port {}...", local_port);
     
     let options = SearchOptions {
         timeout: Some(std::time::Duration::from_secs(5)),
         ..Default::default()
     };
     
+    log::info!("Searching for UPnP gateway...");
     let gateway = igd_next::search_gateway(options)
-        .map_err(|e| format!("Failed to find UPnP gateway: {}", e))?;
+        .map_err(|e| format!("Failed to find UPnP gateway: {} (is UPnP enabled on your router?)", e))?;
     
-    log::info!("Found UPnP gateway: {:?}", gateway);
+    log::info!("Found UPnP gateway at: {}", gateway);
     
     // Get our local IP to this gateway
     let local_ip = get_local_ip()
@@ -3201,7 +3210,23 @@ pub fn setup_upnp_mapping(local_port: u16, description: &str) -> Result<UPnPMapp
     let external_ip = gateway.get_external_ip()
         .map_err(|e| format!("Failed to get external IP from gateway: {}", e))?;
     
-    log::info!("External IP from gateway: {}", external_ip);
+    log::info!("Router reports external IP: {}", external_ip);
+    
+    // Check if the external IP is actually a public IP (detect CGNAT/double NAT)
+    let is_private = match external_ip {
+        std::net::IpAddr::V4(ipv4) => {
+            ipv4.is_private() 
+            || ipv4.is_loopback()
+            || (ipv4.octets()[0] == 100 && ipv4.octets()[1] >= 64 && ipv4.octets()[1] <= 127) // CGNAT range 100.64.0.0/10
+        }
+        std::net::IpAddr::V6(_) => false, // IPv6 typically doesn't have NAT issues
+    };
+    
+    if is_private {
+        log::warn!("*** CGNAT/Double NAT detected! Router's external IP {} is not public ***", external_ip);
+        log::warn!("*** Your ISP or another router is performing NAT. Voice calls may not work ***");
+        log::warn!("*** Consider: port forwarding on outer router, or using a VPN ***");
+    }
     
     // Try to use the same port externally if possible
     let mut external_port = local_port;
@@ -3211,6 +3236,8 @@ pub fn setup_upnp_mapping(local_port: u16, description: &str) -> Result<UPnPMapp
         // Lease duration of 3 hours (in seconds)
         let lease_duration = 3 * 60 * 60;
         
+        log::info!("Requesting UPnP mapping: TCP external port {} -> {}", external_port, local_addr);
+        
         match gateway.add_port(
             PortMappingProtocol::TCP,
             external_port,
@@ -3219,8 +3246,12 @@ pub fn setup_upnp_mapping(local_port: u16, description: &str) -> Result<UPnPMapp
             description,
         ) {
             Ok(()) => {
-                log::info!("Successfully created UPnP mapping: external {}:{} -> local {}:{}", 
-                    external_ip, external_port, local_ip, local_port);
+                log::info!("=== UPnP MAPPING CREATED SUCCESSFULLY ===");
+                log::info!("  External: {}:{} (TCP)", external_ip, external_port);
+                log::info!("  Internal: {} (TCP)", local_addr);
+                log::info!("  Lease: {} seconds", lease_duration);
+                log::info!("  Remote peers should connect to: {}:{}", external_ip, external_port);
+                log::info!("==========================================");
                 
                 return Ok(UPnPMapping {
                     external_port,
@@ -3240,7 +3271,7 @@ pub fn setup_upnp_mapping(local_port: u16, description: &str) -> Result<UPnPMapp
                 if external_port < 1024 {
                     external_port = 49152; // Jump to dynamic port range
                 }
-                log::debug!("Port {} in use, trying {}", external_port - 1, external_port);
+                log::info!("External port {} in use, trying {}", external_port - 1, external_port);
             }
             Err(e) => {
                 return Err(format!("Failed to add port mapping: {}", e));
@@ -3252,26 +3283,30 @@ pub fn setup_upnp_mapping(local_port: u16, description: &str) -> Result<UPnPMapp
 /// Try to set up UPnP, falling back to local IP if it fails
 /// Returns (ip, port, optional_upnp_mapping)
 pub fn setup_voice_address(local_port: u16) -> (String, u16, Option<UPnPMapping>) {
+    log::info!("Setting up voice address for local port {}", local_port);
+    
     // First try UPnP
     match setup_upnp_mapping(local_port, "NAIS Voice Chat") {
         Ok(mapping) => {
             let ip = mapping.external_ip.clone();
             let port = mapping.external_port;
-            log::info!("Using UPnP: {}:{}", ip, port);
+            log::info!("UPnP SUCCESS: external {}:{} -> local 0.0.0.0:{}", ip, port, local_port);
             (ip, port, Some(mapping))
         }
         Err(e) => {
-            log::warn!("UPnP setup failed: {}, trying external IP service", e);
+            log::warn!("UPnP FAILED: {}", e);
+            log::warn!("Falling back to external IP without port forwarding");
+            log::warn!("*** Connection will likely fail unless you manually forward the port ***");
             
             // Try to get external IP from service
             if let Some(external_ip) = get_external_ip_sync() {
-                log::info!("Using external IP (no UPnP): {}:{}", external_ip, local_port);
-                log::warn!("Note: You may need to manually forward port {} to this machine", local_port);
+                log::info!("Using external IP (NO PORT FORWARDING): {}:{}", external_ip, local_port);
+                log::warn!("Manual port forward required: external port {} -> this machine port {}", local_port, local_port);
                 (external_ip, local_port, None)
             } else {
                 // Final fallback: local IP
                 let local_ip = get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
-                log::warn!("Using local IP (NAT may block connections): {}:{}", local_ip, local_port);
+                log::warn!("Using local IP only: {}:{} - will NOT work over internet", local_ip, local_port);
                 (local_ip, local_port, None)
             }
         }
