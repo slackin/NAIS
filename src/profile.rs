@@ -61,6 +61,10 @@ pub struct ProfileStore {
     pub last_used: Option<String>,
     #[serde(default)]
     pub default_nickname: Option<String>,
+    #[serde(default)]
+    pub show_timestamps: bool,
+    #[serde(default)]
+    pub show_advanced: bool,
 }
 
 impl Default for Profile {
@@ -111,6 +115,8 @@ impl Default for ProfileStore {
             profiles: vec![support_profile.clone()],
             last_used: Some(support_profile.name.clone()),
             default_nickname: None,
+            show_timestamps: false,
+            show_advanced: false,
         }
     }
 }

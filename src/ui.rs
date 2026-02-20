@@ -147,6 +147,13 @@ fn app() -> Element {
     let mut settings_noise_gate_threshold = use_signal(|| 0.01f32);
     let mut settings_highpass_filter = use_signal(|| true);
     let mut settings_highpass_cutoff = use_signal(|| 80.0f32);
+    
+    // Display settings
+    let mut settings_show_timestamps = use_signal(|| store.show_timestamps);
+    let mut settings_show_advanced = use_signal(|| store.show_advanced);
+    // Provide global access to these settings
+    use_context_provider(|| settings_show_timestamps);
+    use_context_provider(|| settings_show_advanced);
 
     let mut new_server_input = use_signal(String::new);
     let mut new_nick_input = use_signal(String::new);
@@ -886,36 +893,39 @@ fn app() -> Element {
                                                 },
                                                 "Edit"
                                             }
-                                            button {
-                                                class: "menu-item",
-                                                onclick: move |_| {
-                                                    let current = show_server_log.read().get(&prof_name_for_log_toggle).copied().unwrap_or(false);
-                                                    show_server_log.write().insert(prof_name_for_log_toggle.clone(), !current);
-                                                    
-                                                    // If we're turning off the log and currently viewing it, switch to first channel
-                                                    if current {
-                                                        let active = state.read().active_profile.clone();
-                                                        if active == prof_name_for_log_toggle {
-                                                            let should_switch = state.read().servers.get(&active)
-                                                                .map(|s| s.current_channel == "Server Log")
-                                                                .unwrap_or(false);
-                                                            
-                                                            if should_switch {
-                                                                let first_channel = state.read().servers.get(&active)
-                                                                    .and_then(|s| s.channels.first().cloned())
-                                                                    .unwrap_or_default();
+                                            // Server Log toggle (advanced only)
+                                            if *settings_show_advanced.read() {
+                                                button {
+                                                    class: "menu-item",
+                                                    onclick: move |_| {
+                                                        let current = show_server_log.read().get(&prof_name_for_log_toggle).copied().unwrap_or(false);
+                                                        show_server_log.write().insert(prof_name_for_log_toggle.clone(), !current);
+                                                        
+                                                        // If we're turning off the log and currently viewing it, switch to first channel
+                                                        if current {
+                                                            let active = state.read().active_profile.clone();
+                                                            if active == prof_name_for_log_toggle {
+                                                                let should_switch = state.read().servers.get(&active)
+                                                                    .map(|s| s.current_channel == "Server Log")
+                                                                    .unwrap_or(false);
                                                                 
-                                                                if let Some(server) = state.write().servers.get_mut(&active) {
-                                                                    server.current_channel = first_channel;
+                                                                if should_switch {
+                                                                    let first_channel = state.read().servers.get(&active)
+                                                                        .and_then(|s| s.channels.first().cloned())
+                                                                        .unwrap_or_default();
+                                                                    
+                                                                    if let Some(server) = state.write().servers.get_mut(&active) {
+                                                                        server.current_channel = first_channel;
+                                                                    }
                                                                 }
                                                             }
                                                         }
+                                                        profile_menu_open.set(None);
+                                                    },
+                                                    {
+                                                        let is_visible = show_server_log.read().get(&prof_name_for_log_toggle).copied().unwrap_or(false);
+                                                        if is_visible { "Hide Server Log" } else { "Show Server Log" }
                                                     }
-                                                    profile_menu_open.set(None);
-                                                },
-                                                {
-                                                    let is_visible = show_server_log.read().get(&prof_name_for_log_toggle).copied().unwrap_or(false);
-                                                    if is_visible { "Hide Server Log" } else { "Show Server Log" }
                                                 }
                                             }
                                             button {
@@ -987,6 +997,8 @@ fn app() -> Element {
                                                             profiles: profiles.read().clone(),
                                                             last_used: last_used.read().clone(),
                                                             default_nickname: default_nick.read().clone(),
+                                                            show_timestamps: *settings_show_timestamps.read(),
+                                                            show_advanced: *settings_show_advanced.read(),
                                                         };
                                                         let _ = profile::save_store(&store);
                                                         profile_menu_open.set(None);
@@ -1031,12 +1043,13 @@ fn app() -> Element {
                         }
                     }
                     ul {
-                        // Server Log channel - only show if enabled for this profile
+                        // Server Log channel - only show if enabled for this profile AND advanced mode is on
                         {
                             let active_profile = state.read().active_profile.clone();
                             let log_visible = show_server_log.read().get(&active_profile).copied().unwrap_or(false);
+                            let advanced_on = *settings_show_advanced.read();
                             
-                            if log_visible {
+                            if log_visible && advanced_on {
                                 Some(rsx! {
                                     li {
                                         button {
@@ -1062,6 +1075,45 @@ fn app() -> Element {
                                                 }
                                             } else {
                                                 "📋 Server Log"
+                                            }
+                                        }
+                                    }
+                                })
+                            } else {
+                                None
+                            }
+                        }
+                        
+                        // Server channel - shows server-level IRC communication (advanced only)
+                        {
+                            let advanced_on = *settings_show_advanced.read();
+                            
+                            if advanced_on {
+                                Some(rsx! {
+                                    li {
+                                        button {
+                                            class: if state.read().servers
+                                                .get(&state.read().active_profile)
+                                                .map(|s| s.current_channel == "Server")
+                                                .unwrap_or(false)
+                                            { "row active" } else { "row" },
+                                            onclick: move |_| {
+                                                let active = state.read().active_profile.clone();
+                                                if let Some(server) = state.write().servers.get_mut(&active) {
+                                                    server.current_channel = "Server".to_string();
+                                                }
+                                                // Force scroll to bottom on channel change
+                                                force_scroll_to_bottom.set(true);
+                                            },
+                                            title: "Server",
+                                            if channels_collapsed() {
+                                                div {
+                                                    class: "channel-icon",
+                                                    style: "background: linear-gradient(135deg, #4CAF50 0%, #2E7D32 100%);",
+                                                    "🖥️"
+                                                }
+                                            } else {
+                                                "🖥️ Server"
                                             }
                                         }
                                     }
@@ -1267,6 +1319,44 @@ fn app() -> Element {
                                         }
                                     }
                                 }
+                            } else if current_channel == "Server" {
+                                // Show server-level messages (messages not tied to a real channel)
+                                let messages = state.read()
+                                    .servers
+                                    .get(&state.read().active_profile)
+                                    .map(|s| {
+                                        s.messages.iter()
+                                            .filter(|m| {
+                                                // Show messages from "Server" channel or messages that aren't 
+                                                // in a real channel (doesn't start with #, &, +, !)
+                                                // and aren't private messages
+                                                m.channel == "Server" || 
+                                                (m.is_system && 
+                                                 !m.channel.starts_with('#') && 
+                                                 !m.channel.starts_with('&') && 
+                                                 !m.channel.starts_with('+') && 
+                                                 !m.channel.starts_with('!'))
+                                            })
+                                            .cloned()
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default();
+                                
+                                rsx! {
+                                    if messages.is_empty() {
+                                        div {
+                                            class: "message system",
+                                            div {
+                                                class: "system-text",
+                                                "No server messages yet. Connect to see MOTD and server notices."
+                                            }
+                                        }
+                                    } else {
+                                        for msg in messages {
+                                            {message_view(msg)}
+                                        }
+                                    }
+                                }
                             } else {
                                 // Show regular chat messages
                                 let messages = state.read()
@@ -1299,6 +1389,14 @@ fn app() -> Element {
                             .map(|s| s.current_channel.clone())
                             .unwrap_or_default();
 
+                        // Check if this is a PM channel (doesn't start with channel prefixes)
+                        let is_pm_channel = !current_channel.is_empty() 
+                            && !current_channel.starts_with('#') 
+                            && !current_channel.starts_with('&') 
+                            && !current_channel.starts_with('+') 
+                            && !current_channel.starts_with('!')
+                            && current_channel != "Server Log";
+                        
                         if current_channel == "Server Log" {
                             // Show connection info instead of users
                             rsx! {
@@ -1339,6 +1437,54 @@ fn app() -> Element {
                                         } else {
                                             rsx! { div { "No info" } }
                                         }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if is_pm_channel {
+                            // Show PM participants (you and the other person)
+                            let my_nick = state.read().servers
+                                .get(&state.read().active_profile)
+                                .map(|s| s.nickname.clone())
+                                .unwrap_or_default();
+                            let other_nick = current_channel.clone();
+                            
+                            rsx! {
+                                div {
+                                    class: "section-title",
+                                    style: "display:flex; justify-content:space-between; align-items:center; color: var(--status-connected);",
+                                    if !userlist_collapsed() {
+                                        "Conversation — 2"
+                                    }
+                                    button {
+                                        class: "collapse-btn",
+                                        onclick: move |_| {
+                                            userlist_collapsed.set(!userlist_collapsed());
+                                        },
+                                        if userlist_collapsed() { "‹" } else { "›" }
+                                    }
+                                }
+                                if !userlist_collapsed() {
+                                    ul {
+                                        li {
+                                            div {
+                                                class: "row user-row",
+                                                style: "display: flex; align-items: center;",
+                                                span {
+                                                    style: "color: {username_color(&other_nick)};",
+                                                    "{other_nick}"
+                                                }
+                                            }
+                                        }
+                                        li {
+                                            div {
+                                                class: "row user-row",
+                                                style: "display: flex; align-items: center;",
+                                                span {
+                                                    style: "color: {username_color(&my_nick)}; opacity: 0.7;",
+                                                    "{my_nick} (you)"
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1576,20 +1722,22 @@ fn app() -> Element {
                                                                         },
                                                                         "📨 Invite to Channel"
                                                                     }
-                                                                    // Whois option
-                                                                    button {
-                                                                        class: "menu-item",
-                                                                        onclick: {
-                                                                            let nick = user_nick.clone();
-                                                                            move |_| {
-                                                                                user_menu_open.set(None);
-                                                                                // Send /whois command directly
-                                                                                if let Some(core) = cores.read().get(&state.read().active_profile) {
-                                                                                    let _ = core.cmd_tx.try_send(IrcCommandEvent::Whois { nickname: nick.clone() });
+                                                                    // Whois option (advanced only)
+                                                                    if *settings_show_advanced.read() {
+                                                                        button {
+                                                                            class: "menu-item",
+                                                                            onclick: {
+                                                                                let nick = user_nick.clone();
+                                                                                move |_| {
+                                                                                    user_menu_open.set(None);
+                                                                                    // Send /whois command directly
+                                                                                    if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Whois { nickname: nick.clone() });
+                                                                                    }
                                                                                 }
-                                                                            }
-                                                                        },
-                                                                        "🔍 Whois"
+                                                                            },
+                                                                            "🔍 Whois"
+                                                                        }
                                                                     }
                                                                 }
                                                             }
@@ -2279,6 +2427,8 @@ fn app() -> Element {
                                                 voice_muted_arc,
                                                 voice_event_rx,
                                                 voice_stop_flag,
+                                                settings_show_timestamps,
+                                                settings_show_advanced,
                                             );
                                         }
                                     }
@@ -2369,6 +2519,8 @@ fn app() -> Element {
                                         voice_muted_arc,
                                         voice_event_rx,
                                         voice_stop_flag,
+                                        settings_show_timestamps,
+                                        settings_show_advanced,
                                     );
                                 }
                             }
@@ -2423,6 +2575,8 @@ fn app() -> Element {
                                             profiles: profiles.read().clone(),
                                             last_used: last_used.read().clone(),
                                             default_nickname: Some(nick.clone()),
+                                            show_timestamps: *settings_show_timestamps.read(),
+                                            show_advanced: *settings_show_advanced.read(),
                                         };
                                         
                                         // Update all profiles with new nickname
@@ -2463,6 +2617,8 @@ fn app() -> Element {
                                         profiles: profiles.read().clone(),
                                         last_used: last_used.read().clone(),
                                         default_nickname: Some(nick.clone()),
+                                        show_timestamps: *settings_show_timestamps.read(),
+                                        show_advanced: *settings_show_advanced.read(),
                                     };
                                     
                                     // Update all profiles with new nickname
@@ -2625,6 +2781,8 @@ fn app() -> Element {
                                     profiles: profiles.read().clone(),
                                     last_used: last_used.read().clone(),
                                     default_nickname: default_nick.read().clone(),
+                                    show_timestamps: *settings_show_timestamps.read(),
+                                    show_advanced: *settings_show_advanced.read(),
                                 };
                                 let _ = profile::save_store(&store);
 
@@ -2668,14 +2826,16 @@ fn app() -> Element {
                                 edit_name_input.set(evt.value());
                             },
                         }
-                        input {
-                            class: "input",
-                            r#type: "text",
-                            placeholder: "Server",
-                            value: "{edit_server_input}",
-                            oninput: move |evt| {
-                                edit_server_input.set(evt.value());
-                            },
+                        if *settings_show_advanced.read() {
+                            input {
+                                class: "input",
+                                r#type: "text",
+                                placeholder: "Server",
+                                value: "{edit_server_input}",
+                                oninput: move |evt| {
+                                    edit_server_input.set(evt.value());
+                                },
+                            }
                         }
                         input {
                             class: "input",
@@ -2695,18 +2855,20 @@ fn app() -> Element {
                                 edit_channel_input.set(evt.value());
                             },
                         }
-                        div {
-                            class: "input",
-                            style: "display: flex; align-items: center; gap: 10px;",
-                            input {
-                                r#type: "checkbox",
-                                checked: "{edit_tls_input}",
-                                onchange: move |evt| {
-                                    edit_tls_input.set(evt.checked());
-                                },
-                            }
-                            label {
-                                "Use TLS/SSL"
+                        if *settings_show_advanced.read() {
+                            div {
+                                class: "input",
+                                style: "display: flex; align-items: center; gap: 10px;",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: "{edit_tls_input}",
+                                    onchange: move |evt| {
+                                        edit_tls_input.set(evt.checked());
+                                    },
+                                }
+                                label {
+                                    "Use TLS/SSL"
+                                }
                             }
                         }
                         div {
@@ -2814,6 +2976,8 @@ fn app() -> Element {
                                         profiles: profiles.read().clone(),
                                         last_used: last_used.read().clone(),
                                         default_nickname: default_nick.read().clone(),
+                                        show_timestamps: *settings_show_timestamps.read(),
+                                        show_advanced: *settings_show_advanced.read(),
                                     };
                                     let _ = profile::save_store(&store);
                                 }
@@ -2907,6 +3071,8 @@ fn app() -> Element {
                                             profiles: profiles.read().clone(),
                                             last_used: last_used.read().clone(),
                                             default_nickname: Some(default_nick.clone()),
+                                            show_timestamps: *settings_show_timestamps.read(),
+                                            show_advanced: *settings_show_advanced.read(),
                                         };
                                         let _ = profile::save_store(&store);
 
@@ -2993,18 +3159,51 @@ fn app() -> Element {
                                 }
                             }
                             
-                            // Scrollback Limit
+                            // Show Timestamps
                             div {
-                                class: "settings-row",
+                                class: "settings-row checkbox-row",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: "{settings_show_timestamps}",
+                                    onchange: move |evt| {
+                                        settings_show_timestamps.set(evt.checked());
+                                    },
+                                }
                                 label {
                                     class: "settings-label",
-                                    "Scrollback Limit"
+                                    "Show Timestamps"
                                 }
+                            }
+                            
+                            // Advanced Features
+                            div {
+                                class: "settings-row checkbox-row",
                                 input {
-                                    class: "input settings-input-small",
-                                    r#type: "number",
-                                    min: "100",
-                                    max: "100000",
+                                    r#type: "checkbox",
+                                    checked: "{settings_show_advanced}",
+                                    onchange: move |evt| {
+                                        settings_show_advanced.set(evt.checked());
+                                    },
+                                }
+                                label {
+                                    class: "settings-label",
+                                    "Advanced Features"
+                                }
+                            }
+                            
+                            // Scrollback Limit (advanced only)
+                            if *settings_show_advanced.read() {
+                                div {
+                                    class: "settings-row",
+                                    label {
+                                        class: "settings-label",
+                                        "Scrollback Limit"
+                                    }
+                                    input {
+                                        class: "input settings-input-small",
+                                        r#type: "number",
+                                        min: "100",
+                                        max: "100000",
                                     value: "{settings_scrollback_limit}",
                                     oninput: move |evt| {
                                         if let Ok(val) = evt.value().parse::<usize>() {
@@ -3016,30 +3215,31 @@ fn app() -> Element {
                                     class: "settings-hint",
                                     "messages"
                                 }
-                            }
+                                }
                             
-                            // Log Buffer Size
-                            div {
-                                class: "settings-row",
-                                label {
-                                    class: "settings-label",
-                                    "Log Buffer Size"
-                                }
-                                input {
-                                    class: "input settings-input-small",
-                                    r#type: "number",
-                                    min: "100",
-                                    max: "100000",
-                                    value: "{settings_log_buffer_size}",
-                                    oninput: move |evt| {
-                                        if let Ok(val) = evt.value().parse::<usize>() {
-                                            settings_log_buffer_size.set(val.clamp(100, 100000));
-                                        }
-                                    },
-                                }
-                                span {
-                                    class: "settings-hint",
-                                    "messages"
+                                // Log Buffer Size (advanced only)
+                                div {
+                                    class: "settings-row",
+                                    label {
+                                        class: "settings-label",
+                                        "Log Buffer Size"
+                                    }
+                                    input {
+                                        class: "input settings-input-small",
+                                        r#type: "number",
+                                        min: "100",
+                                        max: "100000",
+                                        value: "{settings_log_buffer_size}",
+                                        oninput: move |evt| {
+                                            if let Ok(val) = evt.value().parse::<usize>() {
+                                                settings_log_buffer_size.set(val.clamp(100, 100000));
+                                            }
+                                        },
+                                    }
+                                    span {
+                                        class: "settings-hint",
+                                        "messages"
+                                    }
                                 }
                             }
                         }
@@ -3167,29 +3367,30 @@ fn app() -> Element {
                             }
                         }
                         
-                        // Noise Filtering Section
-                        div {
-                            class: "settings-section",
+                        // Noise Filtering Section (advanced only)
+                        if *settings_show_advanced.read() {
                             div {
-                                class: "settings-section-title",
-                                "🔇 Noise Filtering"
-                            }
-                            
-                            // Noise Suppression (AI)
-                            div {
-                                class: "settings-row checkbox-row",
-                                input {
-                                    r#type: "checkbox",
-                                    checked: "{settings_noise_suppression}",
-                                    onchange: move |evt| {
-                                        settings_noise_suppression.set(evt.checked());
-                                    },
+                                class: "settings-section",
+                                div {
+                                    class: "settings-section-title",
+                                    "🔇 Noise Filtering"
                                 }
-                                label {
-                                    class: "settings-label",
-                                    "AI Noise Suppression (RNNoise)"
+                                
+                                // Noise Suppression (AI)
+                                div {
+                                    class: "settings-row checkbox-row",
+                                    input {
+                                        r#type: "checkbox",
+                                        checked: "{settings_noise_suppression}",
+                                        onchange: move |evt| {
+                                            settings_noise_suppression.set(evt.checked());
+                                        },
+                                    }
+                                    label {
+                                        class: "settings-label",
+                                        "AI Noise Suppression (RNNoise)"
+                                    }
                                 }
-                            }
                             
                             // Suppression Strength
                             if *settings_noise_suppression.read() {
@@ -3307,6 +3508,7 @@ fn app() -> Element {
                                     }
                                 }
                             }
+                            }
                         }
                     }
                     div {
@@ -3346,6 +3548,8 @@ fn app() -> Element {
                                     profiles: profiles.read().clone(),
                                     last_used: last_used.read().clone(),
                                     default_nickname: default_nick_opt,
+                                    show_timestamps: *settings_show_timestamps.read(),
+                                    show_advanced: *settings_show_advanced.read(),
                                 };
                                 let _ = profile::save_store(&store);
                                 
@@ -3461,6 +3665,8 @@ fn app() -> Element {
                                                                 profiles: profiles.read().clone(),
                                                                 last_used: last_used.read().clone(),
                                                                 default_nickname: default_nick.read().clone(),
+                                                                show_timestamps: *settings_show_timestamps.read(),
+                                                                show_advanced: *settings_show_advanced.read(),
                                                             };
                                                             let _ = profile::save_store(&store);
                                                             
@@ -3564,6 +3770,8 @@ fn handle_send_message(
     voice_muted_arc: Signal<std::sync::Arc<std::sync::Mutex<bool>>>,
     mut voice_event_rx: Signal<Option<async_channel::Receiver<crate::voice_chat::VoiceEvent>>>,
     mut voice_stop_flag: Signal<Option<std::sync::Arc<std::sync::Mutex<bool>>>>,
+    settings_show_timestamps: Signal<bool>,
+    settings_show_advanced: Signal<bool>,
 ) {
     let text = text.trim().to_string();
     if text.is_empty() {
@@ -3637,6 +3845,8 @@ fn handle_send_message(
                                 profiles: profiles.read().clone(),
                                 last_used: last_used.read().clone(),
                                 default_nickname: default_nick.clone(),
+                                show_timestamps: *settings_show_timestamps.read(),
+                                show_advanced: *settings_show_advanced.read(),
                             };
                             let _ = profile::save_store(&store);
                         } else {
@@ -3687,6 +3897,8 @@ fn handle_send_message(
                         profiles: profiles.read().clone(),
                         last_used: last_used.read().clone(),
                         default_nickname: default_nick.clone(),
+                        show_timestamps: *settings_show_timestamps.read(),
+                        show_advanced: *settings_show_advanced.read(),
                     };
                     let _ = profile::save_store(&store);
                 } else {
@@ -4275,24 +4487,57 @@ fn message_view(msg: ChatMessage) -> Element {
     // Extract media content (images, videos, etc.) from the message text
     let media_items = extract_media_content(&msg.text);
     
+    // Format timestamp for display
+    let timestamp_str = {
+        let dt = chrono::DateTime::from_timestamp(msg.timestamp, 0)
+            .unwrap_or_else(|| chrono::Utc::now());
+        dt.format("%H:%M:%S").to_string()
+    };
+    let timestamp_display = timestamp_str.clone();
+    
+    // State for showing timestamp on click
+    let mut show_timestamp_clicked = use_signal(|| false);
+    
+    // Get global "always show timestamps" setting from context
+    let always_show_timestamps = use_context::<Signal<bool>>();
+    let show_timestamp = move || always_show_timestamps() || show_timestamp_clicked();
+    
     rsx! {
         div {
             class: format!("message{system_class}{action_class}"),
+            onclick: move |_| {
+                if !msg.is_system && !always_show_timestamps() {
+                    show_timestamp_clicked.set(true);
+                    // Auto-hide after 3 seconds
+                    spawn(async move {
+                        Delay::new(Duration::from_secs(3)).await;
+                        show_timestamp_clicked.set(false);
+                    });
+                }
+            },
             if msg.is_system {
                 div {
                     class: "system-text",
-                    "{msg.text}"
+                    {render_text_with_links(&msg.text)}
                 }
             } else if msg.is_action {
                 div {
                     class: "action-text",
+                    if show_timestamp() {
+                        span {
+                            class: "timestamp",
+                            style: "color: var(--text-dim); font-size: 11px; margin-right: 6px;",
+                            "[{timestamp_display}]"
+                        }
+                    }
                     span {
                         class: "user",
                         style: "color: {username_color(&msg.user)};",
                         "* {msg.user}"
                     }
                     span {
-                        " {msg.text}"
+                        " "
+                        {render_text_with_links(&msg.text)}
                     }
                 }
                 if !media_items.is_empty() {
@@ -4306,6 +4551,13 @@ fn message_view(msg: ChatMessage) -> Element {
             } else {
                 div {
                     class: "message-meta",
+                    if show_timestamp() {
+                        span {
+                            class: "timestamp",
+                            style: "color: var(--text-dim); font-size: 11px; margin-right: 6px;",
+                            "[{timestamp_str}]"
+                        }
+                    }
                     span {
                         class: "user",
                         style: "color: {username_color(&msg.user)};",
@@ -4314,7 +4566,7 @@ fn message_view(msg: ChatMessage) -> Element {
                 }
                 div {
                     class: "message-text",
-                    "{msg.text}"
+                    {render_text_with_links(&msg.text)}
                 }
                 if !media_items.is_empty() {
                     div {
@@ -4334,6 +4586,90 @@ enum MediaItem {
     Image { source_url: String, image_url: String },
     YouTubeVideo { video_id: String, source_url: String },
     DiscoursePost { source_url: String, data: DiscourseData },
+}
+
+/// Represents a segment of text that may be plain or a clickable link
+#[derive(Clone, Debug)]
+enum TextSegment {
+    Plain(String),
+    Link(String),
+}
+
+/// Parse text into segments, identifying URLs that should be clickable
+fn parse_text_with_links(text: &str) -> Vec<TextSegment> {
+    let mut segments = Vec::new();
+    let mut current_plain = String::new();
+    
+    for word in text.split_inclusive(|c: char| c.is_whitespace()) {
+        // Check if this word contains a URL
+        let trimmed = word.trim();
+        let cleaned = trimmed
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .trim_end_matches(',')
+            .trim_end_matches('.')
+            .trim_end_matches(';')
+            .trim_end_matches(')')
+            .trim_start_matches('(');
+        
+        if cleaned.starts_with("http://") || cleaned.starts_with("https://") {
+            // Found a URL - push any accumulated plain text first
+            if !current_plain.is_empty() {
+                segments.push(TextSegment::Plain(current_plain.clone()));
+                current_plain.clear();
+            }
+            
+            // Handle prefix characters (like opening parentheses)
+            let prefix_chars: String = trimmed.chars().take_while(|c| *c == '(' || *c == '<').collect();
+            if !prefix_chars.is_empty() {
+                segments.push(TextSegment::Plain(prefix_chars));
+            }
+            
+            // Push the link
+            segments.push(TextSegment::Link(cleaned.to_string()));
+            
+            // Handle suffix characters (punctuation after URL) and trailing whitespace
+            let suffix_start = trimmed.find(cleaned).unwrap_or(0) + cleaned.len();
+            let suffix = &trimmed[suffix_start..];
+            let trailing_ws: String = word.chars().rev().take_while(|c| c.is_whitespace()).collect();
+            if !suffix.is_empty() || !trailing_ws.is_empty() {
+                current_plain.push_str(suffix);
+                current_plain.push_str(&trailing_ws.chars().rev().collect::<String>());
+            }
+        } else {
+            // Regular word, add to current plain text
+            current_plain.push_str(word);
+        }
+    }
+    
+    // Push any remaining plain text
+    if !current_plain.is_empty() {
+        segments.push(TextSegment::Plain(current_plain));
+    }
+    
+    segments
+}
+
+/// Render text with clickable links
+fn render_text_with_links(text: &str) -> Element {
+    let segments = parse_text_with_links(text);
+    
+    rsx! {
+        for segment in segments {
+            match segment {
+                TextSegment::Plain(txt) => rsx! { "{txt}" },
+                TextSegment::Link(url) => rsx! {
+                    a {
+                        href: "{url}",
+                        target: "_blank",
+                        rel: "noopener noreferrer",
+                        class: "chat-link",
+                        "{url}"
+                    }
+                },
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -6033,6 +6369,17 @@ body {
 .message-text {
     color: var(--text);
     word-wrap: break-word;
+}
+
+.chat-link {
+    color: var(--accent);
+    text-decoration: underline;
+    cursor: pointer;
+    word-break: break-all;
+}
+
+.chat-link:hover {
+    opacity: 0.8;
 }
 
 .system-text {
