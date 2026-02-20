@@ -41,3 +41,6 @@ cpal = "0.15"
 # Audio noise filtering
 nnnoiseless = "0.5"
 biquad = "0.4"
+
+# NAT traversal
+igd-next = "0.15"

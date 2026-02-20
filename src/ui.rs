@@ -214,6 +214,7 @@ fn app() -> Element {
     let mut voice_current_peer: Signal<Option<String>> = use_signal(|| None);
     let mut voice_session_id: Signal<Option<String>> = use_signal(|| None);
     let mut voice_local_port: Signal<u16> = use_signal(|| 0);
+    let mut voice_external_ip: Signal<String> = use_signal(|| String::new());
     let mut voice_event_rx: Signal<Option<async_channel::Receiver<crate::voice_chat::VoiceEvent>>> = use_signal(|| None);
     let voice_muted_arc: Signal<std::sync::Arc<std::sync::Mutex<bool>>> = use_signal(|| std::sync::Arc::new(std::sync::Mutex::new(false)));
     let mut voice_stop_flag: Signal<Option<std::sync::Arc<std::sync::Mutex<bool>>>> = use_signal(|| None);
@@ -732,14 +733,15 @@ fn app() -> Element {
                                             let config = crate::voice_chat::VoiceConfig::default();
                                             let muted_arc_clone = voice_muted_arc.read().clone();
                                             
-                                            if let Some((port, evt_rx, stop_flag)) = crate::voice_chat::start_voice_listener(config, muted_arc_clone) {
+                                            if let Some((external_ip, port, evt_rx, stop_flag)) = crate::voice_chat::start_voice_listener(config, muted_arc_clone) {
+                                                voice_external_ip.set(external_ip.clone());
                                                 voice_local_port.set(port);
                                                 voice_event_rx.set(Some(evt_rx));
                                                 voice_stop_flag.set(Some(stop_flag));
                                                 voice_state.set(crate::voice_chat::VoiceState::Hosting);
                                                 voice_session_id.set(Some(session_id));
                                                 voice_current_peer.set(None);
-                                                log::info!("Voice channel started on port {}", port);
+                                                log::info!("Voice channel started at {}:{}", external_ip, port);
                                             } else {
                                                 log::error!("Failed to start voice listener");
                                             }
@@ -1640,19 +1642,19 @@ fn app() -> Element {
                                                                                         user_menu_open.set(None);
                                                                                         if !can_invite { return; }
                                                                                         
-                                                                                        // Send voice channel invite
-                                                                                        let local_ip = crate::voice_chat::get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
+                                                                                        // Send voice channel invite using stored external IP
+                                                                                        let external_ip = voice_external_ip();
                                                                                         let port = voice_local_port();
                                                                                         let session_id = voice_session_id().unwrap_or_else(|| "unknown".to_string());
                                                                                         
-                                                                                        let ctcp_msg = crate::voice_chat::create_voice_call_ctcp(&local_ip, port, &session_id);
+                                                                                        let ctcp_msg = crate::voice_chat::create_voice_call_ctcp(&external_ip, port, &session_id);
                                                                                         if let Some(core) = cores.read().get(&state.read().active_profile) {
                                                                                             let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
                                                                                                 target: nick.clone(),
                                                                                                 message: ctcp_msg,
                                                                                             });
                                                                                         }
-                                                                                        log::info!("Sent voice channel invite to {}", nick);
+                                                                                        log::info!("Sent voice channel invite to {} at {}:{}", nick, external_ip, port);
                                                                                     }
                                                                                 },
                                                                                 "� Invite to Voice"
@@ -1675,13 +1677,12 @@ fn app() -> Element {
                                                                                         
                                                                                         // Generate session ID and get local IP
                                                                                         let session_id = crate::voice_chat::VoiceChatManager::generate_session_id();
-                                                                                        let local_ip = crate::voice_chat::get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
-                                                                                        
-                                                                                        // Start voice listener to get a port
+                                                                                        // Start voice listener to get a port and external IP
                                                                                         let config = crate::voice_chat::VoiceConfig::default();
                                                                                         let muted_arc_clone = voice_muted_arc.read().clone();
                                                                                         
-                                                                                        if let Some((port, evt_rx, stop_flag)) = crate::voice_chat::start_voice_listener(config, muted_arc_clone) {
+                                                                                        if let Some((external_ip, port, evt_rx, stop_flag)) = crate::voice_chat::start_voice_listener(config, muted_arc_clone) {
+                                                                                            voice_external_ip.set(external_ip.clone());
                                                                                             voice_local_port.set(port);
                                                                                             voice_event_rx.set(Some(evt_rx));
                                                                                             voice_stop_flag.set(Some(stop_flag));
@@ -1692,13 +1693,14 @@ fn app() -> Element {
                                                                                             voice_current_peer.set(Some(nick.clone()));
                                                                                             
                                                                                             // Send CTCP VOICE_CALL via IRC
-                                                                                            let ctcp_msg = crate::voice_chat::create_voice_call_ctcp(&local_ip, port, &session_id);
+                                                                                            let ctcp_msg = crate::voice_chat::create_voice_call_ctcp(&external_ip, port, &session_id);
                                                                                             if let Some(core) = cores.read().get(&state.read().active_profile) {
                                                                                                 let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
                                                                                                     target: nick.clone(),
                                                                                                     message: ctcp_msg,
                                                                                                 });
                                                                                             }
+                                                                                            log::info!("Started voice call to {} at {}:{}", nick, external_ip, port);
                                                                                         } else {
                                                                                             log::error!("Failed to start voice listener");
                                                                                         }
@@ -1781,9 +1783,11 @@ fn app() -> Element {
                                 let sid = session_id.clone();
                                 move |_| {
                                     // Accept the call and connect to caller
-                                    let local_ip = crate::voice_chat::get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
+                                    // Get our external IP for the accept response
+                                    let external_ip = crate::voice_chat::get_external_ip_sync()
+                                        .unwrap_or_else(|| crate::voice_chat::get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string()));
                                     
-                                    // Start voice listener for our port (in case caller initiates)
+                                    // Connect to the caller's listener
                                     let config = crate::voice_chat::VoiceConfig::default();
                                     let muted_arc_clone = voice_muted_arc.read().clone();
                                     
@@ -1797,9 +1801,9 @@ fn app() -> Element {
                                         voice_event_rx.set(Some(evt_rx));
                                         voice_stop_flag.set(Some(stop_flag));
                                         
-                                        // Send CTCP VOICE_ACCEPT with our port (may not be needed if we're connecting outbound)
+                                        // Send CTCP VOICE_ACCEPT with our external IP (may not be needed if we're connecting outbound)
                                         let local_port = voice_local_port();
-                                        let ctcp_msg = crate::voice_chat::create_voice_accept_ctcp(&local_ip, if local_port > 0 { local_port } else { 5000 }, &sid);
+                                        let ctcp_msg = crate::voice_chat::create_voice_accept_ctcp(&external_ip, if local_port > 0 { local_port } else { 5000 }, &sid);
                                         if let Some(core) = cores.read().get(&state.read().active_profile) {
                                             let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
                                                 target: from_user.clone(),
@@ -2424,6 +2428,7 @@ fn app() -> Element {
                                                 voice_session_id,
                                                 voice_current_peer,
                                                 voice_local_port,
+                                                voice_external_ip,
                                                 voice_muted_arc,
                                                 voice_event_rx,
                                                 voice_stop_flag,
@@ -2516,6 +2521,7 @@ fn app() -> Element {
                                         voice_session_id,
                                         voice_current_peer,
                                         voice_local_port,
+                                        voice_external_ip,
                                         voice_muted_arc,
                                         voice_event_rx,
                                         voice_stop_flag,
@@ -3767,6 +3773,7 @@ fn handle_send_message(
     mut voice_session_id: Signal<Option<String>>,
     mut voice_current_peer: Signal<Option<String>>,
     mut voice_local_port: Signal<u16>,
+    mut voice_external_ip: Signal<String>,
     voice_muted_arc: Signal<std::sync::Arc<std::sync::Mutex<bool>>>,
     mut voice_event_rx: Signal<Option<async_channel::Receiver<crate::voice_chat::VoiceEvent>>>,
     mut voice_stop_flag: Signal<Option<std::sync::Arc<std::sync::Mutex<bool>>>>,
@@ -4281,15 +4288,15 @@ fn handle_send_message(
                             },
                         );
                     } else {
-                        // Generate session ID and get local IP
+                        // Generate session ID
                         let session_id = crate::voice_chat::VoiceChatManager::generate_session_id();
-                        let local_ip = crate::voice_chat::get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
                         
-                        // Start voice listener to get a port
+                        // Start voice listener to get a port and external IP
                         let config = crate::voice_chat::VoiceConfig::default();
                         let muted_arc_clone = voice_muted_arc.read().clone();
                         
-                        if let Some((port, evt_rx, stop_flag)) = crate::voice_chat::start_voice_listener(config, muted_arc_clone) {
+                        if let Some((external_ip, port, evt_rx, stop_flag)) = crate::voice_chat::start_voice_listener(config, muted_arc_clone) {
+                            voice_external_ip.set(external_ip.clone());
                             voice_local_port.set(port);
                             voice_event_rx.set(Some(evt_rx));
                             voice_stop_flag.set(Some(stop_flag));
@@ -4300,7 +4307,7 @@ fn handle_send_message(
                             voice_current_peer.set(Some(target_nick.clone()));
                             
                             // Send CTCP VOICE_CALL via IRC
-                            let ctcp_msg = crate::voice_chat::create_voice_call_ctcp(&local_ip, port, &session_id);
+                            let ctcp_msg = crate::voice_chat::create_voice_call_ctcp(&external_ip, port, &session_id);
                             if let Some(h) = handle.as_ref() {
                                 let _ = h.cmd_tx.try_send(IrcCommandEvent::Ctcp {
                                     target: target_nick.clone(),
@@ -4314,7 +4321,7 @@ fn handle_send_message(
                                 &active_profile,
                                 IrcEvent::System {
                                     channel: channel.clone(),
-                                    text: format!("Calling {}...", target_nick),
+                                    text: format!("Calling {} at {}:{}...", target_nick, external_ip, port),
                                 },
                             );
                         } else {

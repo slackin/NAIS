@@ -778,7 +778,7 @@ pub struct VoiceChannelHandle {
 }
 
 /// Start a voice channel as host
-/// Returns (channel, listener port, event receiver, stop flag)
+/// Returns (channel, external port, event receiver, stop flag)
 pub fn create_voice_channel(
     host_nickname: &str,
     config: VoiceConfig,
@@ -788,14 +788,11 @@ pub fn create_voice_channel(
     let (evt_tx, evt_rx) = async_channel::unbounded();
     let stop_flag = Arc::new(Mutex::new(false));
     
-    // Get local IP
-    let local_ip = get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
-    
-    // Create a channel to receive the bound port
-    let (port_tx, port_rx) = std::sync::mpsc::channel();
+    // Create a channel to receive the bound port and external address info
+    // Returns (external_ip, external_port, local_port)
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel::<(String, u16, u16)>();
     
     let host_nick = host_nickname.to_string();
-    let local_ip_clone = local_ip.clone();
     let config_clone = config.clone();
     let evt_tx_clone = evt_tx.clone();
     let stop_flag_clone = stop_flag.clone();
@@ -809,18 +806,23 @@ pub fn create_voice_channel(
             match TcpListener::bind("0.0.0.0:0").await {
                 Ok(listener) => {
                     let local_addr = listener.local_addr().unwrap();
-                    let port = local_addr.port();
-                    log::info!("Voice channel listener started on port {}", port);
+                    let local_port = local_addr.port();
+                    log::info!("Voice channel listener started on local port {}", local_port);
                     
-                    // Send the port back
-                    let _ = port_tx.send(port);
+                    // Set up UPnP and get external address
+                    let (external_ip, external_port, _upnp_mapping) = setup_voice_address(local_port);
+                    log::info!("Voice channel address: {}:{} (local port {})", 
+                        external_ip, external_port, local_port);
+                    
+                    // Send the address info back
+                    let _ = addr_tx.send((external_ip.clone(), external_port, local_port));
                     
                     // Run the channel host loop
                     let _ = run_voice_channel_host(
                         listener,
                         host_nick,
-                        local_ip_clone,
-                        port,
+                        external_ip,
+                        external_port,
                         config_clone,
                         evt_tx_clone,
                         stop_flag_clone,
@@ -830,20 +832,20 @@ pub fn create_voice_channel(
                 }
                 Err(e) => {
                     log::error!("Failed to bind voice channel listener: {}", e);
-                    let _ = port_tx.send(0);
+                    let _ = addr_tx.send(("".to_string(), 0, 0));
                 }
             }
         });
     });
     
-    // Wait for the port
-    match port_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(port) if port > 0 => {
-            let mut channel = VoiceChannel::new(host_nickname.to_string(), local_ip, port);
+    // Wait for the address info
+    match addr_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok((external_ip, external_port, _local_port)) if external_port > 0 => {
+            let mut channel = VoiceChannel::new(host_nickname.to_string(), external_ip, external_port);
             if let Some(name) = channel_name {
                 channel.name = Some(name.to_string());
             }
-            Some((channel, port, evt_rx, stop_flag))
+            Some((channel, external_port, evt_rx, stop_flag))
         }
         _ => None,
     }
@@ -1808,12 +1810,12 @@ pub fn connect_voice_call(
 }
 
 /// Start listening for incoming voice connections (used when initiating a call)
-/// Returns (listener port, event receiver, stop flag)
+/// Returns (external_ip, external_port, event receiver, stop flag)
 /// Set the stop flag to true to terminate the voice connection
 pub fn start_voice_listener(
     config: VoiceConfig,
     muted: Arc<Mutex<bool>>,
-) -> Option<(u16, async_channel::Receiver<VoiceEvent>, Arc<Mutex<bool>>)> {
+) -> Option<(String, u16, async_channel::Receiver<VoiceEvent>, Arc<Mutex<bool>>)> {
     let (evt_tx, evt_rx) = async_channel::unbounded();
     let stop_flag = Arc::new(Mutex::new(false));
     
@@ -1822,8 +1824,9 @@ pub fn start_voice_listener(
     let muted_clone = muted.clone();
     let stop_flag_clone = stop_flag.clone();
     
-    // Create a channel to receive the bound port
-    let (port_tx, port_rx) = std::sync::mpsc::channel();
+    // Create a channel to receive the bound address info
+    // Returns (external_ip, external_port, local_port)
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel::<(String, u16, u16)>();
     
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("voice listener runtime");
@@ -1832,11 +1835,16 @@ pub fn start_voice_listener(
             match TcpListener::bind("0.0.0.0:0").await {
                 Ok(listener) => {
                     let local_addr = listener.local_addr().unwrap();
-                    let port = local_addr.port();
-                    log::info!("Voice listener started on port {}", port);
+                    let local_port = local_addr.port();
+                    log::info!("Voice listener started on local port {}", local_port);
                     
-                    // Send the port back
-                    let _ = port_tx.send(port);
+                    // Set up UPnP and get external address
+                    let (external_ip, external_port, _upnp_mapping) = setup_voice_address(local_port);
+                    log::info!("Voice listener address: {}:{} (local port {})", 
+                        external_ip, external_port, local_port);
+                    
+                    // Send the address info back
+                    let _ = addr_tx.send((external_ip, external_port, local_port));
                     
                     // Wait for one incoming connection
                     match listener.accept().await {
@@ -1862,15 +1870,17 @@ pub fn start_voice_listener(
                 }
                 Err(e) => {
                     log::error!("Failed to bind voice listener: {}", e);
-                    let _ = port_tx.send(0);
+                    let _ = addr_tx.send(("".to_string(), 0, 0));
                 }
             }
         });
     });
     
-    // Wait for the port
-    match port_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(port) if port > 0 => Some((port, evt_rx, stop_flag)),
+    // Wait for the address info (allow more time for UPnP setup)
+    match addr_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok((external_ip, external_port, _local_port)) if external_port > 0 => {
+            Some((external_ip, external_port, evt_rx, stop_flag))
+        }
         _ => None,
     }
 }
@@ -3020,6 +3030,214 @@ pub fn get_local_ip() -> Option<String> {
     socket.connect("8.8.8.8:80").ok()?;
     let local_addr = socket.local_addr().ok()?;
     Some(local_addr.ip().to_string())
+}
+
+// ============================================================================
+// NAT Traversal - External IP and UPnP
+// ============================================================================
+
+/// Get the external (public) IP address using various public services
+pub async fn get_external_ip() -> Option<String> {
+    // Try multiple services for reliability
+    let services = [
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://icanhazip.com",
+        "https://api.seeip.org",
+    ];
+    
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+    
+    for service in services {
+        match client.get(service).send().await {
+            Ok(resp) => {
+                if let Ok(ip) = resp.text().await {
+                    let ip = ip.trim().to_string();
+                    // Validate it looks like an IP address
+                    if ip.parse::<std::net::IpAddr>().is_ok() {
+                        log::info!("Got external IP from {}: {}", service, ip);
+                        return Some(ip);
+                    }
+                }
+            }
+            Err(e) => {
+                log::debug!("Failed to get external IP from {}: {}", service, e);
+            }
+        }
+    }
+    
+    log::warn!("Failed to get external IP from any service, falling back to local IP");
+    None
+}
+
+/// Get external IP synchronously (blocking)
+pub fn get_external_ip_sync() -> Option<String> {
+    // Try to create a runtime for async operation
+    match tokio::runtime::Handle::try_current() {
+        Ok(_handle) => {
+            // We're in an async context, spawn blocking
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().ok()?;
+                rt.block_on(get_external_ip())
+            }).join().ok()?
+        }
+        Err(_) => {
+            // Not in async context, create runtime
+            let rt = tokio::runtime::Runtime::new().ok()?;
+            rt.block_on(get_external_ip())
+        }
+    }
+}
+
+/// Represents an active UPnP port mapping
+#[derive(Clone, Debug)]
+pub struct UPnPMapping {
+    /// External port that was mapped
+    pub external_port: u16,
+    /// Local port it maps to
+    pub local_port: u16,
+    /// Protocol (TCP or UDP)
+    pub protocol: igd_next::PortMappingProtocol,
+    /// External IP address
+    pub external_ip: String,
+    /// Description of the mapping
+    pub description: String,
+}
+
+impl UPnPMapping {
+    /// Remove this port mapping from the gateway
+    pub fn remove(&self) -> Result<(), String> {
+        use igd_next::SearchOptions;
+        
+        let options = SearchOptions::default();
+        let gateway = igd_next::search_gateway(options)
+            .map_err(|e| format!("Failed to find gateway: {}", e))?;
+        
+        gateway.remove_port(self.protocol, self.external_port)
+            .map_err(|e| format!("Failed to remove port mapping: {}", e))?;
+        
+        log::info!("Removed UPnP port mapping: {} -> {}", self.external_port, self.local_port);
+        Ok(())
+    }
+}
+
+impl Drop for UPnPMapping {
+    fn drop(&mut self) {
+        if let Err(e) = self.remove() {
+            log::warn!("Failed to clean up UPnP mapping on drop: {}", e);
+        }
+    }
+}
+
+/// Set up a UPnP port mapping for voice chat
+/// Returns the mapping info on success, or uses local IP as fallback
+pub fn setup_upnp_mapping(local_port: u16, description: &str) -> Result<UPnPMapping, String> {
+    use igd_next::{SearchOptions, PortMappingProtocol};
+    use std::net::SocketAddrV4;
+    
+    log::info!("Setting up UPnP port mapping for port {}", local_port);
+    
+    let options = SearchOptions {
+        timeout: Some(std::time::Duration::from_secs(5)),
+        ..Default::default()
+    };
+    
+    let gateway = igd_next::search_gateway(options)
+        .map_err(|e| format!("Failed to find UPnP gateway: {}", e))?;
+    
+    log::info!("Found UPnP gateway: {:?}", gateway);
+    
+    // Get our local IP to this gateway
+    let local_ip = get_local_ip()
+        .ok_or_else(|| "Failed to get local IP".to_string())?;
+    
+    let local_addr_v4: SocketAddrV4 = format!("{}:{}", local_ip, local_port)
+        .parse()
+        .map_err(|e| format!("Invalid local address: {}", e))?;
+    let local_addr: std::net::SocketAddr = local_addr_v4.into();
+    
+    // Get external IP from gateway
+    let external_ip = gateway.get_external_ip()
+        .map_err(|e| format!("Failed to get external IP from gateway: {}", e))?;
+    
+    log::info!("External IP from gateway: {}", external_ip);
+    
+    // Try to use the same port externally if possible
+    let mut external_port = local_port;
+    let mut attempts = 0;
+    
+    loop {
+        // Lease duration of 3 hours (in seconds)
+        let lease_duration = 3 * 60 * 60;
+        
+        match gateway.add_port(
+            PortMappingProtocol::TCP,
+            external_port,
+            local_addr,
+            lease_duration,
+            description,
+        ) {
+            Ok(()) => {
+                log::info!("Successfully created UPnP mapping: external {}:{} -> local {}:{}", 
+                    external_ip, external_port, local_ip, local_port);
+                
+                return Ok(UPnPMapping {
+                    external_port,
+                    local_port,
+                    protocol: PortMappingProtocol::TCP,
+                    external_ip: external_ip.to_string(),
+                    description: description.to_string(),
+                });
+            }
+            Err(igd_next::AddPortError::PortInUse) => {
+                // Try a different port
+                attempts += 1;
+                if attempts >= 10 {
+                    return Err("Failed to find available port after 10 attempts".to_string());
+                }
+                external_port = external_port.saturating_add(1);
+                if external_port < 1024 {
+                    external_port = 49152; // Jump to dynamic port range
+                }
+                log::debug!("Port {} in use, trying {}", external_port - 1, external_port);
+            }
+            Err(e) => {
+                return Err(format!("Failed to add port mapping: {}", e));
+            }
+        }
+    }
+}
+
+/// Try to set up UPnP, falling back to local IP if it fails
+/// Returns (ip, port, optional_upnp_mapping)
+pub fn setup_voice_address(local_port: u16) -> (String, u16, Option<UPnPMapping>) {
+    // First try UPnP
+    match setup_upnp_mapping(local_port, "NAIS Voice Chat") {
+        Ok(mapping) => {
+            let ip = mapping.external_ip.clone();
+            let port = mapping.external_port;
+            log::info!("Using UPnP: {}:{}", ip, port);
+            (ip, port, Some(mapping))
+        }
+        Err(e) => {
+            log::warn!("UPnP setup failed: {}, trying external IP service", e);
+            
+            // Try to get external IP from service
+            if let Some(external_ip) = get_external_ip_sync() {
+                log::info!("Using external IP (no UPnP): {}:{}", external_ip, local_port);
+                log::warn!("Note: You may need to manually forward port {} to this machine", local_port);
+                (external_ip, local_port, None)
+            } else {
+                // Final fallback: local IP
+                let local_ip = get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
+                log::warn!("Using local IP (NAT may block connections): {}:{}", local_ip, local_port);
+                (local_ip, local_port, None)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
