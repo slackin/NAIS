@@ -16,8 +16,20 @@ pub enum ConnectionStatus {
     Connected,
 }
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Global message ID counter for unique keys
+static MESSAGE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn next_message_id() -> u64 {
+    MESSAGE_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChatMessage {
+    /// Unique message ID for efficient UI rendering (not persisted)
+    #[serde(skip, default = "next_message_id")]
+    pub id: u64,
     pub channel: String,
     pub user: String,
     pub text: String,
@@ -269,6 +281,7 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent, enable_lo
             state.connection_log.push(log_msg);
             if !state.current_channel.is_empty() {
                 state.messages.push(ChatMessage {
+                    id: next_message_id(),
                     channel: state.current_channel.clone(),
                     user: "system".to_string(),
                     text: "Connected.".to_string(),
@@ -284,6 +297,7 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent, enable_lo
             state.connection_log.push(log_msg);
             if !state.current_channel.is_empty() {
                 state.messages.push(ChatMessage {
+                    id: next_message_id(),
                     channel: state.current_channel.clone(),
                     user: "system".to_string(),
                     text: "Disconnected.".to_string(),
@@ -323,6 +337,7 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent, enable_lo
             }
             
             state.messages.push(ChatMessage {
+                id: next_message_id(),
                 channel: channel.clone(),
                 user: "system".to_string(),
                 text: "Joined channel.".to_string(),
@@ -342,6 +357,7 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent, enable_lo
                     .unwrap_or_default();
             }
             state.messages.push(ChatMessage {
+                id: next_message_id(),
                 channel,
                 user: "system".to_string(),
                 text: "Left channel.".to_string(),
@@ -386,6 +402,7 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent, enable_lo
                 }
             }
             state.messages.push(ChatMessage {
+                id: next_message_id(),
                 channel,
                 user,
                 text,
@@ -402,6 +419,7 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent, enable_lo
                 }
             }
             state.messages.push(ChatMessage {
+                id: next_message_id(),
                 channel,
                 user,
                 text,
@@ -421,6 +439,7 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent, enable_lo
             // Only add to channel messages if it's NOT an IRC protocol message
             if !text.starts_with("[IRC]") {
                 state.messages.push(ChatMessage {
+                    id: next_message_id(),
                     channel,
                     user: "system".to_string(),
                     text,

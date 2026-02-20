@@ -47,6 +47,21 @@ struct ChannelInviteInfo {
     current_profile: String,
 }
 
+/// Information for a cross-network invite we received
+#[derive(Clone, Debug)]
+struct CrossNetworkInviteInfo {
+    /// User who sent the invite
+    from_nick: String,
+    /// Channel to join
+    channel: String,
+    /// Server address to connect to
+    server: String,
+    /// Whether this is a NAIS encrypted channel
+    is_nais: bool,
+    /// Profile name where we received this invite (for context)
+    received_on_profile: String,
+}
+
 /// A channel option for the invite selector
 #[derive(Clone, Debug)]
 struct InviteChannelOption {
@@ -185,9 +200,12 @@ fn app() -> Element {
     // Display settings
     let mut settings_show_timestamps = use_signal(|| store.show_timestamps);
     let mut settings_show_advanced = use_signal(|| store.show_advanced);
+    // Channel users for nick highlighting
+    let mut channel_users: Signal<Vec<String>> = use_signal(Vec::new);
     // Provide global access to these settings
     use_context_provider(|| settings_show_timestamps);
     use_context_provider(|| settings_show_advanced);
+    use_context_provider(|| channel_users);
 
     let mut new_server_input = use_signal(String::new);
     let mut new_nick_input = use_signal(String::new);
@@ -253,6 +271,9 @@ fn app() -> Element {
     let known_nais_users: Signal<HashMap<String, bool>> = use_signal(HashMap::new);
     // Pending VERSION probes for invite detection (nick -> true means waiting)  
     let mut pending_invite_probes: Signal<HashMap<String, bool>> = use_signal(HashMap::new);
+    
+    // Cross-network invite popup state (when we receive an invite to another server)
+    let mut cross_network_invite: Signal<Option<CrossNetworkInviteInfo>> = use_signal(|| None);
 
     // Voice chat state
     let mut voice_state: Signal<crate::voice_chat::VoiceState> = use_signal(|| crate::voice_chat::VoiceState::Idle);
@@ -286,6 +307,22 @@ fn app() -> Element {
     
     // Voice network stats
     let mut voice_network_stats: Signal<crate::voice_chat::VoiceNetworkStats> = use_signal(|| crate::voice_chat::VoiceNetworkStats::new());
+
+    // Update channel_users context when channel or user list changes
+    use_effect(move || {
+        let state_read = state.read();
+        let active_profile = state_read.active_profile.clone();
+        let current_channel = state_read.servers
+            .get(&active_profile)
+            .map(|s| s.current_channel.clone())
+            .unwrap_or_default();
+        let users = state_read.servers
+            .get(&active_profile)
+            .and_then(|s| s.users_by_channel.get(&current_channel).cloned())
+            .unwrap_or_default();
+        drop(state_read);
+        channel_users.set(users);
+    });
 
     // Scroll behavior state
     let mut is_at_bottom = use_signal(|| true);
@@ -457,6 +494,7 @@ fn app() -> Element {
         let mut channel_invite_popup_handle = channel_invite_popup;
         let mut known_nais_users_handle = known_nais_users;
         let mut pending_invite_probes_handle = pending_invite_probes;
+        let mut cross_network_invite_handle = cross_network_invite;
         spawn(async move {
             let mut channel_buffer: Vec<(String, u32, String)> = Vec::new();
             const BATCH_SIZE: usize = 200;
@@ -846,6 +884,15 @@ fn app() -> Element {
                                                     },
                                                 );
                                                 drop(state_mut);
+                                                
+                                                // Show the cross-network invite popup
+                                                cross_network_invite_handle.set(Some(CrossNetworkInviteInfo {
+                                                    from_nick: from.clone(),
+                                                    channel: channel.clone(),
+                                                    server: server.clone(),
+                                                    is_nais: channel_type == "nais",
+                                                    received_on_profile: profile_name.clone(),
+                                                }));
                                                 
                                                 log::info!("NAIS channel invite from {}: channel={} server={} type={}", 
                                                     from, channel, server, channel_type);
@@ -1621,18 +1668,21 @@ fn app() -> Element {
                             });
                         },
                         {
-                            let current_channel = state.read().servers
-                                .get(&state.read().active_profile)
+                            // Read state once and extract only what we need for the current view
+                            let state_read = state.read();
+                            let active_profile = state_read.active_profile.clone();
+                            let server_state = state_read.servers.get(&active_profile);
+                            
+                            let current_channel = server_state
                                 .map(|s| s.current_channel.clone())
                                 .unwrap_or_default();
                             
                             if current_channel == "Server Log" {
-                                // Show server connection log
-                                let log_entries = state.read()
-                                    .servers
-                                    .get(&state.read().active_profile)
+                                // Clone only log entries (typically small)
+                                let log_entries = server_state
                                     .map(|s| s.connection_log.clone())
                                     .unwrap_or_default();
+                                drop(state_read);
                                 
                                 rsx! {
                                     if log_entries.is_empty() {
@@ -1658,30 +1708,24 @@ fn app() -> Element {
                                     }
                                 }
                             } else if current_channel == "Server" {
-                                // Show server-level messages (messages not tied to a real channel)
-                                let messages = state.read()
-                                    .servers
-                                    .get(&state.read().active_profile)
-                                    .map(|s| {
-                                        s.messages.iter()
-                                            .filter(|m| {
-                                                // Show messages from "Server" channel or messages that aren't 
-                                                // in a real channel (doesn't start with #, &, +, !)
-                                                // and aren't private messages
-                                                m.channel == "Server" || 
-                                                (m.is_system && 
-                                                 !m.channel.starts_with('#') && 
-                                                 !m.channel.starts_with('&') && 
-                                                 !m.channel.starts_with('+') && 
-                                                 !m.channel.starts_with('!'))
-                                            })
-                                            .cloned()
-                                            .collect::<Vec<_>>()
-                                    })
+                                // Clone and filter in one pass - only server messages
+                                let filtered: Vec<_> = server_state
+                                    .map(|s| s.messages.iter()
+                                        .filter(|m| {
+                                            m.channel == "Server" || 
+                                            (m.is_system && 
+                                             !m.channel.starts_with('#') && 
+                                             !m.channel.starts_with('&') && 
+                                             !m.channel.starts_with('+') && 
+                                             !m.channel.starts_with('!'))
+                                        })
+                                        .cloned()
+                                        .collect())
                                     .unwrap_or_default();
+                                drop(state_read);
                                 
                                 rsx! {
-                                    if messages.is_empty() {
+                                    if filtered.is_empty() {
                                         div {
                                             class: "message system",
                                             div {
@@ -1690,27 +1734,30 @@ fn app() -> Element {
                                             }
                                         }
                                     } else {
-                                        for msg in messages {
-                                            {message_view(msg)}
+                                        for msg in filtered {
+                                            {
+                                                let id = msg.id;
+                                                message_view(msg, id)
+                                            }
                                         }
                                     }
                                 }
                             } else {
-                                // Show regular chat messages
-                                let messages = state.read()
-                                    .servers
-                                    .get(&state.read().active_profile)
-                                    .map(|s| {
-                                        s.messages.iter()
-                                            .filter(|m| m.channel == current_channel)
-                                            .cloned()
-                                            .collect::<Vec<_>>()
-                                    })
+                                // Clone and filter in one pass - only current channel messages
+                                let filtered: Vec<_> = server_state
+                                    .map(|s| s.messages.iter()
+                                        .filter(|m| m.channel == current_channel)
+                                        .cloned()
+                                        .collect())
                                     .unwrap_or_default();
+                                drop(state_read);
                                 
                                 rsx! {
-                                    for msg in messages {
-                                        {message_view(msg)}
+                                    for msg in filtered {
+                                        {
+                                            let id = msg.id;
+                                            message_view(msg, id)
+                                        }
                                     }
                                 }
                             }
@@ -3135,6 +3182,241 @@ fn app() -> Element {
                                             }
                                         }
                                     }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Cross-network invite popup
+            if let Some(invite) = cross_network_invite() {
+                div {
+                    class: "modal-backdrop",
+                    onclick: move |_| {
+                        cross_network_invite.set(None);
+                    },
+                    div {
+                        class: "ctcp-popup",
+                        style: "max-width: 420px;",
+                        onclick: move |e| e.stop_propagation(),
+                        div {
+                            class: "ctcp-popup-header",
+                            div {
+                                style: "display: flex; align-items: center; gap: 8px;",
+                                span {
+                                    style: "font-size: 20px;",
+                                    if invite.is_nais { "🔒" } else { "📨" }
+                                }
+                                "Channel Invite"
+                            }
+                            button {
+                                class: "close-button",
+                                onclick: move |_| {
+                                    cross_network_invite.set(None);
+                                },
+                                "×"
+                            }
+                        }
+                        div {
+                            class: "ctcp-popup-content",
+                            div {
+                                class: "ctcp-row",
+                                span { class: "ctcp-label", "From" }
+                                span { class: "ctcp-value", "{invite.from_nick}" }
+                            }
+                            div {
+                                class: "ctcp-row",
+                                span { class: "ctcp-label", "Channel" }
+                                span { 
+                                    class: "ctcp-value",
+                                    style: if invite.is_nais { "color: #4CAF50;" } else { "" },
+                                    "{invite.channel}"
+                                    if invite.is_nais {
+                                        span {
+                                            style: "margin-left: 8px; font-size: 11px; background: rgba(76,175,80,0.1); padding: 2px 6px; border-radius: 4px;",
+                                            "NAIS Encrypted"
+                                        }
+                                    }
+                                }
+                            }
+                            div {
+                                class: "ctcp-row",
+                                span { class: "ctcp-label", "Server" }
+                                span { class: "ctcp-value", "{invite.server}" }
+                            }
+                            
+                            // Show if this is a cross-network invite
+                            {
+                                let is_cross_network = {
+                                    let state_read = state.read();
+                                    !state_read.servers.values().any(|s| s.server == invite.server)
+                                };
+                                
+                                if is_cross_network {
+                                    rsx! {
+                                        div {
+                                            style: "margin-top: 12px; padding: 10px; background: rgba(255,193,7,0.1); border: 1px solid rgba(255,193,7,0.3); border-radius: 6px;",
+                                            div {
+                                                style: "display: flex; align-items: center; gap: 8px; color: #FFB300;",
+                                                span { style: "font-size: 16px;", "⚠️" }
+                                                span { style: "font-weight: 500;", "New Network" }
+                                            }
+                                            p {
+                                                style: "margin: 8px 0 0 0; font-size: 13px; color: var(--text-muted);",
+                                                "Accepting will create a new profile and connect to this server."
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    rsx! { }
+                                }
+                            }
+                            
+                            // Buttons
+                            div {
+                                style: "display: flex; gap: 10px; margin-top: 16px;",
+                                button {
+                                    style: "flex: 1; padding: 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; font-size: 14px;",
+                                    onclick: move |_| {
+                                        cross_network_invite.set(None);
+                                    },
+                                    "Decline"
+                                }
+                                button {
+                                    style: "flex: 1; padding: 10px; background: #4CAF50; border: none; border-radius: 6px; cursor: pointer; color: white; font-weight: 500; font-size: 14px;",
+                                    onclick: {
+                                        let invite_data = invite.clone();
+                                        move |_| {
+                                            // Accept the invite
+                                            let server = invite_data.server.clone();
+                                            let channel = invite_data.channel.clone();
+                                            
+                                            // Check if we already have a profile for this server
+                                            let existing_profile = {
+                                                let profs = profiles.read();
+                                                profs.iter().find(|p| p.server == server).cloned()
+                                            };
+                                            
+                                            if let Some(profile) = existing_profile {
+                                                // We already have a profile for this server
+                                                // Check if already connected
+                                                let is_connected = state.read().servers.get(&profile.name)
+                                                    .map(|s| s.status == ConnectionStatus::Connected)
+                                                    .unwrap_or(false);
+                                                
+                                                if is_connected {
+                                                    // Just join the channel
+                                                    if let Some(core) = cores.read().get(&profile.name) {
+                                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Join {
+                                                            channel: channel.clone(),
+                                                        });
+                                                    }
+                                                } else {
+                                                    // Connect first, then join
+                                                    // Create core if not exists
+                                                    if !cores.read().contains_key(&profile.name) {
+                                                        let core = irc_client::start_core();
+                                                        cores.write().insert(profile.name.clone(), core);
+                                                    }
+                                                    
+                                                    if let Some(core) = cores.read().get(&profile.name) {
+                                                        // Update state to show we're connecting
+                                                        state.write().servers.entry(profile.name.clone())
+                                                            .or_insert_with(|| irc_client::default_server_state(
+                                                                profile.server.clone(),
+                                                                profile.nickname.clone(),
+                                                                channel.clone(),
+                                                            ))
+                                                            .status = ConnectionStatus::Connecting;
+                                                        
+                                                        // Connect to the server
+                                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Connect {
+                                                            server: profile.server.clone(),
+                                                            nickname: profile.nickname.clone(),
+                                                            channel: channel.clone(),
+                                                            use_tls: profile.use_tls,
+                                                            hide_host: profile.hide_host,
+                                                        });
+                                                    }
+                                                }
+                                                
+                                                // Switch to that profile
+                                                state.write().active_profile = profile.name.clone();
+                                            } else {
+                                                // No existing profile - create a new one
+                                                let new_nickname = {
+                                                    let profs = profiles.read();
+                                                    profs.first().map(|p| p.nickname.clone())
+                                                        .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "nais".to_string()))
+                                                };
+                                                
+                                                let new_profile_name = profile::profile_name(&server, &new_nickname, &channel);
+                                                let new_profile = profile::Profile {
+                                                    name: new_profile_name.clone(),
+                                                    server: server.clone(),
+                                                    nickname: new_nickname.clone(),
+                                                    channel: channel.clone(),
+                                                    use_tls: true, // Default to TLS
+                                                    auto_connect: true,
+                                                    enable_logging: true,
+                                                    scrollback_limit: 1000,
+                                                    log_buffer_size: 1000,
+                                                    hide_host: true,
+                                                };
+                                                
+                                                // Add profile
+                                                {
+                                                    let mut profs = profiles.write();
+                                                    profs.push(new_profile.clone());
+                                                }
+                                                
+                                                // Save profiles
+                                                let store = profile::ProfileStore {
+                                                    profiles: profiles.read().clone(),
+                                                    last_used: last_used.read().clone(),
+                                                    default_nickname: default_nick.read().clone(),
+                                                    show_timestamps: *settings_show_timestamps.read(),
+                                                    show_advanced: *settings_show_advanced.read(),
+                                                };
+                                                let _ = profile::save_store(&store);
+                                                
+                                                // Create server state
+                                                state.write().servers.insert(
+                                                    new_profile_name.clone(),
+                                                    irc_client::default_server_state(
+                                                        server.clone(),
+                                                        new_nickname.clone(),
+                                                        channel.clone(),
+                                                    ),
+                                                );
+                                                
+                                                // Create IRC core
+                                                let core = irc_client::start_core();
+                                                cores.write().insert(new_profile_name.clone(), core);
+                                                
+                                                // Connect
+                                                if let Some(core) = cores.read().get(&new_profile_name) {
+                                                    state.write().servers.get_mut(&new_profile_name)
+                                                        .map(|s| s.status = ConnectionStatus::Connecting);
+                                                    
+                                                    let _ = core.cmd_tx.try_send(IrcCommandEvent::Connect {
+                                                        server: server.clone(),
+                                                        nickname: new_nickname,
+                                                        channel: channel.clone(),
+                                                        use_tls: true,
+                                                        hide_host: true,
+                                                    });
+                                                }
+                                                
+                                                // Switch to the new profile
+                                                state.write().active_profile = new_profile_name;
+                                            }
+                                            
+                                            cross_network_invite.set(None);
+                                        }
+                                    },
+                                    "Accept & Join"
                                 }
                             }
                         }
@@ -6124,7 +6406,7 @@ fn username_color(username: &str) -> &'static str {
     COLORS[index]
 }
 
-fn message_view(msg: ChatMessage) -> Element {
+fn message_view(msg: ChatMessage, key: u64) -> Element {
     let system_class = if msg.is_system { " system" } else { "" };
     let action_class = if msg.is_action { " action" } else { "" };
     
@@ -6148,6 +6430,7 @@ fn message_view(msg: ChatMessage) -> Element {
     
     rsx! {
         div {
+            key: "{key}",
             class: format!("message{system_class}{action_class}"),
             onclick: move |_| {
                 if !msg.is_system && !always_show_timestamps() {
@@ -6232,17 +6515,29 @@ enum MediaItem {
     DiscoursePost { source_url: String, data: DiscourseData },
 }
 
-/// Represents a segment of text that may be plain or a clickable link
+/// Represents a segment of text that may be plain, a clickable link, or a highlighted nick
 #[derive(Clone, Debug)]
 enum TextSegment {
     Plain(String),
     Link(String),
+    Nick(String),
 }
 
 /// Parse text into segments, identifying URLs that should be clickable
+#[allow(dead_code)]
 fn parse_text_with_links(text: &str) -> Vec<TextSegment> {
+    parse_text_with_links_and_nicks(text, &[])
+}
+
+/// Parse text into segments, identifying URLs and nick mentions
+fn parse_text_with_links_and_nicks(text: &str, nicks: &[String]) -> Vec<TextSegment> {
     let mut segments = Vec::new();
     let mut current_plain = String::new();
+    
+    // Build a lowercase nick set for case-insensitive matching
+    let nick_set: std::collections::HashSet<String> = nicks.iter()
+        .map(|n| n.trim_start_matches(['@', '+', '%', '&', '~']).to_lowercase())
+        .collect();
     
     for word in text.split_inclusive(|c: char| c.is_whitespace()) {
         // Check if this word contains a URL
@@ -6257,9 +6552,9 @@ fn parse_text_with_links(text: &str) -> Vec<TextSegment> {
             .trim_start_matches('(');
         
         if cleaned.starts_with("http://") || cleaned.starts_with("https://") {
-            // Found a URL - push any accumulated plain text first
+            // Found a URL - push any accumulated plain text first (checking for nicks)
             if !current_plain.is_empty() {
-                segments.push(TextSegment::Plain(current_plain.clone()));
+                segments.extend(split_plain_text_by_nicks(&current_plain, &nick_set, nicks));
                 current_plain.clear();
             }
             
@@ -6286,7 +6581,64 @@ fn parse_text_with_links(text: &str) -> Vec<TextSegment> {
         }
     }
     
-    // Push any remaining plain text
+    // Push any remaining plain text (checking for nicks)
+    if !current_plain.is_empty() {
+        segments.extend(split_plain_text_by_nicks(&current_plain, &nick_set, nicks));
+    }
+    
+    segments
+}
+
+/// Split plain text into segments, identifying nick mentions
+/// Optimized to use O(n) word-based scanning instead of O(n*m) per-nick scanning
+fn split_plain_text_by_nicks(
+    text: &str, 
+    nick_set: &std::collections::HashSet<String>,
+    _original_nicks: &[String]
+) -> Vec<TextSegment> {
+    if nick_set.is_empty() || text.is_empty() {
+        return vec![TextSegment::Plain(text.to_string())];
+    }
+    
+    let mut segments = Vec::new();
+    let mut current_plain = String::new();
+    let mut chars = text.char_indices().peekable();
+    
+    while let Some((_start_idx, c)) = chars.next() {
+        // Check if this starts a potential word (alphanumeric or underscore)
+        if c.is_alphanumeric() || c == '_' {
+            // Collect the entire word
+            let mut word = String::new();
+            word.push(c);
+            
+            while let Some(&(_idx, next_c)) = chars.peek() {
+                if next_c.is_alphanumeric() || next_c == '_' {
+                    word.push(next_c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            
+            // Check if word is a nick (case-insensitive)
+            let word_lower = word.to_lowercase();
+            if nick_set.contains(&word_lower) {
+                // Found a nick! Push accumulated plain text first
+                if !current_plain.is_empty() {
+                    segments.push(TextSegment::Plain(std::mem::take(&mut current_plain)));
+                }
+                segments.push(TextSegment::Nick(word));
+            } else {
+                // Not a nick, add to plain text
+                current_plain.push_str(&word);
+            }
+        } else {
+            // Non-word character, add to plain text
+            current_plain.push(c);
+        }
+    }
+    
+    // Push remaining plain text
     if !current_plain.is_empty() {
         segments.push(TextSegment::Plain(current_plain));
     }
@@ -6294,9 +6646,12 @@ fn parse_text_with_links(text: &str) -> Vec<TextSegment> {
     segments
 }
 
-/// Render text with clickable links
+/// Render text with clickable links and highlighted nick mentions
 fn render_text_with_links(text: &str) -> Element {
-    let segments = parse_text_with_links(text);
+    // Get channel users from context for nick highlighting
+    let channel_users = use_context::<Signal<Vec<String>>>();
+    let nicks = channel_users();
+    let segments = parse_text_with_links_and_nicks(text, &nicks);
     
     rsx! {
         for segment in segments {
@@ -6311,6 +6666,15 @@ fn render_text_with_links(text: &str) -> Element {
                         "{url}"
                     }
                 },
+                TextSegment::Nick(nick) => {
+                    let color = username_color(&nick);
+                    rsx! {
+                        span {
+                            style: "color: {color}; font-weight: 500;",
+                            "{nick}"
+                        }
+                    }
+                }
             }
         }
     }
