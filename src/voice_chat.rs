@@ -201,6 +201,11 @@ pub const CTCP_VOICE_ACCEPT: &str = "VOICE_ACCEPT";
 pub const CTCP_VOICE_REJECT: &str = "VOICE_REJECT";
 pub const CTCP_VOICE_CANCEL: &str = "VOICE_CANCEL";
 
+// Voice channel CTCP commands
+pub const CTCP_VOICE_CHANNEL_INVITE: &str = "VOICE_CHANNEL_INVITE";
+pub const CTCP_VOICE_CHANNEL_JOIN: &str = "VOICE_CHANNEL_JOIN";
+pub const CTCP_VOICE_CHANNEL_LEAVE: &str = "VOICE_CHANNEL_LEAVE";
+
 /// Voice chat configuration
 #[derive(Clone, Debug)]
 pub struct VoiceConfig {
@@ -225,6 +230,850 @@ impl Default for VoiceConfig {
             frame_size: 960, // 20ms at 48kHz
             channels: 1,
         }
+    }
+}
+
+// ============================================================================
+// Voice Channel Types (Multi-party voice chat)
+// ============================================================================
+
+/// State of a voice channel
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VoiceChannelState {
+    /// Channel is active and accepting connections
+    Active,
+    /// Channel is being created
+    Creating,
+    /// Channel has ended
+    Closed,
+}
+
+/// A participant in a voice channel
+#[derive(Clone, Debug)]
+pub struct VoiceChannelParticipant {
+    /// Nickname of the participant
+    pub nickname: String,
+    /// IP address of the participant
+    pub ip: String,
+    /// Port the participant is listening on
+    pub port: u16,
+    /// Whether the participant is muted
+    pub muted: bool,
+    /// Whether this is the channel host
+    pub is_host: bool,
+    /// When the participant joined
+    pub joined_at: std::time::Instant,
+}
+
+/// Voice channel information
+#[derive(Clone, Debug)]
+pub struct VoiceChannel {
+    /// Unique channel ID (e.g., "VCHAN1a2b3c4d")
+    pub channel_id: String,
+    /// Channel name (optional, for display)
+    pub name: Option<String>,
+    /// Host's nickname (the channel creator)
+    pub host: String,
+    /// Host's IP address
+    pub host_ip: String,
+    /// Host's listening port
+    pub host_port: u16,
+    /// List of participants (including host)
+    pub participants: Vec<VoiceChannelParticipant>,
+    /// Channel state
+    pub state: VoiceChannelState,
+    /// When the channel was created
+    pub created_at: std::time::Instant,
+    /// Maximum number of participants (0 = unlimited)
+    pub max_participants: usize,
+}
+
+impl VoiceChannel {
+    /// Create a new voice channel
+    pub fn new(host: String, host_ip: String, host_port: u16) -> Self {
+        let channel_id = generate_channel_id();
+        let host_participant = VoiceChannelParticipant {
+            nickname: host.clone(),
+            ip: host_ip.clone(),
+            port: host_port,
+            muted: false,
+            is_host: true,
+            joined_at: std::time::Instant::now(),
+        };
+        
+        Self {
+            channel_id,
+            name: None,
+            host,
+            host_ip,
+            host_port,
+            participants: vec![host_participant],
+            state: VoiceChannelState::Active,
+            created_at: std::time::Instant::now(),
+            max_participants: 8, // Default max participants
+        }
+    }
+    
+    /// Create a voice channel with a custom name
+    pub fn with_name(mut self, name: &str) -> Self {
+        self.name = Some(name.to_string());
+        self
+    }
+    
+    /// Add a participant to the channel
+    pub fn add_participant(&mut self, nickname: String, ip: String, port: u16) -> bool {
+        // Check if at max capacity
+        if self.max_participants > 0 && self.participants.len() >= self.max_participants {
+            return false;
+        }
+        
+        // Check if already in channel
+        if self.participants.iter().any(|p| p.nickname == nickname) {
+            return false;
+        }
+        
+        self.participants.push(VoiceChannelParticipant {
+            nickname,
+            ip,
+            port,
+            muted: false,
+            is_host: false,
+            joined_at: std::time::Instant::now(),
+        });
+        true
+    }
+    
+    /// Remove a participant from the channel
+    pub fn remove_participant(&mut self, nickname: &str) -> bool {
+        let initial_len = self.participants.len();
+        self.participants.retain(|p| p.nickname != nickname);
+        self.participants.len() < initial_len
+    }
+    
+    /// Get a participant by nickname
+    pub fn get_participant(&self, nickname: &str) -> Option<&VoiceChannelParticipant> {
+        self.participants.iter().find(|p| p.nickname == nickname)
+    }
+    
+    /// Get participant count
+    pub fn participant_count(&self) -> usize {
+        self.participants.len()
+    }
+    
+    /// Check if the channel is full
+    pub fn is_full(&self) -> bool {
+        self.max_participants > 0 && self.participants.len() >= self.max_participants
+    }
+    
+    /// Get display name for the channel
+    pub fn display_name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| format!("{}'s Voice Channel", self.host))
+    }
+}
+
+/// Generate a unique channel ID
+pub fn generate_channel_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("VCHAN{:x}{:x}", timestamp, count)
+}
+
+/// Events specific to voice channels
+#[derive(Clone, Debug)]
+pub enum VoiceChannelEvent {
+    /// Voice channel was created
+    Created { channel: VoiceChannel },
+    /// Received an invitation to join a voice channel
+    Invited { from: String, channel_id: String, channel_name: Option<String>, host_ip: String, host_port: u16 },
+    /// A participant joined the channel
+    ParticipantJoined { channel_id: String, nickname: String },
+    /// A participant left the channel
+    ParticipantLeft { channel_id: String, nickname: String },
+    /// Channel was closed
+    Closed { channel_id: String, reason: String },
+    /// Error occurred
+    Error { channel_id: String, message: String },
+}
+
+/// Commands for voice channel management
+#[derive(Clone, Debug)]
+pub enum VoiceChannelCommand {
+    /// Create a new voice channel
+    Create { name: Option<String> },
+    /// Invite a user to the channel
+    Invite { nickname: String },
+    /// Join a channel (when accepting an invite)
+    Join { channel_id: String, host_ip: String, host_port: u16 },
+    /// Leave the current channel
+    Leave,
+    /// Close the channel (host only)
+    Close,
+    /// Kick a participant (host only)
+    Kick { nickname: String },
+}
+
+// ============================================================================
+// Voice Channel CTCP Message Functions
+// ============================================================================
+
+/// Create CTCP message for inviting someone to a voice channel
+/// Format: VOICE_CHANNEL_INVITE <channel_id> <host_ip> <host_port> [channel_name]
+pub fn create_voice_channel_invite_ctcp(channel_id: &str, host_ip: &str, host_port: u16, channel_name: Option<&str>) -> String {
+    if let Some(name) = channel_name {
+        format!("\x01{} {} {} {} {}\x01", CTCP_VOICE_CHANNEL_INVITE, channel_id, host_ip, host_port, name)
+    } else {
+        format!("\x01{} {} {} {}\x01", CTCP_VOICE_CHANNEL_INVITE, channel_id, host_ip, host_port)
+    }
+}
+
+/// Create CTCP message for joining a voice channel
+/// Format: VOICE_CHANNEL_JOIN <channel_id> <joiner_ip> <joiner_port>
+pub fn create_voice_channel_join_ctcp(channel_id: &str, joiner_ip: &str, joiner_port: u16) -> String {
+    format!("\x01{} {} {} {}\x01", CTCP_VOICE_CHANNEL_JOIN, channel_id, joiner_ip, joiner_port)
+}
+
+/// Create CTCP message for leaving a voice channel
+/// Format: VOICE_CHANNEL_LEAVE <channel_id>
+pub fn create_voice_channel_leave_ctcp(channel_id: &str) -> String {
+    format!("\x01{} {}\x01", CTCP_VOICE_CHANNEL_LEAVE, channel_id)
+}
+
+/// Parse voice channel CTCP message
+/// Returns: (command, args) if valid voice channel CTCP
+pub fn parse_voice_channel_ctcp(text: &str) -> Option<(String, Vec<String>)> {
+    if !text.starts_with('\x01') || !text.ends_with('\x01') {
+        return None;
+    }
+    
+    let content = &text[1..text.len()-1];
+    let parts: Vec<&str> = content.splitn(2, ' ').collect();
+    
+    let command = parts[0].to_string();
+    if !command.starts_with("VOICE_CHANNEL_") {
+        return None;
+    }
+    
+    let args = if parts.len() > 1 {
+        parts[1].split_whitespace().map(|s| s.to_string()).collect()
+    } else {
+        Vec::new()
+    };
+    
+    Some((command, args))
+}
+
+// ============================================================================
+// Voice Channel Manager
+// ============================================================================
+
+/// Manages voice channels (hosting and participating)
+pub struct VoiceChannelManager {
+    /// Currently hosted channel (if we're the host)
+    pub hosted_channel: Option<VoiceChannel>,
+    /// Currently joined channel (if we're a participant)
+    pub joined_channel: Option<VoiceChannel>,
+    /// Configuration
+    pub config: VoiceConfig,
+    /// Local listener address (when hosting)
+    listener_addr: Option<SocketAddr>,
+    /// Event sender
+    event_tx: Option<Sender<VoiceChannelEvent>>,
+    /// Connections to participants (when hosting)
+    participant_streams: Arc<Mutex<HashMap<String, TcpStream>>>,
+    /// Connection to host (when joining)
+    host_stream: Option<TcpStream>,
+    /// Local muted state
+    pub local_muted: bool,
+    /// Stop flag
+    stop_flag: Arc<Mutex<bool>>,
+}
+
+impl VoiceChannelManager {
+    pub fn new(config: VoiceConfig) -> Self {
+        Self {
+            hosted_channel: None,
+            joined_channel: None,
+            config,
+            listener_addr: None,
+            event_tx: None,
+            participant_streams: Arc::new(Mutex::new(HashMap::new())),
+            host_stream: None,
+            local_muted: false,
+            stop_flag: Arc::new(Mutex::new(false)),
+        }
+    }
+    
+    /// Check if we're currently in a voice channel
+    pub fn is_in_channel(&self) -> bool {
+        self.hosted_channel.is_some() || self.joined_channel.is_some()
+    }
+    
+    /// Check if we're the host of a channel
+    pub fn is_host(&self) -> bool {
+        self.hosted_channel.is_some()
+    }
+    
+    /// Get the current channel (hosted or joined)
+    pub fn current_channel(&self) -> Option<&VoiceChannel> {
+        self.hosted_channel.as_ref().or(self.joined_channel.as_ref())
+    }
+    
+    /// Get participants in the current channel
+    pub fn get_participants(&self) -> Vec<VoiceChannelParticipant> {
+        self.current_channel()
+            .map(|c| c.participants.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Handle for interacting with voice channels from UI
+#[derive(Clone)]
+pub struct VoiceChannelHandle {
+    pub cmd_tx: Sender<VoiceChannelCommand>,
+    pub evt_rx: Receiver<VoiceChannelEvent>,
+}
+
+/// Start a voice channel as host
+/// Returns (channel, listener port, event receiver, stop flag)
+pub fn create_voice_channel(
+    host_nickname: &str,
+    config: VoiceConfig,
+    channel_name: Option<&str>,
+    muted: Arc<Mutex<bool>>,
+) -> Option<(VoiceChannel, u16, Receiver<VoiceChannelEvent>, Arc<Mutex<bool>>)> {
+    let (evt_tx, evt_rx) = async_channel::unbounded();
+    let stop_flag = Arc::new(Mutex::new(false));
+    
+    // Get local IP
+    let local_ip = get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
+    
+    // Create a channel to receive the bound port
+    let (port_tx, port_rx) = std::sync::mpsc::channel();
+    
+    let host_nick = host_nickname.to_string();
+    let local_ip_clone = local_ip.clone();
+    let config_clone = config.clone();
+    let evt_tx_clone = evt_tx.clone();
+    let stop_flag_clone = stop_flag.clone();
+    let muted_clone = muted.clone();
+    let channel_name_owned = channel_name.map(|s| s.to_string());
+    
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("voice channel runtime");
+        rt.block_on(async move {
+            // Bind to any available port
+            match TcpListener::bind("0.0.0.0:0").await {
+                Ok(listener) => {
+                    let local_addr = listener.local_addr().unwrap();
+                    let port = local_addr.port();
+                    log::info!("Voice channel listener started on port {}", port);
+                    
+                    // Send the port back
+                    let _ = port_tx.send(port);
+                    
+                    // Run the channel host loop
+                    let _ = run_voice_channel_host(
+                        listener,
+                        host_nick,
+                        local_ip_clone,
+                        port,
+                        config_clone,
+                        evt_tx_clone,
+                        stop_flag_clone,
+                        muted_clone,
+                        channel_name_owned,
+                    ).await;
+                }
+                Err(e) => {
+                    log::error!("Failed to bind voice channel listener: {}", e);
+                    let _ = port_tx.send(0);
+                }
+            }
+        });
+    });
+    
+    // Wait for the port
+    match port_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(port) if port > 0 => {
+            let mut channel = VoiceChannel::new(host_nickname.to_string(), local_ip, port);
+            if let Some(name) = channel_name {
+                channel.name = Some(name.to_string());
+            }
+            Some((channel, port, evt_rx, stop_flag))
+        }
+        _ => None,
+    }
+}
+
+/// Join an existing voice channel
+/// Returns (event receiver, stop flag)
+pub fn join_voice_channel(
+    channel_id: &str,
+    host_ip: &str,
+    host_port: u16,
+    our_nickname: &str,
+    config: VoiceConfig,
+    muted: Arc<Mutex<bool>>,
+) -> Option<(Receiver<VoiceChannelEvent>, Arc<Mutex<bool>>)> {
+    let (evt_tx, evt_rx) = async_channel::unbounded();
+    let stop_flag = Arc::new(Mutex::new(false));
+    
+    let channel_id = channel_id.to_string();
+    let host_addr = format!("{}:{}", host_ip, host_port);
+    let our_nick = our_nickname.to_string();
+    let config_clone = config.clone();
+    let evt_tx_clone = evt_tx.clone();
+    let stop_flag_clone = stop_flag.clone();
+    let muted_clone = muted.clone();
+    
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("voice channel join runtime");
+        rt.block_on(async move {
+            log::info!("Joining voice channel {} at {}", channel_id, host_addr);
+            
+            match TcpStream::connect(&host_addr).await {
+                Ok(stream) => {
+                    log::info!("Connected to voice channel host");
+                    let _ = run_voice_channel_participant(
+                        stream,
+                        channel_id,
+                        our_nick,
+                        config_clone,
+                        evt_tx_clone,
+                        stop_flag_clone,
+                        muted_clone,
+                    ).await;
+                }
+                Err(e) => {
+                    log::error!("Failed to connect to voice channel: {}", e);
+                    let _ = evt_tx_clone.send(VoiceChannelEvent::Error {
+                        channel_id,
+                        message: format!("Connection failed: {}", e),
+                    }).await;
+                }
+            }
+        });
+    });
+    
+    Some((evt_rx, stop_flag))
+}
+
+/// Run the voice channel host loop - accepts connections and mixes audio
+async fn run_voice_channel_host(
+    listener: TcpListener,
+    host_nick: String,
+    host_ip: String,
+    host_port: u16,
+    config: VoiceConfig,
+    evt_tx: Sender<VoiceChannelEvent>,
+    stop_flag: Arc<Mutex<bool>>,
+    muted: Arc<Mutex<bool>>,
+    channel_name: Option<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let channel_id = generate_channel_id();
+    let mut channel = VoiceChannel::new(host_nick.clone(), host_ip.clone(), host_port);
+    if let Some(name) = &channel_name {
+        channel.name = Some(name.clone());
+    }
+    channel.channel_id = channel_id.clone();
+    
+    // Send channel created event
+    let _ = evt_tx.send(VoiceChannelEvent::Created { channel: channel.clone() }).await;
+    
+    // Track participant connections
+    let participants: Arc<Mutex<HashMap<String, ParticipantConnection>>> = Arc::new(Mutex::new(HashMap::new()));
+    
+    // Channel for receiving audio from participants
+    let (audio_tx, audio_rx) = async_channel::bounded::<(String, u32, Vec<u8>)>(100);
+    
+    // Start our own audio capture
+    let mut audio_stream = VoiceAudioStream::new(&config);
+    let dummy_voice_evt_tx: Sender<VoiceEvent> = {
+        let (tx, _rx) = async_channel::unbounded();
+        tx
+    };
+    
+    let frame_rx = audio_stream.start(
+        &config,
+        None,
+        None,
+        dummy_voice_evt_tx,
+        muted.clone(),
+    );
+    
+    // Spawn audio mixing task
+    let participants_clone = participants.clone();
+    let stop_flag_clone = stop_flag.clone();
+    let config_clone = config.clone();
+    
+    tokio::spawn(async move {
+        let mut mixer = AudioMixer::new(&config_clone);
+        let mut mix_interval = tokio::time::interval(std::time::Duration::from_millis(20));
+        
+        loop {
+            if *stop_flag_clone.lock().unwrap() {
+                break;
+            }
+            
+            tokio::select! {
+                _ = mix_interval.tick() => {
+                    // Collect and mix audio from all participants
+                    let pconns = participants_clone.lock().unwrap();
+                    for (_nick, conn) in pconns.iter() {
+                        // Get pending audio from this participant
+                        if let Some(audio) = conn.pending_audio.lock().unwrap().take() {
+                            mixer.add_audio(&audio);
+                        }
+                    }
+                    
+                    // Get mixed audio and broadcast
+                    if let Some(mixed) = mixer.get_mixed() {
+                        for (nick, conn) in pconns.iter() {
+                            if let Some(ref tx) = conn.audio_out_tx {
+                                let _ = tx.try_send(mixed.clone());
+                            }
+                            let _ = nick; // Silence unused warning
+                        }
+                    }
+                }
+                
+                // Receive audio from participants
+                audio = audio_rx.recv() => {
+                    if let Ok((from_nick, _seq, data)) = audio {
+                        if let Ok(mut pconns) = participants_clone.lock() {
+                            if let Some(conn) = pconns.get_mut(&from_nick) {
+                                *conn.pending_audio.lock().unwrap() = Some(data);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    
+    // Accept loop
+    loop {
+        if *stop_flag.lock().unwrap() {
+            break;
+        }
+        
+        tokio::select! {
+            accept_result = listener.accept() => {
+                if let Ok((stream, addr)) = accept_result {
+                    log::info!("New participant connected from {}", addr);
+                    
+                    // Create participant connection
+                    let (out_tx, out_rx) = async_channel::bounded::<Vec<u8>>(100);
+                    let participant_name = format!("participant_{}", addr.port());
+                    
+                    let conn = ParticipantConnection {
+                        stream: None, // Will be set after we identify the participant
+                        audio_out_tx: Some(out_tx),
+                        pending_audio: Arc::new(Mutex::new(None)),
+                    };
+                    
+                    participants.lock().unwrap().insert(participant_name.clone(), conn);
+                    
+                    // Handle this participant in a separate task
+                    let audio_tx_clone = audio_tx.clone();
+                    let evt_tx_clone = evt_tx.clone();
+                    let channel_id_clone = channel_id.clone();
+                    let stop_flag_clone = stop_flag.clone();
+                    let config_clone = config.clone();
+                    let muted_clone = muted.clone();
+                    
+                    tokio::spawn(async move {
+                        let _ = handle_channel_participant(
+                            stream,
+                            participant_name,
+                            audio_tx_clone,
+                            out_rx,
+                            evt_tx_clone,
+                            channel_id_clone,
+                            stop_flag_clone,
+                            config_clone,
+                            muted_clone,
+                        ).await;
+                    });
+                }
+            }
+            
+            // Send our own audio frames
+            frame = async {
+                if let Some(ref rx) = frame_rx {
+                    rx.recv().await.ok()
+                } else {
+                    None
+                }
+            } => {
+                if let Some((_seq, data)) = frame {
+                    // Broadcast to all participants
+                    let pconns = participants.lock().unwrap();
+                    for (_nick, conn) in pconns.iter() {
+                        if let Some(ref tx) = conn.audio_out_tx {
+                            let _ = tx.try_send(data.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Cleanup
+    audio_stream.stop();
+    let _ = evt_tx.send(VoiceChannelEvent::Closed {
+        channel_id,
+        reason: "Host ended channel".to_string(),
+    }).await;
+    
+    Ok(())
+}
+
+/// Participant connection state
+struct ParticipantConnection {
+    #[allow(dead_code)]
+    stream: Option<TcpStream>,
+    audio_out_tx: Option<Sender<Vec<u8>>>,
+    pending_audio: Arc<Mutex<Option<Vec<u8>>>>,
+}
+
+/// Handle a single participant connection (runs on the host)
+async fn handle_channel_participant(
+    mut stream: TcpStream,
+    participant_name: String,
+    audio_tx: Sender<(String, u32, Vec<u8>)>,
+    audio_out_rx: Receiver<Vec<u8>>,
+    evt_tx: Sender<VoiceChannelEvent>,
+    channel_id: String,
+    stop_flag: Arc<Mutex<bool>>,
+    _config: VoiceConfig,
+    _muted: Arc<Mutex<bool>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut read_buf = [0u8; 8192];
+    let mut pending_data: Vec<u8> = Vec::with_capacity(16384);
+    
+    let _ = evt_tx.send(VoiceChannelEvent::ParticipantJoined {
+        channel_id: channel_id.clone(),
+        nickname: participant_name.clone(),
+    }).await;
+    
+    loop {
+        if *stop_flag.lock().unwrap() {
+            break;
+        }
+        
+        tokio::select! {
+            // Send audio out to this participant
+            audio_out = audio_out_rx.recv() => {
+                if let Ok(data) = audio_out {
+                    // Send as audio frame
+                    let cmd = VoiceCommand::AudioFrame { sequence: 0, data };
+                    if let Err(e) = stream.write_all(&cmd.to_bytes()).await {
+                        log::error!("Failed to send audio to {}: {}", participant_name, e);
+                        break;
+                    }
+                }
+            }
+            
+            // Receive audio from this participant
+            result = stream.read(&mut read_buf) => {
+                let n = match result {
+                    Ok(n) => n,
+                    Err(e) => {
+                        log::error!("Read error from {}: {}", participant_name, e);
+                        break;
+                    }
+                };
+                
+                if n == 0 {
+                    log::info!("Participant {} disconnected", participant_name);
+                    break;
+                }
+                
+                pending_data.extend_from_slice(&read_buf[..n]);
+                
+                // Process messages
+                loop {
+                    match parse_voice_command_from_buffer(&pending_data) {
+                        Some((cmd, consumed)) => {
+                            pending_data.drain(..consumed);
+                            
+                            match cmd {
+                                VoiceCommand::AudioFrame { sequence, data } => {
+                                    let _ = audio_tx.try_send((participant_name.clone(), sequence, data));
+                                }
+                                VoiceCommand::Hangup => {
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+    
+    let _ = evt_tx.send(VoiceChannelEvent::ParticipantLeft {
+        channel_id,
+        nickname: participant_name,
+    }).await;
+    
+    Ok(())
+}
+
+/// Run as a participant in a voice channel
+async fn run_voice_channel_participant(
+    mut stream: TcpStream,
+    channel_id: String,
+    our_nick: String,
+    config: VoiceConfig,
+    evt_tx: Sender<VoiceChannelEvent>,
+    stop_flag: Arc<Mutex<bool>>,
+    muted: Arc<Mutex<bool>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut read_buf = [0u8; 8192];
+    let mut pending_data: Vec<u8> = Vec::with_capacity(16384);
+    
+    // Start audio
+    let mut audio_stream = VoiceAudioStream::new(&config);
+    let dummy_evt_tx: Sender<VoiceEvent> = {
+        let (tx, _rx) = async_channel::unbounded();
+        tx
+    };
+    
+    let frame_rx = audio_stream.start(
+        &config,
+        None,
+        None,
+        dummy_evt_tx,
+        muted.clone(),
+    );
+    
+    if frame_rx.is_none() {
+        let _ = evt_tx.send(VoiceChannelEvent::Error {
+            channel_id: channel_id.clone(),
+            message: "Failed to start audio".to_string(),
+        }).await;
+        return Ok(());
+    }
+    
+    let frame_rx = frame_rx.unwrap();
+    
+    log::info!("Participant {} joined channel {}", our_nick, channel_id);
+    
+    loop {
+        if *stop_flag.lock().unwrap() {
+            // Send hangup to host
+            let _ = stream.write_all(&VoiceCommand::Hangup.to_bytes()).await;
+            break;
+        }
+        
+        tokio::select! {
+            // Send our audio frames to host
+            frame = frame_rx.recv() => {
+                if let Ok((seq, data)) = frame {
+                    let cmd = VoiceCommand::AudioFrame { sequence: seq, data };
+                    if let Err(e) = stream.write_all(&cmd.to_bytes()).await {
+                        log::error!("Failed to send audio to host: {}", e);
+                        break;
+                    }
+                }
+            }
+            
+            // Receive mixed audio from host
+            result = stream.read(&mut read_buf) => {
+                let n = match result {
+                    Ok(n) => n,
+                    Err(e) => {
+                        log::error!("Read error from host: {}", e);
+                        break;
+                    }
+                };
+                
+                if n == 0 {
+                    log::info!("Host closed connection");
+                    break;
+                }
+                
+                pending_data.extend_from_slice(&read_buf[..n]);
+                
+                loop {
+                    match parse_voice_command_from_buffer(&pending_data) {
+                        Some((cmd, consumed)) => {
+                            pending_data.drain(..consumed);
+                            
+                            match cmd {
+                                VoiceCommand::AudioFrame { sequence, data } => {
+                                    audio_stream.receive_frame(sequence, &data);
+                                }
+                                VoiceCommand::Hangup => {
+                                    let _ = evt_tx.send(VoiceChannelEvent::Closed {
+                                        channel_id: channel_id.clone(),
+                                        reason: "Host ended channel".to_string(),
+                                    }).await;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+    
+    audio_stream.stop();
+    let _ = evt_tx.send(VoiceChannelEvent::Closed {
+        channel_id,
+        reason: "Left channel".to_string(),
+    }).await;
+    
+    Ok(())
+}
+
+/// Simple audio mixer for combining multiple audio streams
+struct AudioMixer {
+    frame_size: usize,
+    accumulated: Vec<f32>,
+    source_count: usize,
+}
+
+impl AudioMixer {
+    fn new(config: &VoiceConfig) -> Self {
+        Self {
+            frame_size: config.frame_size,
+            accumulated: vec![0.0; config.frame_size],
+            source_count: 0,
+        }
+    }
+    
+    /// Add audio data to the mix (already encoded, needs decoding first)
+    fn add_audio(&mut self, _encoded_data: &[u8]) {
+        // In a full implementation, we'd decode and mix
+        // For now, this is a placeholder
+        self.source_count += 1;
+    }
+    
+    /// Get the mixed audio and reset
+    fn get_mixed(&mut self) -> Option<Vec<u8>> {
+        if self.source_count == 0 {
+            return None;
+        }
+        
+        // In a full implementation, we'd encode the mixed audio
+        // For now, return None to indicate no mixing happened
+        self.source_count = 0;
+        self.accumulated.fill(0.0);
+        None
     }
 }
 
@@ -280,11 +1129,14 @@ impl VoiceChatManager {
     /// Generate a unique session ID
     pub fn generate_session_id() -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis();
-        format!("VC{:x}", timestamp)
+            .as_nanos();
+        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("VC{:x}{:x}", timestamp, count)
     }
 
     /// Get current voice state
@@ -1959,5 +2811,143 @@ mod tests {
         let id2 = VoiceChatManager::generate_session_id();
         assert!(id1.starts_with("VC"));
         assert_ne!(id1, id2);
+    }
+    
+    #[test]
+    fn test_channel_id_generation() {
+        let id1 = generate_channel_id();
+        let id2 = generate_channel_id();
+        assert!(id1.starts_with("VCHAN"));
+        assert_ne!(id1, id2);
+    }
+    
+    #[test]
+    fn test_voice_channel_creation() {
+        let channel = VoiceChannel::new(
+            "TestHost".to_string(),
+            "192.168.1.1".to_string(),
+            5000,
+        );
+        
+        assert!(channel.channel_id.starts_with("VCHAN"));
+        assert_eq!(channel.host, "TestHost");
+        assert_eq!(channel.host_ip, "192.168.1.1");
+        assert_eq!(channel.host_port, 5000);
+        assert_eq!(channel.participants.len(), 1);
+        assert!(channel.participants[0].is_host);
+        assert_eq!(channel.state, VoiceChannelState::Active);
+    }
+    
+    #[test]
+    fn test_voice_channel_add_participant() {
+        let mut channel = VoiceChannel::new(
+            "TestHost".to_string(),
+            "192.168.1.1".to_string(),
+            5000,
+        );
+        
+        assert!(channel.add_participant("User1".to_string(), "192.168.1.2".to_string(), 5001));
+        assert_eq!(channel.participants.len(), 2);
+        
+        // Can't add duplicate
+        assert!(!channel.add_participant("User1".to_string(), "192.168.1.2".to_string(), 5001));
+        assert_eq!(channel.participants.len(), 2);
+        
+        // Add another
+        assert!(channel.add_participant("User2".to_string(), "192.168.1.3".to_string(), 5002));
+        assert_eq!(channel.participants.len(), 3);
+    }
+    
+    #[test]
+    fn test_voice_channel_remove_participant() {
+        let mut channel = VoiceChannel::new(
+            "TestHost".to_string(),
+            "192.168.1.1".to_string(),
+            5000,
+        );
+        channel.add_participant("User1".to_string(), "192.168.1.2".to_string(), 5001);
+        channel.add_participant("User2".to_string(), "192.168.1.3".to_string(), 5002);
+        
+        assert_eq!(channel.participants.len(), 3);
+        assert!(channel.remove_participant("User1"));
+        assert_eq!(channel.participants.len(), 2);
+        
+        // Can't remove non-existent
+        assert!(!channel.remove_participant("User1"));
+        assert_eq!(channel.participants.len(), 2);
+    }
+    
+    #[test]
+    fn test_voice_channel_max_participants() {
+        let mut channel = VoiceChannel::new(
+            "TestHost".to_string(),
+            "192.168.1.1".to_string(),
+            5000,
+        );
+        channel.max_participants = 3;
+        
+        assert!(channel.add_participant("User1".to_string(), "192.168.1.2".to_string(), 5001));
+        assert!(channel.add_participant("User2".to_string(), "192.168.1.3".to_string(), 5002));
+        assert!(channel.is_full());
+        
+        // Can't add when full
+        assert!(!channel.add_participant("User3".to_string(), "192.168.1.4".to_string(), 5003));
+    }
+    
+    #[test]
+    fn test_voice_channel_invite_ctcp() {
+        let ctcp = create_voice_channel_invite_ctcp("VCHAN123", "192.168.1.100", 5000, Some("Test Channel"));
+        assert!(ctcp.starts_with('\x01'));
+        assert!(ctcp.ends_with('\x01'));
+        assert!(ctcp.contains("VOICE_CHANNEL_INVITE"));
+        assert!(ctcp.contains("VCHAN123"));
+        assert!(ctcp.contains("192.168.1.100"));
+        assert!(ctcp.contains("5000"));
+        assert!(ctcp.contains("Test Channel"));
+        
+        let parsed = parse_voice_channel_ctcp(&ctcp);
+        assert!(parsed.is_some());
+        let (cmd, args) = parsed.unwrap();
+        assert_eq!(cmd, CTCP_VOICE_CHANNEL_INVITE);
+        assert_eq!(args[0], "VCHAN123");
+        assert_eq!(args[1], "192.168.1.100");
+        assert_eq!(args[2], "5000");
+    }
+    
+    #[test]
+    fn test_voice_channel_join_ctcp() {
+        let ctcp = create_voice_channel_join_ctcp("VCHAN123", "192.168.1.50", 6000);
+        
+        let parsed = parse_voice_channel_ctcp(&ctcp);
+        assert!(parsed.is_some());
+        let (cmd, args) = parsed.unwrap();
+        assert_eq!(cmd, CTCP_VOICE_CHANNEL_JOIN);
+        assert_eq!(args[0], "VCHAN123");
+        assert_eq!(args[1], "192.168.1.50");
+        assert_eq!(args[2], "6000");
+    }
+    
+    #[test]
+    fn test_voice_channel_leave_ctcp() {
+        let ctcp = create_voice_channel_leave_ctcp("VCHAN123");
+        
+        let parsed = parse_voice_channel_ctcp(&ctcp);
+        assert!(parsed.is_some());
+        let (cmd, args) = parsed.unwrap();
+        assert_eq!(cmd, CTCP_VOICE_CHANNEL_LEAVE);
+        assert_eq!(args[0], "VCHAN123");
+    }
+    
+    #[test]
+    fn test_voice_channel_display_name() {
+        let channel = VoiceChannel::new(
+            "TestHost".to_string(),
+            "192.168.1.1".to_string(),
+            5000,
+        );
+        assert_eq!(channel.display_name(), "TestHost's Voice Channel");
+        
+        let channel_with_name = channel.with_name("Game Night Chat");
+        assert_eq!(channel_with_name.display_name(), "Game Night Chat");
     }
 }
