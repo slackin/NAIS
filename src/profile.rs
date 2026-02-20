@@ -9,12 +9,27 @@ fn get_system_username() -> String {
         .unwrap_or_else(|_| "nais".to_string())
 }
 
-// Generate fallback nicknames
+// Generate fallback nicknames for automatic roll-over when nick is taken
 pub fn generate_fallback_nicknames(base: &str) -> Vec<String> {
-    vec![
-        format!("{}_", base),
-        format!("{}`", base),
-    ]
+    let mut fallbacks = Vec::new();
+    
+    // First try underscore suffix
+    fallbacks.push(format!("{}_", base));
+    
+    // Then try numbered suffixes (1-9)
+    for i in 1..=9 {
+        fallbacks.push(format!("{}{}", base, i));
+    }
+    
+    // Then double underscore
+    fallbacks.push(format!("{}__", base));
+    
+    // Then more numbered suffixes (10-99)
+    for i in 10..=99 {
+        fallbacks.push(format!("{}{}", base, i));
+    }
+    
+    fallbacks
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

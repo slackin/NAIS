@@ -95,6 +95,8 @@ pub enum IrcEvent {
     Topic { channel: String, topic: String },
     ChannelListItem { channel: String, user_count: u32, topic: String },
     ChannelListEnd,
+    /// Nick changed (own or fallback from registration)
+    NickChanged { new_nick: String },
     /// Voice chat CTCP message received
     VoiceCtcp { from: String, command: String, args: Vec<String> },
     /// WHOIS response data
@@ -463,6 +465,10 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent, enable_lo
         }
         IrcEvent::CtcpResponse { .. } => {
             // CTCP response events are handled in the UI event loop for popup display
+        }
+        IrcEvent::NickChanged { new_nick } => {
+            // Update the nickname in state when it changes (e.g., from rollover during registration)
+            state.nickname = new_nick;
         }
         IrcEvent::NaisCtcp { .. } => {
             // NAIS CTCP events are handled in the UI event loop
@@ -1614,6 +1620,12 @@ async fn handle_connection(
                                 .await;
                             
                             self_nick = new_nick.clone();
+                            // Notify UI of the nick change so state is updated
+                            let _ = evt_tx
+                                .send(IrcEvent::NickChanged {
+                                    new_nick: self_nick.clone(),
+                                })
+                                .await;
                             let _ = client.send(IrcCommand::NICK(new_nick));
                         } else {
                             let _ = evt_tx
