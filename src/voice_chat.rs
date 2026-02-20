@@ -10,6 +10,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[allow(unused_imports)]
 use std::time::Duration;
 
+// Noise filtering imports
+use biquad::{Biquad, Coefficients, DirectForm1, ToHertz, Type as FilterType, Q_BUTTERWORTH_F32};
+
 // Re-export opus codec types
 pub use opus::{Encoder as OpusEncoder, Decoder as OpusDecoder, Channels, Application};
 
@@ -221,6 +224,8 @@ pub struct VoiceConfig {
     pub frame_size: usize,
     /// Number of audio channels
     pub channels: u16,
+    /// Noise filtering configuration
+    pub noise_filter: NoiseFilterConfig,
 }
 
 impl Default for VoiceConfig {
@@ -231,7 +236,238 @@ impl Default for VoiceConfig {
             sample_rate: 48000,
             frame_size: 960, // 20ms at 48kHz
             channels: 1,
+            noise_filter: NoiseFilterConfig::default(),
         }
+    }
+}
+
+// ============================================================================
+// Noise Filtering
+// ============================================================================
+
+/// Configuration for noise filtering options
+#[derive(Clone, Debug)]
+pub struct NoiseFilterConfig {
+    /// Enable AI-powered noise suppression (nnnoiseless/RNNoise)
+    pub noise_suppression_enabled: bool,
+    /// Noise suppression strength (0.0 = off, 1.0 = full suppression)
+    pub noise_suppression_strength: f32,
+    /// Enable noise gate (mutes audio below threshold)
+    pub noise_gate_enabled: bool,
+    /// Noise gate threshold (0.0-1.0, audio below this is muted)
+    pub noise_gate_threshold: f32,
+    /// Noise gate attack time in ms (how fast gate opens)
+    pub noise_gate_attack_ms: f32,
+    /// Noise gate release time in ms (how fast gate closes)
+    pub noise_gate_release_ms: f32,
+    /// Enable high-pass filter (removes low frequency rumble)
+    pub highpass_enabled: bool,
+    /// High-pass filter cutoff frequency in Hz
+    pub highpass_cutoff_hz: f32,
+}
+
+impl Default for NoiseFilterConfig {
+    fn default() -> Self {
+        Self {
+            noise_suppression_enabled: true,
+            noise_suppression_strength: 1.0,
+            noise_gate_enabled: true,
+            noise_gate_threshold: 0.01, // -40dB roughly
+            noise_gate_attack_ms: 5.0,
+            noise_gate_release_ms: 50.0,
+            highpass_enabled: true,
+            highpass_cutoff_hz: 80.0, // Remove rumble below 80Hz
+        }
+    }
+}
+
+/// Real-time audio noise filter processor
+pub struct NoiseFilter {
+    config: NoiseFilterConfig,
+    sample_rate: u32,
+    /// RNNoise denoiser state
+    denoiser: Option<Box<nnnoiseless::DenoiseState<'static>>>,
+    /// High-pass filter state
+    highpass: Option<DirectForm1<f32>>,
+    /// Noise gate state
+    gate_envelope: f32,
+    /// Buffer for RNNoise (requires 480-sample frames at 48kHz)
+    rnnoise_buffer: Vec<f32>,
+    /// Output buffer for processed audio
+    output_buffer: Vec<f32>,
+}
+
+impl NoiseFilter {
+    /// Create a new noise filter with the given configuration
+    pub fn new(config: NoiseFilterConfig, sample_rate: u32) -> Self {
+        // Initialize RNNoise denoiser if enabled
+        let denoiser = if config.noise_suppression_enabled {
+            Some(nnnoiseless::DenoiseState::new())
+        } else {
+            None
+        };
+        
+        // Initialize high-pass filter if enabled
+        let highpass: Option<DirectForm1<f32>> = if config.highpass_enabled {
+            let coeffs = Coefficients::<f32>::from_params(
+                FilterType::HighPass,
+                sample_rate.hz(),
+                config.highpass_cutoff_hz.hz(),
+                Q_BUTTERWORTH_F32,
+            ).ok();
+            coeffs.map(DirectForm1::<f32>::new)
+        } else {
+            None
+        };
+        
+        Self {
+            config,
+            sample_rate,
+            denoiser,
+            highpass,
+            gate_envelope: 0.0,
+            rnnoise_buffer: Vec::with_capacity(480),
+            output_buffer: Vec::new(),
+        }
+    }
+    
+    /// Update the filter configuration at runtime
+    pub fn update_config(&mut self, config: NoiseFilterConfig) {
+        // Reinitialize denoiser if suppression was toggled
+        if config.noise_suppression_enabled != self.config.noise_suppression_enabled {
+            self.denoiser = if config.noise_suppression_enabled {
+                Some(nnnoiseless::DenoiseState::new())
+            } else {
+                None
+            };
+        }
+        
+        // Reinitialize high-pass if settings changed
+        if config.highpass_enabled != self.config.highpass_enabled 
+            || config.highpass_cutoff_hz != self.config.highpass_cutoff_hz 
+        {
+            self.highpass = if config.highpass_enabled {
+                let coeffs = Coefficients::<f32>::from_params(
+                    FilterType::HighPass,
+                    self.sample_rate.hz(),
+                    config.highpass_cutoff_hz.hz(),
+                    Q_BUTTERWORTH_F32,
+                ).ok();
+                coeffs.map(DirectForm1::<f32>::new)
+            } else {
+                None
+            };
+        }
+        
+        self.config = config;
+    }
+    
+    /// Process audio samples through all enabled filters
+    /// Returns filtered audio samples
+    pub fn process(&mut self, input: &[f32]) -> Vec<f32> {
+        if input.is_empty() {
+            return Vec::new();
+        }
+        
+        let mut samples = input.to_vec();
+        
+        // Step 1: High-pass filter (remove low frequency rumble)
+        if let Some(ref mut hp) = self.highpass {
+            for sample in samples.iter_mut() {
+                *sample = hp.run(*sample);
+            }
+        }
+        
+        // Step 2: RNNoise noise suppression
+        if self.config.noise_suppression_enabled {
+            samples = self.apply_rnnoise(&samples);
+        }
+        
+        // Step 3: Noise gate
+        if self.config.noise_gate_enabled {
+            self.apply_noise_gate(&mut samples);
+        }
+        
+        samples
+    }
+    
+    /// Apply RNNoise noise suppression
+    /// RNNoise requires 480-sample frames at 48kHz (10ms)
+    fn apply_rnnoise(&mut self, input: &[f32]) -> Vec<f32> {
+        const RNNOISE_FRAME_SIZE: usize = 480;
+        
+        let denoiser = match &mut self.denoiser {
+            Some(d) => d,
+            None => return input.to_vec(),
+        };
+        
+        // Add input to buffer
+        self.rnnoise_buffer.extend_from_slice(input);
+        self.output_buffer.clear();
+        
+        // Process complete frames
+        while self.rnnoise_buffer.len() >= RNNOISE_FRAME_SIZE {
+            let frame: Vec<f32> = self.rnnoise_buffer.drain(0..RNNOISE_FRAME_SIZE).collect();
+            let mut output_frame = vec![0.0f32; RNNOISE_FRAME_SIZE];
+            
+            // RNNoise works with values in range [-32768, 32767]
+            let input_scaled: Vec<f32> = frame.iter().map(|s| s * 32767.0).collect();
+            
+            let _vad_prob = denoiser.process_frame(&mut output_frame, &input_scaled);
+            
+            // Scale back to [-1, 1] and apply suppression strength
+            let strength = self.config.noise_suppression_strength;
+            for (i, sample) in output_frame.iter_mut().enumerate() {
+                let denoised = *sample / 32767.0;
+                let original = frame[i];
+                // Blend between original and denoised based on strength
+                *sample = original * (1.0 - strength) + denoised * strength;
+            }
+            
+            self.output_buffer.extend_from_slice(&output_frame);
+        }
+        
+        // Return processed audio (may be less than input if buffering)
+        std::mem::take(&mut self.output_buffer)
+    }
+    
+    /// Apply noise gate to samples in-place
+    fn apply_noise_gate(&mut self, samples: &mut [f32]) {
+        let threshold = self.config.noise_gate_threshold;
+        let attack_coeff = (-1.0 / (self.sample_rate as f32 * self.config.noise_gate_attack_ms / 1000.0)).exp();
+        let release_coeff = (-1.0 / (self.sample_rate as f32 * self.config.noise_gate_release_ms / 1000.0)).exp();
+        
+        for sample in samples.iter_mut() {
+            let input_level = sample.abs();
+            
+            // Update envelope follower
+            if input_level > self.gate_envelope {
+                // Attack: envelope rises quickly
+                self.gate_envelope = attack_coeff * self.gate_envelope + (1.0 - attack_coeff) * input_level;
+            } else {
+                // Release: envelope falls slowly
+                self.gate_envelope = release_coeff * self.gate_envelope + (1.0 - release_coeff) * input_level;
+            }
+            
+            // Apply gate: if envelope is below threshold, attenuate
+            if self.gate_envelope < threshold {
+                // Soft knee - gradually reduce gain as we approach threshold
+                let gain = (self.gate_envelope / threshold).powi(2);
+                *sample *= gain;
+            }
+        }
+    }
+    
+    /// Get current configuration
+    pub fn config(&self) -> &NoiseFilterConfig {
+        &self.config
+    }
+    
+    /// Check if any filtering is enabled
+    pub fn is_active(&self) -> bool {
+        self.config.noise_suppression_enabled 
+            || self.config.noise_gate_enabled 
+            || self.config.highpass_enabled
     }
 }
 
@@ -2340,12 +2576,20 @@ impl VoiceAudioStream {
             let mut encoder = AudioCapture::new(&config_clone).create_encoder().unwrap();
             let mut opus_output = vec![0u8; 4000]; // Max opus frame size
             
+            // Initialize noise filter
+            let mut noise_filter = NoiseFilter::new(
+                config_clone.noise_filter.clone(),
+                config_clone.sample_rate,
+            );
+            
             // Target frame interval based on frame size and sample rate
             // frame_size / sample_rate = time per frame
             // e.g., 960 samples / 48000 Hz = 20ms per frame
             let frame_duration_ms = (frame_size as u64 * 1000) / config_clone.sample_rate as u64;
             let frame_interval = std::time::Duration::from_millis(frame_duration_ms.max(1));
-            let mut last_encode = std::time::Instant::now();
+            
+            // Buffer for filtered samples (noise filter may output different amounts than input)
+            let mut filtered_buffer: Vec<f32> = Vec::new();
             
             loop {
                 if *stop_clone2.lock().unwrap() {
@@ -2353,16 +2597,22 @@ impl VoiceAudioStream {
                 }
                 
                 // Check if we have enough samples to encode
-                let samples_to_encode: Option<Vec<f32>> = {
+                let has_samples = {
                     let mut buf = encode_buffer.lock().unwrap();
                     if buf.len() >= frame_size {
-                        Some(buf.drain(0..frame_size).collect())
+                        let raw_samples: Vec<f32> = buf.drain(0..frame_size).collect();
+                        // Process through noise filter and add to filtered buffer
+                        let filtered = noise_filter.process(&raw_samples);
+                        filtered_buffer.extend(filtered);
+                        true
                     } else {
-                        None
+                        false
                     }
                 };
                 
-                if let Some(samples) = samples_to_encode {
+                // Encode complete frames from filtered buffer
+                while filtered_buffer.len() >= frame_size {
+                    let samples: Vec<f32> = filtered_buffer.drain(0..frame_size).collect();
                     // Encode the frame
                     match encoder.encode_float(&samples, &mut opus_output) {
                         Ok(len) => {
@@ -2387,13 +2637,13 @@ impl VoiceAudioStream {
                             log::error!("Opus encode error: {}", e);
                         }
                     }
-                    last_encode = std::time::Instant::now();
-                } else {
-                    // Sleep based on time since last encode to maintain consistent timing
-                    let elapsed = last_encode.elapsed();
-                    if elapsed < frame_interval {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
+                }
+                
+                // No samples available - sleep to avoid busy-waiting
+                if !has_samples {
+                    // Sleep for half the frame interval (e.g., 10ms for 20ms frames)
+                    // This balances responsiveness with CPU efficiency
+                    std::thread::sleep(frame_interval / 2);
                 }
             }
         });

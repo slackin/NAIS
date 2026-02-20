@@ -36,3 +36,7 @@ arboard = { version = "3.6", optional = true }
 # Voice chat dependencies
 opus = "0.3"
 cpal = "0.15"
+
+# Audio noise filtering
+nnnoiseless = "0.5"
+biquad = "0.4"
