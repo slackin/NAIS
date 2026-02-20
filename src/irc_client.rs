@@ -366,6 +366,12 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent, enable_lo
             }
         }
         IrcEvent::Message { channel, user, text } => {
+            // If this is a private message (channel doesn't start with #/&/+/!), auto-add to channel list
+            if !channel.starts_with('#') && !channel.starts_with('&') && !channel.starts_with('+') && !channel.starts_with('!') {
+                if !state.channels.contains(&channel) {
+                    state.channels.push(channel.clone());
+                }
+            }
             state.messages.push(ChatMessage {
                 channel,
                 user,
@@ -376,6 +382,12 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent, enable_lo
             });
         }
         IrcEvent::Action { channel, user, text } => {
+            // If this is a private message action (channel doesn't start with #/&/+/!), auto-add to channel list
+            if !channel.starts_with('#') && !channel.starts_with('&') && !channel.starts_with('+') && !channel.starts_with('!') {
+                if !state.channels.contains(&channel) {
+                    state.channels.push(channel.clone());
+                }
+            }
             state.messages.push(ChatMessage {
                 channel,
                 user,
@@ -928,9 +940,15 @@ async fn handle_connection(
                         if let Some((command, args)) = parse_ctcp(body) {
                             if command == "ACTION" {
                                 // This is a /me action
+                                // For private messages, use sender's nick as channel
+                                let channel = if !target.starts_with('#') && !target.starts_with('&') && !target.starts_with('+') && !target.starts_with('!') {
+                                    user.clone()
+                                } else {
+                                    target.to_string()
+                                };
                                 let _ = evt_tx
                                     .send(IrcEvent::Action {
-                                        channel: target.to_string(),
+                                        channel,
                                         user,
                                         text: args,
                                     })
@@ -978,9 +996,16 @@ async fn handle_connection(
                             }
                         } else {
                             // Regular message
+                            // For private messages (target is our nick), use sender's nick as channel
+                            let channel = if !target.starts_with('#') && !target.starts_with('&') && !target.starts_with('+') && !target.starts_with('!') {
+                                // This is a private message to us, use sender's nick as channel
+                                user.clone()
+                            } else {
+                                target.to_string()
+                            };
                             let _ = evt_tx
                                 .send(IrcEvent::Message {
-                                    channel: target.to_string(),
+                                    channel,
                                     user,
                                     text: body.to_string(),
                                 })

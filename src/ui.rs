@@ -89,7 +89,7 @@ fn apply_event_with_config(
 fn app() -> Element {
     let store = profile::load_store();
     let initial_profile = profile::select_profile(&store);
-    let default_nick = use_signal(|| store.default_nickname.clone());
+    let mut default_nick = use_signal(|| store.default_nickname.clone());
 
     let mut state = use_signal(|| {
         let mut servers = HashMap::new();
@@ -129,9 +129,24 @@ fn app() -> Element {
     let mut show_new_profile = use_signal(|| false);
     let mut show_edit_profile = use_signal(|| false);
     let mut show_import_modal = use_signal(|| false);
+    let mut show_settings = use_signal(|| false);
     let mut show_channel_browser = use_signal(|| false);
     let mut show_first_run_setup = use_signal(|| store.default_nickname.is_none());
     let mut profile_menu_open = use_signal(|| None::<String>);
+
+    // Settings modal input state
+    let mut settings_default_nick = use_signal(|| store.default_nickname.clone().unwrap_or_default());
+    let mut settings_enable_logging = use_signal(|| true);
+    let mut settings_scrollback_limit = use_signal(|| 1000usize);
+    let mut settings_log_buffer_size = use_signal(|| 1000usize);
+    
+    // Audio/Voice settings
+    let mut settings_noise_suppression = use_signal(|| true);
+    let mut settings_noise_suppression_strength = use_signal(|| 1.0f32);
+    let mut settings_noise_gate = use_signal(|| true);
+    let mut settings_noise_gate_threshold = use_signal(|| 0.01f32);
+    let mut settings_highpass_filter = use_signal(|| true);
+    let mut settings_highpass_cutoff = use_signal(|| 80.0f32);
 
     let mut new_server_input = use_signal(String::new);
     let mut new_nick_input = use_signal(String::new);
@@ -676,6 +691,21 @@ fn app() -> Element {
                             show_import_modal.set(true);
                         },
                         "Import"
+                    }
+                    button {
+                        class: "compact-btn settings-btn",
+                        onclick: move |_| {
+                            // Load current profile settings into the modal
+                            let active = state.read().active_profile.clone();
+                            if let Some(profile) = profiles.read().iter().find(|p| p.name == active) {
+                                settings_enable_logging.set(profile.enable_logging);
+                                settings_scrollback_limit.set(profile.scrollback_limit);
+                                settings_log_buffer_size.set(profile.log_buffer_size);
+                            }
+                            settings_default_nick.set(default_nick.read().clone().unwrap_or_default());
+                            show_settings.set(true);
+                        },
+                        "⚙ Settings"
                     }
                     // Voice Channel button
                     {
@@ -1425,9 +1455,26 @@ fn app() -> Element {
                                                                             let nick = user_nick.clone();
                                                                             move |_| {
                                                                                 user_menu_open.set(None);
-                                                                                // Set input to /query command
-                                                                                let mut input_clone = input.clone();
-                                                                                input_clone.set(format!("/query {}", nick));
+                                                                                // Open private message tab with this user
+                                                                                let active = state.read().active_profile.clone();
+                                                                                {
+                                                                                    let mut state_write = state.write();
+                                                                                    if let Some(server) = state_write.servers.get_mut(&active) {
+                                                                                        // Add nick as a channel if not already present
+                                                                                        if !server.channels.contains(&nick) {
+                                                                                            server.channels.push(nick.clone());
+                                                                                        }
+                                                                                        server.current_channel = nick.clone();
+                                                                                    }
+                                                                                }
+                                                                                force_scroll_to_bottom.set(true);
+                                                                                // Focus the chat input
+                                                                                let _ = document::eval(
+                                                                                    r#"
+                                                                                    const input = document.getElementById('chat-input');
+                                                                                    if (input) input.focus();
+                                                                                    "#
+                                                                                );
                                                                             }
                                                                         },
                                                                         "💬 Private Message"
@@ -1734,73 +1781,6 @@ fn app() -> Element {
                                 }
                             }
                             
-                            // Mic Input Device Selector
-                            div {
-                                style: "margin-bottom: 8px;",
-                                div {
-                                    style: "font-size: 11px; color: var(--text-muted); margin-bottom: 4px;",
-                                    "Input Device"
-                                }
-                                select {
-                                    style: "width: 100%; padding: 6px; background: var(--input-bg); color: var(--text-color); border: 1px solid var(--border-color); border-radius: 4px; font-size: 12px;",
-                                    onchange: move |evt| {
-                                        let value = evt.value();
-                                        let new_device = if value == "__default__" {
-                                            None
-                                        } else {
-                                            Some(value)
-                                        };
-                                        voice_selected_device.set(new_device.clone());
-                                        
-                                        // Restart monitor with new device
-                                        if let Some(device_name) = new_device.as_deref() {
-                                            if let Some(monitor) = crate::voice_chat::AudioLevelMonitor::start(Some(device_name)) {
-                                                voice_level_monitor.set(Some(std::sync::Arc::new(monitor)));
-                                            }
-                                        } else {
-                                            if let Some(monitor) = crate::voice_chat::AudioLevelMonitor::start(None) {
-                                                voice_level_monitor.set(Some(std::sync::Arc::new(monitor)));
-                                            }
-                                        }
-                                    },
-                                    option {
-                                        value: "__default__",
-                                        selected: voice_selected_device.read().is_none(),
-                                        "System Default"
-                                    }
-                                    {
-                                        voice_available_devices.read().iter().map(|device| {
-                                            let name = device.name.clone();
-                                            let is_selected = voice_selected_device.read().as_ref() == Some(&name);
-                                            let display_name = if device.is_default {
-                                                format!("{} (default)", name)
-                                            } else {
-                                                name.clone()
-                                            };
-                                            rsx! {
-                                                option {
-                                                    value: "{name}",
-                                                    selected: is_selected,
-                                                    "{display_name}"
-                                                }
-                                            }
-                                        })
-                                    }
-                                }
-                            }
-                            
-                            // Refresh devices button
-                            button {
-                                style: "width: 100%; padding: 4px 8px; background: #333; color: var(--text-muted); border: 1px solid var(--border-color); border-radius: 4px; font-size: 11px; cursor: pointer; margin-bottom: 12px;",
-                                onclick: move |_| {
-                                    let devices = crate::voice_chat::list_audio_input_devices();
-                                    voice_available_devices.set(devices);
-                                    let output_devices = crate::voice_chat::list_audio_output_devices();
-                                    voice_output_devices.set(output_devices);
-                                },
-                                "🔄 Refresh Devices"
-                            }
-                            
                             // Output Level Meter
                             div {
                                 style: "margin-bottom: 12px;",
@@ -1844,50 +1824,6 @@ fn app() -> Element {
                                         let level = voice_output_level();
                                         let db = if level > 0.0 { (level * 100.0).log10() * 20.0 } else { -60.0 };
                                         format!("{:.1} dB", db.max(-60.0))
-                                    }
-                                }
-                            }
-                            
-                            // Output Device Selector
-                            div {
-                                style: "margin-bottom: 12px;",
-                                div {
-                                    style: "font-size: 11px; color: var(--text-muted); margin-bottom: 4px;",
-                                    "Output Device"
-                                }
-                                select {
-                                    style: "width: 100%; padding: 6px; background: var(--input-bg); color: var(--text-color); border: 1px solid var(--border-color); border-radius: 4px; font-size: 12px;",
-                                    onchange: move |evt| {
-                                        let value = evt.value();
-                                        let new_device = if value == "__default__" {
-                                            None
-                                        } else {
-                                            Some(value)
-                                        };
-                                        voice_selected_output_device.set(new_device);
-                                    },
-                                    option {
-                                        value: "__default__",
-                                        selected: voice_selected_output_device.read().is_none(),
-                                        "System Default"
-                                    }
-                                    {
-                                        voice_output_devices.read().iter().map(|device| {
-                                            let name = device.name.clone();
-                                            let is_selected = voice_selected_output_device.read().as_ref() == Some(&name);
-                                            let display_name = if device.is_default {
-                                                format!("{} (default)", name)
-                                            } else {
-                                                name.clone()
-                                            };
-                                            rsx! {
-                                                option {
-                                                    value: "{name}",
-                                                    selected: is_selected,
-                                                    "{display_name}"
-                                                }
-                                            }
-                                        })
                                     }
                                 }
                             }
@@ -2985,6 +2921,443 @@ fn app() -> Element {
             }
         }
 
+        // Settings Modal
+        if show_settings.read().clone() {
+            div {
+                class: "modal-backdrop",
+                onclick: move |_| {
+                    show_settings.set(false);
+                },
+                div {
+                    class: "modal settings-modal",
+                    onclick: move |evt| {
+                        evt.stop_propagation();
+                    },
+                    div {
+                        class: "modal-title",
+                        "⚙ Settings"
+                    }
+                    div {
+                        class: "modal-body settings-body",
+                        
+                        // Global Settings Section
+                        div {
+                            class: "settings-section",
+                            div {
+                                class: "settings-section-title",
+                                "Global Settings"
+                            }
+                            div {
+                                class: "settings-row",
+                                label {
+                                    class: "settings-label",
+                                    "Default Nickname"
+                                }
+                                input {
+                                    class: "input settings-input",
+                                    r#type: "text",
+                                    placeholder: "Default nickname for new profiles",
+                                    value: "{settings_default_nick}",
+                                    oninput: move |evt| {
+                                        settings_default_nick.set(evt.value());
+                                    },
+                                }
+                            }
+                        }
+                        
+                        // Profile Settings Section
+                        div {
+                            class: "settings-section",
+                            div {
+                                class: "settings-section-title",
+                                "Profile Settings"
+                            }
+                            div {
+                                class: "settings-profile-name",
+                                "Active profile: {state.read().active_profile}"
+                            }
+                            
+                            // Enable Logging
+                            div {
+                                class: "settings-row checkbox-row",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: "{settings_enable_logging}",
+                                    onchange: move |evt| {
+                                        settings_enable_logging.set(evt.checked());
+                                    },
+                                }
+                                label {
+                                    class: "settings-label",
+                                    "Enable Message Logging"
+                                }
+                            }
+                            
+                            // Scrollback Limit
+                            div {
+                                class: "settings-row",
+                                label {
+                                    class: "settings-label",
+                                    "Scrollback Limit"
+                                }
+                                input {
+                                    class: "input settings-input-small",
+                                    r#type: "number",
+                                    min: "100",
+                                    max: "100000",
+                                    value: "{settings_scrollback_limit}",
+                                    oninput: move |evt| {
+                                        if let Ok(val) = evt.value().parse::<usize>() {
+                                            settings_scrollback_limit.set(val.clamp(100, 100000));
+                                        }
+                                    },
+                                }
+                                span {
+                                    class: "settings-hint",
+                                    "messages"
+                                }
+                            }
+                            
+                            // Log Buffer Size
+                            div {
+                                class: "settings-row",
+                                label {
+                                    class: "settings-label",
+                                    "Log Buffer Size"
+                                }
+                                input {
+                                    class: "input settings-input-small",
+                                    r#type: "number",
+                                    min: "100",
+                                    max: "100000",
+                                    value: "{settings_log_buffer_size}",
+                                    oninput: move |evt| {
+                                        if let Ok(val) = evt.value().parse::<usize>() {
+                                            settings_log_buffer_size.set(val.clamp(100, 100000));
+                                        }
+                                    },
+                                }
+                                span {
+                                    class: "settings-hint",
+                                    "messages"
+                                }
+                            }
+                        }
+                        
+                        // Audio Settings Section
+                        div {
+                            class: "settings-section",
+                            div {
+                                class: "settings-section-title",
+                                "🎤 Audio Settings"
+                            }
+                            
+                            // Input Device
+                            div {
+                                class: "settings-row",
+                                label {
+                                    class: "settings-label",
+                                    "Input Device"
+                                }
+                                select {
+                                    class: "input settings-select",
+                                    onchange: move |evt| {
+                                        let value = evt.value();
+                                        let new_device = if value == "__default__" {
+                                            None
+                                        } else {
+                                            Some(value)
+                                        };
+                                        voice_selected_device.set(new_device.clone());
+                                        
+                                        // Restart monitor with new device if active
+                                        if voice_level_monitor.read().is_some() {
+                                            if let Some(monitor) = crate::voice_chat::AudioLevelMonitor::start(new_device.as_deref()) {
+                                                voice_level_monitor.set(Some(std::sync::Arc::new(monitor)));
+                                            }
+                                        }
+                                    },
+                                    option {
+                                        value: "__default__",
+                                        selected: voice_selected_device.read().is_none(),
+                                        "System Default"
+                                    }
+                                    {
+                                        voice_available_devices.read().iter().map(|device| {
+                                            let name = device.name.clone();
+                                            let is_selected = voice_selected_device.read().as_ref() == Some(&name);
+                                            let display_name = if device.is_default {
+                                                format!("{} (default)", name)
+                                            } else {
+                                                name.clone()
+                                            };
+                                            rsx! {
+                                                option {
+                                                    value: "{name}",
+                                                    selected: is_selected,
+                                                    "{display_name}"
+                                                }
+                                            }
+                                        })
+                                    }
+                                }
+                            }
+                            
+                            // Output Device
+                            div {
+                                class: "settings-row",
+                                label {
+                                    class: "settings-label",
+                                    "Output Device"
+                                }
+                                select {
+                                    class: "input settings-select",
+                                    onchange: move |evt| {
+                                        let value = evt.value();
+                                        let new_device = if value == "__default__" {
+                                            None
+                                        } else {
+                                            Some(value)
+                                        };
+                                        voice_selected_output_device.set(new_device);
+                                    },
+                                    option {
+                                        value: "__default__",
+                                        selected: voice_selected_output_device.read().is_none(),
+                                        "System Default"
+                                    }
+                                    {
+                                        voice_output_devices.read().iter().map(|device| {
+                                            let name = device.name.clone();
+                                            let is_selected = voice_selected_output_device.read().as_ref() == Some(&name);
+                                            let display_name = if device.is_default {
+                                                format!("{} (default)", name)
+                                            } else {
+                                                name.clone()
+                                            };
+                                            rsx! {
+                                                option {
+                                                    value: "{name}",
+                                                    selected: is_selected,
+                                                    "{display_name}"
+                                                }
+                                            }
+                                        })
+                                    }
+                                }
+                            }
+                            
+                            // Refresh Devices
+                            div {
+                                class: "settings-row",
+                                label {
+                                    class: "settings-label",
+                                    ""
+                                }
+                                button {
+                                    class: "send settings-refresh-btn",
+                                    onclick: move |_| {
+                                        let devices = crate::voice_chat::list_audio_input_devices();
+                                        voice_available_devices.set(devices);
+                                        let output_devices = crate::voice_chat::list_audio_output_devices();
+                                        voice_output_devices.set(output_devices);
+                                    },
+                                    "🔄 Refresh Devices"
+                                }
+                            }
+                        }
+                        
+                        // Noise Filtering Section
+                        div {
+                            class: "settings-section",
+                            div {
+                                class: "settings-section-title",
+                                "🔇 Noise Filtering"
+                            }
+                            
+                            // Noise Suppression (AI)
+                            div {
+                                class: "settings-row checkbox-row",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: "{settings_noise_suppression}",
+                                    onchange: move |evt| {
+                                        settings_noise_suppression.set(evt.checked());
+                                    },
+                                }
+                                label {
+                                    class: "settings-label",
+                                    "AI Noise Suppression (RNNoise)"
+                                }
+                            }
+                            
+                            // Suppression Strength
+                            if *settings_noise_suppression.read() {
+                                div {
+                                    class: "settings-row",
+                                    label {
+                                        class: "settings-label",
+                                        "Suppression Strength"
+                                    }
+                                    input {
+                                        class: "settings-slider",
+                                        r#type: "range",
+                                        min: "0",
+                                        max: "100",
+                                        value: "{(*settings_noise_suppression_strength.read() * 100.0) as i32}",
+                                        oninput: move |evt| {
+                                            if let Ok(val) = evt.value().parse::<f32>() {
+                                                settings_noise_suppression_strength.set((val / 100.0).clamp(0.0, 1.0));
+                                            }
+                                        },
+                                    }
+                                    span {
+                                        class: "settings-hint",
+                                        "{(*settings_noise_suppression_strength.read() * 100.0) as i32}%"
+                                    }
+                                }
+                            }
+                            
+                            // Noise Gate
+                            div {
+                                class: "settings-row checkbox-row",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: "{settings_noise_gate}",
+                                    onchange: move |evt| {
+                                        settings_noise_gate.set(evt.checked());
+                                    },
+                                }
+                                label {
+                                    class: "settings-label",
+                                    "Noise Gate (mutes low audio)"
+                                }
+                            }
+                            
+                            // Gate Threshold
+                            if *settings_noise_gate.read() {
+                                div {
+                                    class: "settings-row",
+                                    label {
+                                        class: "settings-label",
+                                        "Gate Threshold"
+                                    }
+                                    input {
+                                        class: "settings-slider",
+                                        r#type: "range",
+                                        min: "0",
+                                        max: "100",
+                                        value: "{(*settings_noise_gate_threshold.read() * 1000.0) as i32}",
+                                        oninput: move |evt| {
+                                            if let Ok(val) = evt.value().parse::<f32>() {
+                                                settings_noise_gate_threshold.set((val / 1000.0).clamp(0.001, 0.1));
+                                            }
+                                        },
+                                    }
+                                    span {
+                                        class: "settings-hint",
+                                        {
+                                            let thresh = *settings_noise_gate_threshold.read();
+                                            let db = if thresh > 0.0 { (thresh).log10() * 20.0 } else { -60.0 };
+                                            format!("{:.0} dB", db)
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // High-pass Filter
+                            div {
+                                class: "settings-row checkbox-row",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: "{settings_highpass_filter}",
+                                    onchange: move |evt| {
+                                        settings_highpass_filter.set(evt.checked());
+                                    },
+                                }
+                                label {
+                                    class: "settings-label",
+                                    "High-pass Filter (removes rumble)"
+                                }
+                            }
+                            
+                            // Highpass Cutoff
+                            if *settings_highpass_filter.read() {
+                                div {
+                                    class: "settings-row",
+                                    label {
+                                        class: "settings-label",
+                                        "Cutoff Frequency"
+                                    }
+                                    input {
+                                        class: "settings-slider",
+                                        r#type: "range",
+                                        min: "20",
+                                        max: "300",
+                                        value: "{*settings_highpass_cutoff.read() as i32}",
+                                        oninput: move |evt| {
+                                            if let Ok(val) = evt.value().parse::<f32>() {
+                                                settings_highpass_cutoff.set(val.clamp(20.0, 300.0));
+                                            }
+                                        },
+                                    }
+                                    span {
+                                        class: "settings-hint",
+                                        "{*settings_highpass_cutoff.read() as i32} Hz"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    div {
+                        class: "modal-actions",
+                        button {
+                            class: "send",
+                            onclick: move |_| {
+                                show_settings.set(false);
+                            },
+                            "Cancel"
+                        }
+                        button {
+                            class: "send primary",
+                            onclick: move |_| {
+                                // Save global settings
+                                let new_default_nick = settings_default_nick.read().trim().to_string();
+                                let default_nick_opt = if new_default_nick.is_empty() {
+                                    None
+                                } else {
+                                    Some(new_default_nick)
+                                };
+                                default_nick.set(default_nick_opt.clone());
+                                
+                                // Save active profile settings
+                                let active = state.read().active_profile.clone();
+                                let prof_idx_opt = profiles.read().iter().position(|p| p.name == active);
+                                if let Some(prof_idx) = prof_idx_opt {
+                                    let mut profs = profiles.write();
+                                    profs[prof_idx].enable_logging = *settings_enable_logging.read();
+                                    profs[prof_idx].scrollback_limit = *settings_scrollback_limit.read();
+                                    profs[prof_idx].log_buffer_size = *settings_log_buffer_size.read();
+                                    drop(profs);
+                                }
+                                
+                                // Persist to disk
+                                let store = profile::ProfileStore {
+                                    profiles: profiles.read().clone(),
+                                    last_used: last_used.read().clone(),
+                                    default_nickname: default_nick_opt,
+                                };
+                                let _ = profile::save_store(&store);
+                                
+                                show_settings.set(false);
+                            },
+                            "Save"
+                        }
+                    }
+                }
+            }
+        }
+
         // Channel Browser Modal
         if show_channel_browser.read().clone() {
             div {
@@ -3465,7 +3838,38 @@ fn handle_send_message(
                 let mut msg_parts = arg.splitn(2, ' ');
                 let target = msg_parts.next().unwrap_or("").trim().to_string();
                 let text = msg_parts.next().unwrap_or("").trim().to_string();
-                if target.is_empty() || text.is_empty() {
+                
+                if target.is_empty() {
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: "Usage: /msg nickname message or /query nickname".to_string(),
+                        },
+                    );
+                } else if text.is_empty() && command == "/query" {
+                    // /query without message - just open PM window
+                    {
+                        let mut state_write = state.write();
+                        if let Some(server) = state_write.servers.get_mut(&active_profile) {
+                            if !server.channels.contains(&target) {
+                                server.channels.push(target.clone());
+                            }
+                            server.current_channel = target.clone();
+                        }
+                    }
+                    force_scroll_to_bottom.set(true);
+                    // Focus the chat input
+                    let _ = document::eval(
+                        r#"
+                        const input = document.getElementById('chat-input');
+                        if (input) input.focus();
+                        "#
+                    );
+                } else if text.is_empty() {
+                    // /msg without message - show error
                     apply_event_with_config(
                         &mut state.write(),
                         &profiles.read(),
@@ -5905,6 +6309,147 @@ body {
 
 .import-row button {
     flex-shrink: 0;
+}
+
+/* Settings Modal Styles */
+.settings-modal {
+    max-width: 500px;
+}
+
+.settings-body {
+    max-height: 60vh;
+    overflow-y: auto;
+}
+
+.settings-section {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 12px;
+}
+
+.settings-section:last-child {
+    margin-bottom: 0;
+}
+
+.settings-section-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--accent);
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+}
+
+.settings-profile-name {
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 12px;
+    padding: 8px;
+    background: rgba(99, 102, 241, 0.1);
+    border-radius: 6px;
+}
+
+.settings-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.settings-row:last-child {
+    margin-bottom: 0;
+}
+
+.settings-row.checkbox-row {
+    gap: 8px;
+}
+
+.settings-label {
+    font-size: 13px;
+    color: var(--text);
+    min-width: 140px;
+    flex-shrink: 0;
+}
+
+.checkbox-row .settings-label {
+    min-width: unset;
+    cursor: pointer;
+}
+
+.settings-input {
+    flex: 1;
+    max-width: 240px;
+}
+
+.settings-input-small {
+    width: 100px;
+    text-align: center;
+}
+
+.settings-hint {
+    font-size: 11px;
+    color: var(--muted);
+    min-width: 50px;
+}
+
+.settings-select {
+    flex: 1;
+    max-width: 240px;
+    padding: 8px;
+    background: var(--input);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 12px;
+}
+
+.settings-slider {
+    flex: 1;
+    max-width: 150px;
+    height: 6px;
+    -webkit-appearance: none;
+    appearance: none;
+    background: var(--border);
+    border-radius: 3px;
+    outline: none;
+}
+
+.settings-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 16px;
+    height: 16px;
+    background: var(--accent);
+    border-radius: 50%;
+    cursor: pointer;
+}
+
+.settings-slider::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    background: var(--accent);
+    border-radius: 50%;
+    cursor: pointer;
+    border: none;
+}
+
+.settings-refresh-btn {
+    background: rgba(99, 102, 241, 0.1);
+    padding: 6px 12px;
+    font-size: 12px;
+}
+
+.settings-btn {
+    background: rgba(99, 102, 241, 0.15);
+}
+
+.settings-btn:hover {
+    background: rgba(99, 102, 241, 0.25);
+}
+
+.send.primary {
+    background: var(--accent);
 }
 
 /* Scrollbar styling */
