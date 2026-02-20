@@ -814,6 +814,10 @@ pub fn create_voice_channel(
                     log::info!("Voice channel address: {}:{} (local port {})", 
                         external_ip, external_port, local_port);
                     
+                    // Give UPnP mapping a moment to propagate through the router
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    log::info!("Voice channel ready to accept connections");
+                    
                     // Send the address info back
                     let _ = addr_tx.send((external_ip.clone(), external_port, local_port));
                     
@@ -1780,29 +1784,58 @@ pub fn connect_voice_call(
         rt.block_on(async move {
             log::info!("Initiating voice connection to {}", peer_addr_clone);
             
-            match TcpStream::connect(&peer_addr_clone).await {
-                Ok(stream) => {
-                    log::info!("Voice connection established to {}", peer_addr_clone);
-                    let addr = stream.peer_addr().unwrap_or_else(|_| {
-                        peer_addr_clone.parse().unwrap()
-                    });
-                    let _ = handle_voice_connection(
-                        stream,
-                        addr,
-                        evt_tx_clone,
-                        Arc::new(Mutex::new(VoiceState::Active { peer: "remote".to_string() })),
-                        muted_clone,
-                        config_clone,
-                        stop_flag_clone,
-                    ).await;
+            // Retry connection with exponential backoff
+            // UPnP port mappings can take a moment to propagate
+            let retry_delays = [500, 1000, 2000, 3000]; // milliseconds
+            let mut last_error = None;
+            
+            for (attempt, delay_ms) in retry_delays.iter().enumerate() {
+                log::info!("Connection attempt {} to {}", attempt + 1, peer_addr_clone);
+                
+                match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5),
+                    TcpStream::connect(&peer_addr_clone)
+                ).await {
+                    Ok(Ok(stream)) => {
+                        log::info!("Voice connection established to {} on attempt {}", peer_addr_clone, attempt + 1);
+                        let addr = stream.peer_addr().unwrap_or_else(|_| {
+                            peer_addr_clone.parse().unwrap()
+                        });
+                        let _ = handle_voice_connection(
+                            stream,
+                            addr,
+                            evt_tx_clone,
+                            Arc::new(Mutex::new(VoiceState::Active { peer: "remote".to_string() })),
+                            muted_clone,
+                            config_clone,
+                            stop_flag_clone,
+                        ).await;
+                        return;
+                    }
+                    Ok(Err(e)) => {
+                        log::warn!("Connection attempt {} failed: {}", attempt + 1, e);
+                        last_error = Some(format!("{}", e));
+                    }
+                    Err(_) => {
+                        log::warn!("Connection attempt {} timed out", attempt + 1);
+                        last_error = Some("Connection timed out".to_string());
+                    }
                 }
-                Err(e) => {
-                    log::error!("Failed to connect voice to {}: {}", peer_addr_clone, e);
-                    let _ = evt_tx_clone.send(VoiceEvent::Error {
-                        message: format!("Connection failed: {}", e),
-                    }).await;
+                
+                // Wait before retrying (unless this was the last attempt)
+                if attempt < retry_delays.len() - 1 {
+                    log::info!("Waiting {}ms before retry...", delay_ms);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(*delay_ms as u64)).await;
                 }
             }
+            
+            // All retries failed
+            let error_msg = last_error.unwrap_or_else(|| "Unknown error".to_string());
+            log::error!("Failed to connect voice to {} after {} attempts: {}", 
+                peer_addr_clone, retry_delays.len(), error_msg);
+            let _ = evt_tx_clone.send(VoiceEvent::Error {
+                message: format!("Connection failed after retries: {}", error_msg),
+            }).await;
         });
     });
     
@@ -1842,6 +1875,11 @@ pub fn start_voice_listener(
                     let (external_ip, external_port, _upnp_mapping) = setup_voice_address(local_port);
                     log::info!("Voice listener address: {}:{} (local port {})", 
                         external_ip, external_port, local_port);
+                    
+                    // Give UPnP mapping a moment to propagate through the router
+                    // Some routers need a brief delay before the mapping is active
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    log::info!("Voice listener ready to accept connections");
                     
                     // Send the address info back
                     let _ = addr_tx.send((external_ip, external_port, local_port));
