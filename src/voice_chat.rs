@@ -1053,11 +1053,24 @@ impl AudioPlayback {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
         
         let host = cpal::default_host();
+        log::info!("Audio playback: Using host {:?}", host.id());
+        
         let device = if let Some(name) = device_name {
+            log::info!("Audio playback: Looking for device '{}'", name);
             host.output_devices().ok()?.find(|d| d.name().ok().as_deref() == Some(name))?
         } else {
+            log::info!("Audio playback: Using default output device");
             host.default_output_device()?
         };
+        
+        log::info!("Audio playback: Selected device '{}'", device.name().unwrap_or_default());
+        
+        // Log supported configs
+        if let Ok(supported) = device.supported_output_configs() {
+            for cfg in supported {
+                log::debug!("  Supported config: {:?}", cfg);
+            }
+        }
         
         // Create buffer with some capacity (100ms at given sample rate)
         let buffer_capacity = (sample_rate as usize * channels as usize) / 10;
@@ -1069,13 +1082,28 @@ impl AudioPlayback {
         let stop_clone = stop_flag.clone();
         let level_clone = output_level.clone();
         
-        let config = cpal::StreamConfig {
+        // Try the requested config first
+        let requested_config = cpal::StreamConfig {
             channels,
             sample_rate: cpal::SampleRate(sample_rate),
             buffer_size: cpal::BufferSize::Default,
         };
         
-        let stream = device.build_output_stream(
+        // On Windows, we may need stereo output even if input is mono
+        // Windows audio devices often don't support mono output
+        let output_channels = if cfg!(windows) && channels == 1 { 2 } else { channels };
+        let is_mono_to_stereo = output_channels != channels;
+        
+        let config = cpal::StreamConfig {
+            channels: output_channels,
+            sample_rate: cpal::SampleRate(sample_rate),
+            buffer_size: cpal::BufferSize::Default,
+        };
+        
+        log::info!("Audio playback: Attempting config: {} Hz, {} channels (mono_to_stereo: {})", 
+            sample_rate, output_channels, is_mono_to_stereo);
+        
+        let stream_result = device.build_output_stream(
             &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 if *stop_clone.lock().unwrap() {
@@ -1086,18 +1114,34 @@ impl AudioPlayback {
                 let mut buf = buffer_clone.lock().unwrap();
                 let mut sum_sq = 0.0f32;
                 
-                for sample in data.iter_mut() {
-                    if let Some(s) = buf.pop_front() {
-                        *sample = s;
-                        sum_sq += s * s;
-                    } else {
-                        *sample = 0.0; // Silence if buffer underrun
+                if is_mono_to_stereo {
+                    // Duplicate mono samples to stereo
+                    for chunk in data.chunks_mut(2) {
+                        if let Some(s) = buf.pop_front() {
+                            chunk[0] = s;  // Left
+                            if chunk.len() > 1 {
+                                chunk[1] = s;  // Right
+                            }
+                            sum_sq += s * s;
+                        } else {
+                            chunk.fill(0.0); // Silence if buffer underrun
+                        }
+                    }
+                } else {
+                    for sample in data.iter_mut() {
+                        if let Some(s) = buf.pop_front() {
+                            *sample = s;
+                            sum_sq += s * s;
+                        } else {
+                            *sample = 0.0; // Silence if buffer underrun
+                        }
                     }
                 }
                 
                 // Update output level
-                if !data.is_empty() {
-                    let rms = (sum_sq / data.len() as f32).sqrt();
+                let sample_count = if is_mono_to_stereo { data.len() / 2 } else { data.len() };
+                if sample_count > 0 {
+                    let rms = (sum_sq / sample_count as f32).sqrt();
                     *level_clone.lock().unwrap() = (rms * 10.0).min(1.0);
                 }
             },
@@ -1105,9 +1149,27 @@ impl AudioPlayback {
                 log::error!("Audio output stream error: {}", err);
             },
             None,
-        ).ok()?;
+        );
         
-        stream.play().ok()?;
+        let stream = match stream_result {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("Audio playback: Failed to build output stream: {}", e);
+                // Try with device's default config
+                log::info!("Audio playback: Attempting device default config...");
+                if let Ok(default_config) = device.default_output_config() {
+                    log::info!("Audio playback: Device default: {:?}", default_config);
+                }
+                return None;
+            }
+        };
+        
+        if let Err(e) = stream.play() {
+            log::error!("Audio playback: Failed to start stream: {}", e);
+            return None;
+        }
+        
+        log::info!("Audio playback: Stream started successfully");
         
         Some(Self {
             buffer,
@@ -1225,7 +1287,13 @@ impl VoiceAudioStream {
         self.muted = muted;
         
         // Start playback
+        log::info!("VoiceAudioStream: Starting playback with sample_rate={}, channels={}", config.sample_rate, config.channels);
         self.playback = AudioPlayback::start(output_device, config.sample_rate, config.channels);
+        if self.playback.is_none() {
+            log::error!("VoiceAudioStream: Failed to start audio playback!");
+        } else {
+            log::info!("VoiceAudioStream: Audio playback started successfully");
+        }
         
         // Create channel for encoded frames
         let (frame_tx, frame_rx) = async_channel::bounded(100);
@@ -1349,12 +1417,24 @@ impl VoiceAudioStream {
             stats.record_rx(data.len(), sequence);
         }
         
+        // Log every 50th frame to avoid spam
+        if sequence % 50 == 0 {
+            log::debug!("receive_frame: seq={}, data_len={}, has_decoder={}, has_playback={}",
+                sequence, data.len(), self.decoder.is_some(), self.playback.is_some());
+        }
+        
         // Decode
         if let Some(ref mut decoder) = self.decoder {
             let mut pcm = vec![0.0f32; self.frame_size];
             match decoder.decode_float(data, &mut pcm, false) {
                 Ok(samples) => {
                     let pcm = &pcm[..samples];
+                    
+                    // Log first decode success and periodically
+                    if sequence % 50 == 0 {
+                        let max_sample = pcm.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+                        log::debug!("Decoded {} samples, max_amplitude={:.4}", samples, max_sample);
+                    }
                     
                     // Send to playback
                     if let Some(ref playback) = self.playback {
@@ -1365,11 +1445,17 @@ impl VoiceAudioStream {
                             let level = playback.get_level();
                             let _ = evt_tx.try_send(VoiceEvent::OutputLevel { level });
                         }
+                    } else if sequence % 50 == 0 {
+                        log::warn!("receive_frame: No playback available to push samples!");
                     }
                 }
                 Err(e) => {
                     log::error!("Opus decode error: {}", e);
                 }
+            }
+        } else {
+            if sequence % 50 == 0 {
+                log::warn!("receive_frame: No decoder available!");
             }
         }
     }
