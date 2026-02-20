@@ -135,6 +135,8 @@ impl VoiceNetworkStats {
 pub enum VoiceState {
     /// No active voice call
     Idle,
+    /// Hosting a voice channel, waiting for users to join
+    Hosting,
     /// Waiting for peer to accept our call request
     Outgoing { peer: String },
     /// Incoming call waiting for user decision

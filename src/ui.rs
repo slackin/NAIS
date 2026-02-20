@@ -15,6 +15,19 @@ use serde::{Serialize, Deserialize};
 use crate::irc_client::{self, ChatMessage, ConnectionStatus, IrcCommandEvent, IrcEvent};
 use crate::profile;
 
+/// Accumulated WHOIS information for popup display
+#[derive(Clone, Default, Debug)]
+struct WhoisInfo {
+    nick: String,
+    user: Option<String>,
+    host: Option<String>,
+    realname: Option<String>,
+    server: Option<String>,
+    server_info: Option<String>,
+    channels: Option<String>,
+    idle_secs: Option<String>,
+}
+
 pub fn run() {
     dioxus::launch(app);
 }
@@ -166,6 +179,11 @@ fn app() -> Element {
     let mut channels_collapsed = use_signal(|| false);
     let mut userlist_collapsed = use_signal(|| false);
     let mut topic_collapsed = use_signal(|| false);
+    let mut user_menu_open: Signal<Option<String>> = use_signal(|| None);
+
+    // WHOIS popup state
+    let mut whois_popup: Signal<Option<WhoisInfo>> = use_signal(|| None);
+    let whois_building: Signal<Option<WhoisInfo>> = use_signal(|| None);
 
     // Voice chat state
     let mut voice_state: Signal<crate::voice_chat::VoiceState> = use_signal(|| crate::voice_chat::VoiceState::Idle);
@@ -360,6 +378,8 @@ fn app() -> Element {
         let mut voice_session_handle = voice_session_id;
         let mut voice_event_rx_handle = voice_event_rx;
         let mut voice_stop_flag_handle = voice_stop_flag;
+        let mut whois_building_handle = whois_building;
+        let mut whois_popup_handle = whois_popup;
         spawn(async move {
             let mut channel_buffer: Vec<(String, u32, String)> = Vec::new();
             const BATCH_SIZE: usize = 200;
@@ -475,6 +495,54 @@ fn app() -> Element {
                                         _ => {}
                                     }
                                     continue;
+                                }
+                                IrcEvent::WhoisUser { nick, user, host, realname } => {
+                                    // Start building whois info
+                                    whois_building_handle.set(Some(WhoisInfo {
+                                        nick: nick.clone(),
+                                        user: Some(user.clone()),
+                                        host: Some(host.clone()),
+                                        realname: Some(realname.clone()),
+                                        ..Default::default()
+                                    }));
+                                }
+                                IrcEvent::WhoisServer { nick, server, server_info } => {
+                                    let current = { whois_building_handle.read().clone() };
+                                    if let Some(mut info) = current {
+                                        if info.nick == *nick {
+                                            info.server = Some(server.clone());
+                                            info.server_info = Some(server_info.clone());
+                                            whois_building_handle.set(Some(info));
+                                        }
+                                    }
+                                }
+                                IrcEvent::WhoisChannels { nick, channels } => {
+                                    let current = { whois_building_handle.read().clone() };
+                                    if let Some(mut info) = current {
+                                        if info.nick == *nick {
+                                            info.channels = Some(channels.clone());
+                                            whois_building_handle.set(Some(info));
+                                        }
+                                    }
+                                }
+                                IrcEvent::WhoisIdle { nick, idle_secs } => {
+                                    let current = { whois_building_handle.read().clone() };
+                                    if let Some(mut info) = current {
+                                        if info.nick == *nick {
+                                            info.idle_secs = Some(idle_secs.clone());
+                                            whois_building_handle.set(Some(info));
+                                        }
+                                    }
+                                }
+                                IrcEvent::WhoisEnd { nick } => {
+                                    let current = { whois_building_handle.read().clone() };
+                                    if let Some(info) = current {
+                                        if info.nick == *nick {
+                                            // Show the popup with accumulated info
+                                            whois_popup_handle.set(Some(info));
+                                            whois_building_handle.set(None);
+                                        }
+                                    }
                                 }
                                 _ => {}
                             }
@@ -608,6 +676,63 @@ fn app() -> Element {
                             show_import_modal.set(true);
                         },
                         "Import"
+                    }
+                    // Voice Channel button
+                    {
+                        let is_hosting = matches!(voice_state(), crate::voice_chat::VoiceState::Hosting);
+                        let is_active = matches!(voice_state(), crate::voice_chat::VoiceState::Active { .. });
+                        let is_in_call = !matches!(voice_state(), crate::voice_chat::VoiceState::Idle);
+                        
+                        rsx! {
+                            button {
+                                class: if is_in_call { "compact-btn voice-btn active" } else { "compact-btn voice-btn" },
+                                onclick: move |_| {
+                                    let current_state = voice_state();
+                                    match current_state {
+                                        crate::voice_chat::VoiceState::Idle => {
+                                            // Start hosting a voice channel
+                                            let session_id = crate::voice_chat::VoiceChatManager::generate_session_id();
+                                            let config = crate::voice_chat::VoiceConfig::default();
+                                            let muted_arc_clone = voice_muted_arc.read().clone();
+                                            
+                                            if let Some((port, evt_rx, stop_flag)) = crate::voice_chat::start_voice_listener(config, muted_arc_clone) {
+                                                voice_local_port.set(port);
+                                                voice_event_rx.set(Some(evt_rx));
+                                                voice_stop_flag.set(Some(stop_flag));
+                                                voice_state.set(crate::voice_chat::VoiceState::Hosting);
+                                                voice_session_id.set(Some(session_id));
+                                                voice_current_peer.set(None);
+                                                log::info!("Voice channel started on port {}", port);
+                                            } else {
+                                                log::error!("Failed to start voice listener");
+                                            }
+                                        }
+                                        crate::voice_chat::VoiceState::Hosting | crate::voice_chat::VoiceState::Active { .. } => {
+                                            // Stop the voice channel
+                                            if let Some(stop_flag) = voice_stop_flag() {
+                                                if let Ok(mut stopped) = stop_flag.lock() {
+                                                    *stopped = true;
+                                                }
+                                            }
+                                            voice_state.set(crate::voice_chat::VoiceState::Idle);
+                                            voice_current_peer.set(None);
+                                            voice_session_id.set(None);
+                                            voice_event_rx.set(None);
+                                            voice_stop_flag.set(None);
+                                            log::info!("Voice channel stopped");
+                                        }
+                                        _ => {}
+                                    }
+                                },
+                                if is_hosting {
+                                    "📞 End Channel"
+                                } else if is_active {
+                                    "📞 In Call"
+                                } else {
+                                    "📞 Voice"
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1247,12 +1372,15 @@ fn app() -> Element {
                                                 '+' => ("◆", "#00CED1", user.trim_start_matches('+')),
                                                 _ => ("", "#CCCCCC", user.as_str()),
                                             };
+                                            let user_nick = username.to_string();
+                                            let menu_key = user_nick.clone();
+                                            let is_menu_open = user_menu_open.read().as_ref() == Some(&menu_key);
                                             
                                             rsx! {
                                                 li {
                                                     div {
-                                                        class: "row",
-                                                        style: "display: flex; align-items: center; justify-content: space-between;",
+                                                        class: "row user-row",
+                                                        style: "display: flex; align-items: center; justify-content: space-between; position: relative;",
                                                         div {
                                                             style: "display: flex; align-items: center;",
                                                             if !symbol.is_empty() {
@@ -1265,51 +1393,156 @@ fn app() -> Element {
                                                                 "{username}"
                                                             }
                                                         }
-                                                        // Voice call button (only if not in a call and not our own nick)
-                                                        {
-                                                            let user_nick = username.to_string();
-                                                            let can_call = matches!(voice_state(), crate::voice_chat::VoiceState::Idle);
-                                                            rsx! {
-                                                                if can_call {
+                                                        // Meatball menu button
+                                                        div {
+                                                            style: "position: relative;",
+                                                            button {
+                                                                class: "user-menu-btn",
+                                                                onclick: {
+                                                                    let key = menu_key.clone();
+                                                                    move |e: Event<MouseData>| {
+                                                                        e.stop_propagation();
+                                                                        if user_menu_open.read().as_ref() == Some(&key) {
+                                                                            user_menu_open.set(None);
+                                                                        } else {
+                                                                            user_menu_open.set(Some(key.clone()));
+                                                                        }
+                                                                    }
+                                                                },
+                                                                "⋮"
+                                                            }
+                                                            // Dropdown menu
+                                                            if is_menu_open {
+                                                                div {
+                                                                    class: "user-menu-panel",
+                                                                    onclick: move |e: Event<MouseData>| {
+                                                                        e.stop_propagation();
+                                                                    },
+                                                                    // Private Message option
                                                                     button {
-                                                                        class: "voice-call-btn",
-                                                                        style: "background: none; border: none; cursor: pointer; padding: 2px 6px; font-size: 12px; opacity: 0.6; transition: opacity 0.2s;",
-                                                                        title: "Start voice call with {user_nick}",
+                                                                        class: "menu-item",
                                                                         onclick: {
                                                                             let nick = user_nick.clone();
                                                                             move |_| {
-                                                                                // Generate session ID and get local IP
-                                                                                let session_id = crate::voice_chat::VoiceChatManager::generate_session_id();
-                                                                                let local_ip = crate::voice_chat::get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
-                                                                                
-                                                                                // Start voice listener to get a port
-                                                                                let config = crate::voice_chat::VoiceConfig::default();
-                                                                                let muted_arc_clone = voice_muted_arc.read().clone();
-                                                                                
-                                                                                if let Some((port, evt_rx, stop_flag)) = crate::voice_chat::start_voice_listener(config, muted_arc_clone) {
-                                                                                    voice_local_port.set(port);
-                                                                                    voice_event_rx.set(Some(evt_rx));
-                                                                                    voice_stop_flag.set(Some(stop_flag));
-                                                                                    
-                                                                                    // Update voice state
-                                                                                    voice_state.set(crate::voice_chat::VoiceState::Outgoing { peer: nick.clone() });
-                                                                                    voice_session_id.set(Some(session_id.clone()));
-                                                                                    voice_current_peer.set(Some(nick.clone()));
-                                                                                    
-                                                                                    // Send CTCP VOICE_CALL via IRC
-                                                                                    let ctcp_msg = crate::voice_chat::create_voice_call_ctcp(&local_ip, port, &session_id);
-                                                                                    if let Some(core) = cores.read().get(&state.read().active_profile) {
-                                                                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
-                                                                                            target: nick.clone(),
-                                                                                            message: ctcp_msg,
-                                                                                        });
+                                                                                user_menu_open.set(None);
+                                                                                // Set input to /query command
+                                                                                let mut input_clone = input.clone();
+                                                                                input_clone.set(format!("/query {}", nick));
+                                                                            }
+                                                                        },
+                                                                        "💬 Private Message"
+                                                                    }
+                                                                    // Invite to Voice Channel option (only when hosting)
+                                                                    {
+                                                                        let is_hosting = matches!(voice_state(), crate::voice_chat::VoiceState::Hosting);
+                                                                        let can_invite = is_hosting || matches!(voice_state(), crate::voice_chat::VoiceState::Active { .. });
+                                                                        rsx! {
+                                                                            button {
+                                                                                class: if can_invite { "menu-item" } else { "menu-item disabled" },
+                                                                                disabled: !can_invite,
+                                                                                title: if can_invite { "Invite this user to your voice channel" } else { "Start a voice channel first" },
+                                                                                onclick: {
+                                                                                    let nick = user_nick.clone();
+                                                                                    move |_| {
+                                                                                        user_menu_open.set(None);
+                                                                                        if !can_invite { return; }
+                                                                                        
+                                                                                        // Send voice channel invite
+                                                                                        let local_ip = crate::voice_chat::get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
+                                                                                        let port = voice_local_port();
+                                                                                        let session_id = voice_session_id().unwrap_or_else(|| "unknown".to_string());
+                                                                                        
+                                                                                        let ctcp_msg = crate::voice_chat::create_voice_call_ctcp(&local_ip, port, &session_id);
+                                                                                        if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                            let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                                                                target: nick.clone(),
+                                                                                                message: ctcp_msg,
+                                                                                            });
+                                                                                        }
+                                                                                        log::info!("Sent voice channel invite to {}", nick);
                                                                                     }
-                                                                                } else {
-                                                                                    log::error!("Failed to start voice listener");
+                                                                                },
+                                                                                "� Invite to Voice"
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    // Direct 1:1 Voice Call option
+                                                                    {
+                                                                        let can_call = matches!(voice_state(), crate::voice_chat::VoiceState::Idle);
+                                                                        rsx! {
+                                                                            button {
+                                                                                class: if can_call { "menu-item" } else { "menu-item disabled" },
+                                                                                disabled: !can_call,
+                                                                                title: if can_call { "Start a direct voice call" } else { "Already in a call" },
+                                                                                onclick: {
+                                                                                    let nick = user_nick.clone();
+                                                                                    move |_| {
+                                                                                        user_menu_open.set(None);
+                                                                                        if !can_call { return; }
+                                                                                        
+                                                                                        // Generate session ID and get local IP
+                                                                                        let session_id = crate::voice_chat::VoiceChatManager::generate_session_id();
+                                                                                        let local_ip = crate::voice_chat::get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
+                                                                                        
+                                                                                        // Start voice listener to get a port
+                                                                                        let config = crate::voice_chat::VoiceConfig::default();
+                                                                                        let muted_arc_clone = voice_muted_arc.read().clone();
+                                                                                        
+                                                                                        if let Some((port, evt_rx, stop_flag)) = crate::voice_chat::start_voice_listener(config, muted_arc_clone) {
+                                                                                            voice_local_port.set(port);
+                                                                                            voice_event_rx.set(Some(evt_rx));
+                                                                                            voice_stop_flag.set(Some(stop_flag));
+                                                                                            
+                                                                                            // Update voice state - direct call (Outgoing)
+                                                                                            voice_state.set(crate::voice_chat::VoiceState::Outgoing { peer: nick.clone() });
+                                                                                            voice_session_id.set(Some(session_id.clone()));
+                                                                                            voice_current_peer.set(Some(nick.clone()));
+                                                                                            
+                                                                                            // Send CTCP VOICE_CALL via IRC
+                                                                                            let ctcp_msg = crate::voice_chat::create_voice_call_ctcp(&local_ip, port, &session_id);
+                                                                                            if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                                let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                                                                    target: nick.clone(),
+                                                                                                    message: ctcp_msg,
+                                                                                                });
+                                                                                            }
+                                                                                        } else {
+                                                                                            log::error!("Failed to start voice listener");
+                                                                                        }
+                                                                                    }
+                                                                                },
+                                                                                "📞 Call"
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    // Invite to Channel option
+                                                                    button {
+                                                                        class: "menu-item",
+                                                                        onclick: {
+                                                                            let nick = user_nick.clone();
+                                                                            move |_| {
+                                                                                user_menu_open.set(None);
+                                                                                // Set input to /invite command (user will need to add channel)
+                                                                                let mut input_clone = input.clone();
+                                                                                input_clone.set(format!("/invite {} ", nick));
+                                                                            }
+                                                                        },
+                                                                        "📨 Invite to Channel"
+                                                                    }
+                                                                    // Whois option
+                                                                    button {
+                                                                        class: "menu-item",
+                                                                        onclick: {
+                                                                            let nick = user_nick.clone();
+                                                                            move |_| {
+                                                                                user_menu_open.set(None);
+                                                                                // Send /whois command directly
+                                                                                if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                    let _ = core.cmd_tx.try_send(IrcCommandEvent::Whois { nickname: nick.clone() });
                                                                                 }
                                                                             }
                                                                         },
-                                                                        "📞"
+                                                                        "🔍 Whois"
                                                                     }
                                                                 }
                                                             }
@@ -1844,6 +2077,93 @@ fn app() -> Element {
                                 }
                             },
                             "Cancel"
+                        }
+                    }
+                }
+            }
+
+            // WHOIS info popup
+            if let Some(info) = whois_popup() {
+                div {
+                    class: "whois-popup-overlay",
+                    onclick: move |_| {
+                        whois_popup.set(None);
+                    },
+                    div {
+                        class: "whois-popup",
+                        onclick: move |e: Event<MouseData>| {
+                            e.stop_propagation();
+                        },
+                        div {
+                            class: "whois-popup-header",
+                            h3 {
+                                "🔍 {info.nick}"
+                            }
+                            button {
+                                class: "whois-popup-close",
+                                onclick: move |_| {
+                                    whois_popup.set(None);
+                                },
+                                "✕"
+                            }
+                        }
+                        div {
+                            class: "whois-popup-content",
+                            if let (Some(user), Some(host)) = (&info.user, &info.host) {
+                                div {
+                                    class: "whois-row",
+                                    span { class: "whois-label", "Address" }
+                                    span { class: "whois-value", "{user}@{host}" }
+                                }
+                            }
+                            if let Some(realname) = &info.realname {
+                                div {
+                                    class: "whois-row",
+                                    span { class: "whois-label", "Real Name" }
+                                    span { class: "whois-value", "{realname}" }
+                                }
+                            }
+                            if let Some(server) = &info.server {
+                                div {
+                                    class: "whois-row",
+                                    span { class: "whois-label", "Server" }
+                                    span { class: "whois-value", 
+                                        "{server}"
+                                        if let Some(server_info) = &info.server_info {
+                                            span {
+                                                style: "color: var(--muted); margin-left: 8px;",
+                                                "({server_info})"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(channels) = &info.channels {
+                                div {
+                                    class: "whois-row",
+                                    span { class: "whois-label", "Channels" }
+                                    span { class: "whois-value whois-channels", "{channels}" }
+                                }
+                            }
+                            if let Some(idle_secs) = &info.idle_secs {
+                                {
+                                    let idle_num: u64 = idle_secs.parse().unwrap_or(0);
+                                    let idle_display = if idle_num >= 3600 {
+                                        format!("{}h {}m", idle_num / 3600, (idle_num % 3600) / 60)
+                                    } else if idle_num >= 60 {
+                                        format!("{}m {}s", idle_num / 60, idle_num % 60)
+                                    } else {
+                                        format!("{}s", idle_num)
+                                    };
+                                    rsx! {
+                                        div {
+                                            class: "whois-row",
+                                            span { class: "whois-label", "Idle" }
+                                            span { class: "whois-value", "{idle_display}" }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -4701,6 +5021,70 @@ body {
     transform: translateY(-1px);
 }
 
+/* Voice call button and dropdown */
+.voice-btn.active {
+    background: rgba(76, 175, 80, 0.3);
+    border-color: #4CAF50;
+    color: #4CAF50;
+}
+
+.voice-call-dropdown {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    margin-top: 4px;
+    background: rgba(20, 25, 45, 0.98);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    min-width: 200px;
+    max-height: 300px;
+    overflow: hidden;
+    z-index: 1000;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(12px);
+}
+
+.voice-dropdown-header {
+    padding: 10px 12px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--border);
+}
+
+.voice-dropdown-empty {
+    padding: 16px 12px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.voice-dropdown-list {
+    max-height: 250px;
+    overflow-y: auto;
+    padding: 4px;
+}
+
+.voice-dropdown-item {
+    display: block;
+    width: 100%;
+    padding: 8px 12px;
+    background: none;
+    border: none;
+    color: var(--text);
+    cursor: pointer;
+    text-align: left;
+    font-size: 13px;
+    border-radius: 4px;
+    transition: background 0.2s;
+}
+
+.voice-dropdown-item:hover {
+    background: rgba(99, 102, 241, 0.2);
+}
+
 .profile-search {
     flex: 1;
     max-width: 300px;
@@ -4836,6 +5220,149 @@ body {
 
 .menu-item:hover {
     background: rgba(99, 102, 241, 0.2);
+}
+
+.menu-item.disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.menu-item.disabled:hover {
+    background: none;
+}
+
+/* User menu in userlist */
+.user-row {
+    position: relative;
+}
+
+.user-menu-btn {
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 2px 6px;
+    font-size: 16px;
+    font-weight: bold;
+    opacity: 0;
+    transition: opacity 0.2s, color 0.2s;
+    line-height: 1;
+}
+
+.user-row:hover .user-menu-btn {
+    opacity: 0.6;
+}
+
+.user-menu-btn:hover {
+    opacity: 1 !important;
+    color: var(--text);
+}
+
+.user-menu-panel {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    background: rgba(20, 25, 45, 0.98);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 4px;
+    min-width: 160px;
+    z-index: 1000;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(12px);
+}
+
+/* WHOIS popup styles */
+.whois-popup-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1001;
+    backdrop-filter: blur(4px);
+}
+
+.whois-popup {
+    background: rgba(20, 25, 45, 0.98);
+    border: 1px solid var(--accent);
+    border-radius: 16px;
+    min-width: 360px;
+    max-width: 500px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    overflow: hidden;
+}
+
+.whois-popup-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 20px;
+    background: rgba(99, 102, 241, 0.1);
+    border-bottom: 1px solid var(--border);
+}
+
+.whois-popup-header h3 {
+    margin: 0;
+    color: var(--accent);
+    font-size: 18px;
+    font-weight: 600;
+}
+
+.whois-popup-close {
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 18px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    transition: all 0.2s;
+}
+
+.whois-popup-close:hover {
+    color: var(--text);
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.whois-popup-content {
+    padding: 16px 20px;
+}
+
+.whois-row {
+    display: flex;
+    align-items: flex-start;
+    padding: 10px 0;
+    border-bottom: 1px solid rgba(100, 150, 255, 0.1);
+}
+
+.whois-row:last-child {
+    border-bottom: none;
+}
+
+.whois-label {
+    min-width: 100px;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.whois-value {
+    flex: 1;
+    color: var(--text);
+    font-size: 14px;
+    word-break: break-word;
+}
+
+.whois-channels {
+    font-family: monospace;
+    font-size: 13px;
 }
 
 .body {

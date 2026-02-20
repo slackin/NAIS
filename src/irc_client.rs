@@ -85,6 +85,12 @@ pub enum IrcEvent {
     ChannelListEnd,
     /// Voice chat CTCP message received
     VoiceCtcp { from: String, command: String, args: Vec<String> },
+    /// WHOIS response data
+    WhoisUser { nick: String, user: String, host: String, realname: String },
+    WhoisServer { nick: String, server: String, server_info: String },
+    WhoisChannels { nick: String, channels: String },
+    WhoisIdle { nick: String, idle_secs: String },
+    WhoisEnd { nick: String },
 }
 
 #[derive(Clone, Debug)]
@@ -407,6 +413,9 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent, enable_lo
         }
         IrcEvent::VoiceCtcp { .. } => {
             // Voice CTCP events are handled in the UI event loop, not here
+        }
+        IrcEvent::WhoisUser { .. } | IrcEvent::WhoisServer { .. } | IrcEvent::WhoisChannels { .. } | IrcEvent::WhoisIdle { .. } | IrcEvent::WhoisEnd { .. } => {
+            // WHOIS events are handled in the UI event loop for popup display
         }
     }
     
@@ -1167,6 +1176,14 @@ async fn handle_connection(
                                     text: format!("WHOIS {nick}: {user}@{host} ({real})"),
                                 })
                                 .await;
+                            let _ = evt_tx
+                                .send(IrcEvent::WhoisUser {
+                                    nick: nick.clone(),
+                                    user,
+                                    host,
+                                    realname: real,
+                                })
+                                .await;
                         }
                     }
                     IrcCommand::Response(Response::RPL_WHOISSERVER, ref args) => {
@@ -1178,6 +1195,13 @@ async fn handle_connection(
                                 .send(IrcEvent::System {
                                     channel: default_channel.clone(),
                                     text: format!("WHOIS {nick}: server {server} ({info})"),
+                                })
+                                .await;
+                            let _ = evt_tx
+                                .send(IrcEvent::WhoisServer {
+                                    nick: nick.clone(),
+                                    server,
+                                    server_info: info,
                                 })
                                 .await;
                         }
@@ -1192,6 +1216,12 @@ async fn handle_connection(
                                     text: format!("WHOIS {nick}: channels {channels}"),
                                 })
                                 .await;
+                            let _ = evt_tx
+                                .send(IrcEvent::WhoisChannels {
+                                    nick: nick.clone(),
+                                    channels,
+                                })
+                                .await;
                         }
                     }
                     IrcCommand::Response(Response::RPL_WHOISIDLE, ref args) => {
@@ -1204,6 +1234,12 @@ async fn handle_connection(
                                     text: format!("WHOIS {nick}: idle {idle}s"),
                                 })
                                 .await;
+                            let _ = evt_tx
+                                .send(IrcEvent::WhoisIdle {
+                                    nick: nick.clone(),
+                                    idle_secs: idle,
+                                })
+                                .await;
                         }
                     }
                     IrcCommand::Response(Response::RPL_ENDOFWHOIS, ref args) => {
@@ -1213,6 +1249,11 @@ async fn handle_connection(
                                 .send(IrcEvent::System {
                                     channel: default_channel.clone(),
                                     text: format!("WHOIS {nick}: end"),
+                                })
+                                .await;
+                            let _ = evt_tx
+                                .send(IrcEvent::WhoisEnd {
+                                    nick: nick.clone(),
                                 })
                                 .await;
                         }
