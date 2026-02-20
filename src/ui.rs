@@ -103,9 +103,15 @@ fn app() -> Element {
     let mut profile_status: Signal<HashMap<String, ConnectionStatus>> = use_signal(HashMap::new);
     let mut show_server_log: Signal<HashMap<String, bool>> = use_signal(HashMap::new);
 
-    let mut input = use_signal(|| String::new());
+    let input = use_signal(|| String::new());
     let history = use_signal(Vec::new);
     let mut history_index = use_signal(|| None::<usize>);
+
+    // Tab completion state
+    let mut tab_completion_prefix = use_signal(|| String::new());
+    let mut tab_completion_matches: Signal<Vec<String>> = use_signal(Vec::new);
+    let mut tab_completion_index = use_signal(|| 0usize);
+    let mut skip_tab_reset = use_signal(|| false);
 
     let mut show_new_profile = use_signal(|| false);
     let mut show_edit_profile = use_signal(|| false);
@@ -233,7 +239,7 @@ fn app() -> Element {
     });
 
     // Main event loop to poll cores for IRC events
-    {
+    use_effect(move || {
         let mut state_handle = state;
         let mut status_handle = profile_status;
         let mut channel_list_handle = channel_list;
@@ -321,7 +327,7 @@ fn app() -> Element {
                 Delay::new(Duration::from_millis(16)).await; // ~60fps
             }
         });
-    }
+    });
 
     // Auto-connect to profiles on startup
     {
@@ -1101,28 +1107,172 @@ fn app() -> Element {
                     class: "input",
                     r#type: "text",
                     placeholder: "Type message or /command...",
-                    value: "{input}",
-                    oninput: move |evt| {
-                        input.set(evt.value());
+                    oninput: move |_evt| {
+                        // Reset tab completion when user types (but not when we set value programmatically)
+                        if *skip_tab_reset.read() {
+                            skip_tab_reset.set(false);
+                            return;
+                        }
+                        tab_completion_prefix.set(String::new());
+                        tab_completion_matches.set(Vec::new());
+                        tab_completion_index.set(0);
                     },
                     onkeydown: move |evt| {
                         match evt.key() {
+                            Key::Tab => {
+                                evt.prevent_default();
+                                
+                                let current_prefix = tab_completion_prefix.read().clone();
+                                let current_matches = tab_completion_matches.read().clone();
+                                let current_idx = *tab_completion_index.read();
+                                
+                                // Get users from current channel
+                                let users = state.read()
+                                    .servers
+                                    .get(&state.read().active_profile)
+                                    .and_then(|s| {
+                                        let channel = &s.current_channel;
+                                        s.users_by_channel.get(channel).cloned()
+                                    })
+                                    .unwrap_or_default();
+                                
+                                // Read current text from DOM and perform completion
+                                spawn(async move {
+                                    let result = document::eval(
+                                        r#"dioxus.send(document.getElementById('chat-input').value)"#
+                                    ).recv::<serde_json::Value>().await;
+                                    let current_text = match result {
+                                        Ok(v) => v.as_str().unwrap_or("").to_string(),
+                                        Err(_) => return,
+                                    };
+                                    
+                                    if current_prefix.is_empty() || current_matches.is_empty() {
+                                        // Start new completion
+                                        // Find the word being typed (from last space to end)
+                                        let prefix = current_text
+                                            .rsplit_once(' ')
+                                            .map(|(_, word)| word)
+                                            .unwrap_or(&current_text)
+                                            .to_string();
+                                        
+                                        if prefix.is_empty() {
+                                            return;
+                                        }
+                                        
+                                        let prefix_lower = prefix.to_lowercase();
+                                        
+                                        // Find matching nicks (strip @ and + prefixes for matching)
+                                        let matches: Vec<String> = users
+                                            .iter()
+                                            .filter_map(|u| {
+                                                let nick = u.trim_start_matches(['@', '+']);
+                                                if nick.to_lowercase().starts_with(&prefix_lower) {
+                                                    Some(nick.to_string())
+                                                } else {
+                                                    None
+                                                }
+                                            })
+                                            .collect();
+                                        
+                                        if !matches.is_empty() {
+                                            let completed_nick = &matches[0];
+                                            let is_start_of_line = !current_text.contains(' ');
+                                            let suffix = if is_start_of_line { ": " } else { " " };
+                                            
+                                            // Replace prefix with completed nick
+                                            let new_text = if let Some((before, _)) = current_text.rsplit_once(' ') {
+                                                format!("{} {}{}", before, completed_nick, suffix)
+                                            } else {
+                                                format!("{}{}", completed_nick, suffix)
+                                            };
+                                            
+                                            skip_tab_reset.set(true);
+                                            let escaped = new_text.replace('\\', "\\\\").replace('\'', "\\'");
+                                            let _ = document::eval(&format!(
+                                                r#"document.getElementById('chat-input').value = '{}'"#,
+                                                escaped
+                                            ));
+                                            tab_completion_prefix.set(prefix);
+                                            tab_completion_matches.set(matches);
+                                            tab_completion_index.set(0);
+                                        }
+                                    } else {
+                                        // Cycle to next match
+                                        let next_idx = (current_idx + 1) % current_matches.len();
+                                        let completed_nick = &current_matches[next_idx];
+                                        
+                                        // Find where the previous completion was inserted
+                                        let prev_nick = &current_matches[current_idx];
+                                        
+                                        // Determine if completion was at start of line
+                                        let is_start_of_line = current_text.starts_with(prev_nick);
+                                        let suffix = if is_start_of_line { ": " } else { " " };
+                                        
+                                        // Replace the previous completion
+                                        let new_text = if is_start_of_line {
+                                            // Replace "nick: " at start
+                                            let after = current_text.strip_prefix(prev_nick)
+                                                .and_then(|s| s.strip_prefix(": "))
+                                                .unwrap_or("");
+                                            format!("{}{}{}", completed_nick, suffix, after)
+                                        } else {
+                                            // Find and replace "nick " in the text
+                                            let search = format!("{} ", prev_nick);
+                                            let replace = format!("{}{}", completed_nick, suffix);
+                                            if let Some(pos) = current_text.rfind(&search) {
+                                                let (before, after) = current_text.split_at(pos);
+                                                let after = &after[search.len()..];
+                                                format!("{}{}{}", before, replace, after)
+                                            } else {
+                                                current_text.clone()
+                                            }
+                                        };
+                                        
+                                        skip_tab_reset.set(true);
+                                        let escaped = new_text.replace('\\', "\\\\").replace('\'', "\\'");
+                                        let _ = document::eval(&format!(
+                                            r#"document.getElementById('chat-input').value = '{}'"#,
+                                            escaped
+                                        ));
+                                        tab_completion_index.set(next_idx);
+                                    }
+                                });
+                            }
                             Key::Enter => {
-                                let text = input.read().clone();
-                                handle_send_message(
-                                    text,
-                                    state,
-                                    input,
-                                    history,
-                                    history_index,
-                                    cores,
-                                    profiles,
-                                    last_used,
-                                    force_scroll_to_bottom,
-                                    default_nick.read().clone(),
-                                );
+                                // Read value directly from DOM for uncontrolled input
+                                spawn(async move {
+                                    let result = document::eval(
+                                        r#"dioxus.send(document.getElementById('chat-input').value)"#
+                                    ).recv::<serde_json::Value>().await;
+                                    if let Ok(text) = result {
+                                        if let Some(text_str) = text.as_str() {
+                                            let text = text_str.to_string();
+                                            // Reset tab completion on enter
+                                            tab_completion_prefix.set(String::new());
+                                            tab_completion_matches.set(Vec::new());
+                                            tab_completion_index.set(0);
+                                            // Clear the input
+                                            let _ = document::eval(
+                                                r#"document.getElementById('chat-input').value = ''"#
+                                            );
+                                            handle_send_message(
+                                                text,
+                                                state,
+                                                input,
+                                                history,
+                                                history_index,
+                                                cores,
+                                                profiles,
+                                                last_used,
+                                                force_scroll_to_bottom,
+                                                default_nick.read().clone(),
+                                            );
+                                        }
+                                    }
+                                });
                             }
                             Key::ArrowUp => {
+                                evt.prevent_default();
                                 let hist = history.read();
                                 let current_idx = *history_index.read();
                                 let next_idx = match current_idx {
@@ -1131,20 +1281,39 @@ fn app() -> Element {
                                 };
                                 if next_idx < hist.len() {
                                     history_index.set(Some(next_idx));
-                                    input.set(hist[next_idx].clone());
+                                    let value = hist[next_idx].clone();
+                                    spawn(async move {
+                                        let escaped = value.replace('\\', "\\\\").replace('\'', "\\'");
+                                        let _ = document::eval(&format!(
+                                            r#"document.getElementById('chat-input').value = '{}'"#,
+                                            escaped
+                                        ));
+                                    });
                                 }
                             }
                             Key::ArrowDown => {
+                                evt.prevent_default();
                                 let hist = history.read();
                                 let current_idx = *history_index.read();
                                 if let Some(idx) = current_idx {
                                     if idx < hist.len() - 1 {
                                         let next_idx = idx + 1;
                                         history_index.set(Some(next_idx));
-                                        input.set(hist[next_idx].clone());
+                                        let value = hist[next_idx].clone();
+                                        spawn(async move {
+                                            let escaped = value.replace('\\', "\\\\").replace('\'', "\\'");
+                                            let _ = document::eval(&format!(
+                                                r#"document.getElementById('chat-input').value = '{}'"#,
+                                                escaped
+                                            ));
+                                        });
                                     } else {
                                         history_index.set(None);
-                                        input.set(String::new());
+                                        spawn(async move {
+                                            let _ = document::eval(
+                                                r#"document.getElementById('chat-input').value = ''"#
+                                            );
+                                        });
                                     }
                                 }
                             }
@@ -1158,19 +1327,32 @@ fn app() -> Element {
                 button {
                     class: "send",
                     onclick: move |_| {
-                        let text = input.read().clone();
-                        handle_send_message(
-                            text,
-                            state,
-                            input,
-                            history,
-                            history_index,
-                            cores,
-                            profiles,
-                            last_used,
-                            force_scroll_to_bottom,
-                            default_nick.read().clone(),
-                        );
+                        spawn(async move {
+                            let result = document::eval(
+                                r#"dioxus.send(document.getElementById('chat-input').value)"#
+                            ).recv::<serde_json::Value>().await;
+                            if let Ok(text) = result {
+                                if let Some(text_str) = text.as_str() {
+                                    let text = text_str.to_string();
+                                    // Clear the input
+                                    let _ = document::eval(
+                                        r#"document.getElementById('chat-input').value = ''"#
+                                    );
+                                    handle_send_message(
+                                        text,
+                                        state,
+                                        input,
+                                        history,
+                                        history_index,
+                                        cores,
+                                        profiles,
+                                        last_used,
+                                        force_scroll_to_bottom,
+                                        default_nick.read().clone(),
+                                    );
+                                }
+                            }
+                        });
                     },
                     "Send"
                 }
@@ -1643,7 +1825,7 @@ fn app() -> Element {
                     }
                     div {
                         class: "import-list",
-                        for (label, server) in IMPORT_NETWORKS.iter() {
+                        for (label, server, channel, use_tls) in IMPORT_NETWORKS.iter() {
                             div {
                                 class: "import-row",
                                 div {
@@ -1654,7 +1836,11 @@ fn app() -> Element {
                                     }
                                     div {
                                         class: "import-meta",
-                                        "{server}"
+                                        if channel.is_empty() {
+                                            "{server}"
+                                        } else {
+                                            "{server} {channel}"
+                                        }
                                     }
                                 }
                                 button {
@@ -1672,8 +1858,8 @@ fn app() -> Element {
                                             name,
                                             server: server.to_string(),
                                             nickname: default_nick.clone(),
-                                            channel: String::new(),
-                                            use_tls: true,
+                                            channel: channel.to_string(),
+                                            use_tls: *use_tls,
                                             auto_connect: true,
                                             enable_logging: true,
                                             scrollback_limit: 1000,
@@ -3478,12 +3664,12 @@ fn extract_media_content(text: &str) -> Vec<MediaItem> {
 }
 
 fn unique_profile_label(
-    _label: &str,
-    server: &str,
-    nickname: &str,
+    label: &str,
+    _server: &str,
+    _nickname: &str,
     existing_profiles: &[profile::Profile],
 ) -> String {
-    let base_name = profile::profile_name(server, nickname, "");
+    let base_name = label.to_string();
     let mut name = base_name.clone();
     let mut counter = 1;
     while existing_profiles.iter().any(|p| p.name == name) {
@@ -3493,15 +3679,17 @@ fn unique_profile_label(
     name
 }
 
-const IMPORT_NETWORKS: &[(&str, &str)] = &[
-    ("Libera.Chat", "irc.libera.chat"),
-    ("freenode", "irc.freenode.net"),
-    ("OFTC", "irc.oftc.net"),
-    ("Undernet", "irc.undernet.org"),
-    ("EFnet", "irc.efnet.org"),
-    ("IRCnet", "irc.ircnet.net"),
-    ("DALnet", "irc.dalnet.net"),
-    ("QuakeNet", "irc.quakenet.org"),
+// (label, server, channel, use_tls)
+const IMPORT_NETWORKS: &[(&str, &str, &str, bool)] = &[
+    ("Support", "irc.quakenet.org", "#nais", false),
+    ("Libera.Chat", "irc.libera.chat", "", true),
+    ("freenode", "irc.freenode.net", "", true),
+    ("OFTC", "irc.oftc.net", "", true),
+    ("Undernet", "irc.undernet.org", "", true),
+    ("EFnet", "irc.efnet.org", "", true),
+    ("IRCnet", "irc.ircnet.net", "", true),
+    ("DALnet", "irc.dalnet.net", "", true),
+    ("QuakeNet", "irc.quakenet.org", "", false),
 ];
 
 const APP_STYLES: &str = r#"

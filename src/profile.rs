@@ -86,14 +86,30 @@ impl Profile {
             log_buffer_size: 1000,
         }
     }
+
+    /// Pre-configured support profile for QuakeNet #nais channel
+    pub fn support() -> Self {
+        let nickname = get_system_username();
+        Self {
+            name: "support".to_string(),
+            server: "irc.quakenet.org".to_string(),
+            nickname,
+            channel: "#nais".to_string(),
+            use_tls: false, // QuakeNet doesn't support TLS on standard ports
+            auto_connect: true,
+            enable_logging: true,
+            scrollback_limit: 1000,
+            log_buffer_size: 1000,
+        }
+    }
 }
 
 impl Default for ProfileStore {
     fn default() -> Self {
-        let profile = Profile::default();
+        let support_profile = Profile::support();
         Self {
-            profiles: vec![profile.clone()],
-            last_used: Some(profile.name.clone()),
+            profiles: vec![support_profile.clone()],
+            last_used: Some(support_profile.name.clone()),
             default_nickname: None,
         }
     }
