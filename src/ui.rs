@@ -651,24 +651,66 @@ fn app() -> Element {
                                 }
                                 IrcEvent::CtcpResponse { from, command, response } => {
                                     // Check if this is a VERSION response for a pending invite probe
-                                    let is_pending_invite = pending_invite_probes_handle.read().contains_key(from);
+                                    // Use lowercase for case-insensitive matching (IRC nicks are case-insensitive)
+                                    let from_lower = from.to_lowercase();
+                                    let pending_probes = pending_invite_probes_handle.read();
+                                    let pending_keys: Vec<_> = pending_probes.keys().cloned().collect();
+                                    let is_pending_invite = pending_probes.contains_key(&from_lower);
+                                    drop(pending_probes);
+                                    
+                                    log::info!("CtcpResponse: from='{}', from_lower='{}', command='{}', response='{}', pending_probes={:?}, is_pending_invite={}", 
+                                        from, from_lower, command, response, pending_keys, is_pending_invite);
                                     
                                     if is_pending_invite && command == "VERSION" {
-                                        // Remove from pending probes
-                                        pending_invite_probes_handle.write().remove(from);
+                                        // Check if this is a NAIS client - check for multiple variations
+                                        // Response could be "NAIS-client v0.1.0 (Rust)" or similar
+                                        let response_upper = response.to_uppercase();
+                                        let contains_nais = response_upper.contains("NAIS");
+                                        let contains_nais_client = response_upper.contains("NAIS-CLIENT");
+                                        let contains_nais_underscore = response_upper.contains("NAIS_CLIENT");
+                                        let is_nais = contains_nais || contains_nais_client || contains_nais_underscore;
                                         
-                                        // Check if this is a NAIS client
-                                        let is_nais = response.to_uppercase().contains("NAIS");
+                                        log::info!("NAIS detection for '{}': response='{}', response_upper='{}', contains_nais={}, contains_nais_client={}, is_nais={}", 
+                                            from, response, response_upper, contains_nais, contains_nais_client, is_nais);
                                         
-                                        // Track known NAIS users
-                                        known_nais_users_handle.write().insert(from.clone(), is_nais);
-                                        
-                                        // Show channel invite popup
-                                        channel_invite_popup_handle.set(Some(ChannelInviteInfo {
-                                            target_nick: from.clone(),
-                                            is_nais_client: is_nais,
-                                            current_profile: profile_name.clone(),
-                                        }));
+                                        if is_nais {
+                                            // Found NAIS client! Remove from pending and show popup immediately
+                                            pending_invite_probes_handle.write().remove(&from_lower);
+                                            
+                                            // Track known NAIS users
+                                            known_nais_users_handle.write().insert(from.clone(), true);
+                                            
+                                            // Show channel invite popup
+                                            channel_invite_popup_handle.set(Some(ChannelInviteInfo {
+                                                target_nick: from.clone(),
+                                                is_nais_client: true,
+                                                current_profile: profile_name.clone(),
+                                            }));
+                                        } else {
+                                            // Non-NAIS response, but there might be more responses coming
+                                            // (some clients send multiple VERSION responses)
+                                            // Spawn a delayed check - if still pending after 500ms, show as non-NAIS
+                                            let from_clone = from.clone();
+                                            let from_lower_clone = from_lower.clone();
+                                            let mut pending_handle = pending_invite_probes_handle.clone();
+                                            let mut popup_handle = channel_invite_popup_handle.clone();
+                                            let mut known_users_handle = known_nais_users_handle.clone();
+                                            let profile = profile_name.clone();
+                                            spawn(async move {
+                                                // Wait for more responses
+                                                Delay::new(Duration::from_millis(500)).await;
+                                                // If still pending (no NAIS response came), show as non-NAIS
+                                                if pending_handle.write().remove(&from_lower_clone).is_some() {
+                                                    log::info!("Timeout reached for '{}', showing as non-NAIS client", from_clone);
+                                                    known_users_handle.write().insert(from_clone.clone(), false);
+                                                    popup_handle.set(Some(ChannelInviteInfo {
+                                                        target_nick: from_clone,
+                                                        is_nais_client: false,
+                                                        current_profile: profile,
+                                                    }));
+                                                }
+                                            });
+                                        }
                                     } else {
                                         // Show CTCP response in popup (normal behavior)
                                         ctcp_response_popup_handle.set(Some(CtcpResponseInfo {
@@ -676,6 +718,25 @@ fn app() -> Element {
                                             command: command.clone(),
                                             response: response.clone(),
                                         }));
+                                        
+                                        // Get current channel for system message
+                                        let current_channel = state_handle.read().servers.get(&profile_name)
+                                            .map(|s| s.current_channel.clone())
+                                            .unwrap_or_default();
+                                        
+                                        // Show system message for non-invite CTCP responses
+                                        let mut state_mut = state_handle.write();
+                                        let profiles_read = profiles.read();
+                                        apply_event_with_config(
+                                            &mut state_mut,
+                                            &profiles_read,
+                                            &profile_name,
+                                            IrcEvent::System {
+                                                channel: current_channel,
+                                                text: format!("[CTCP {}] {} reply from {}", command, response, from),
+                                            },
+                                        );
+                                        drop(state_mut);
                                     }
                                 }
                                 IrcEvent::NaisCtcp { from, command, args } => {
@@ -2000,8 +2061,9 @@ fn app() -> Element {
                                                                                 user_menu_open.set(None);
                                                                                 ctcp_submenu_open.set(false);
                                                                                 
-                                                                                // Add to pending invite probes
-                                                                                pending_invite_probes.write().insert(nick.clone(), true);
+                                                                                // Add to pending invite probes (lowercase for case-insensitive matching)
+                                                                                log::info!("Adding '{}' (lowercase: '{}') to pending_invite_probes", nick, nick.to_lowercase());
+                                                                                pending_invite_probes.write().insert(nick.to_lowercase(), true);
                                                                                 
                                                                                 // Send VERSION probe to detect if they're a NAIS client
                                                                                 if let Some(core) = cores.read().get(&state.read().active_profile) {

@@ -1120,17 +1120,12 @@ async fn handle_connection(
                                     .await;
                             } else {
                                 // This is a CTCP response - emit special event for popup
+                                // Note: UI layer handles showing system message to avoid showing during invite probes
                                 let _ = evt_tx
                                     .send(IrcEvent::CtcpResponse {
                                         from: user.clone(),
                                         command: command.clone(),
                                         response: response.clone(),
-                                    })
-                                    .await;
-                                let _ = evt_tx
-                                    .send(IrcEvent::System {
-                                        channel: target.to_string(),
-                                        text: format!("[CTCP {}] {} reply from {}", command, response, user),
                                     })
                                     .await;
                             }
