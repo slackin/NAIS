@@ -665,20 +665,23 @@ pub fn start_voice_chat(config: VoiceConfig) -> VoiceChatHandle {
 }
 
 /// Initiate an outgoing voice connection to a peer
-/// Returns a channel receiver for VoiceEvents
+/// Returns (event receiver, stop flag)
+/// Set the stop flag to true to terminate the voice connection
 pub fn connect_voice_call(
     peer_ip: &str, 
     peer_port: u16, 
     config: VoiceConfig,
     muted: Arc<Mutex<bool>>,
-) -> Option<async_channel::Receiver<VoiceEvent>> {
+) -> Option<(async_channel::Receiver<VoiceEvent>, Arc<Mutex<bool>>)> {
     let peer_addr = format!("{}:{}", peer_ip, peer_port);
     let (evt_tx, evt_rx) = async_channel::unbounded();
+    let stop_flag = Arc::new(Mutex::new(false));
     
     let peer_addr_clone = peer_addr.clone();
     let config_clone = config.clone();
     let evt_tx_clone = evt_tx.clone();
     let muted_clone = muted.clone();
+    let stop_flag_clone = stop_flag.clone();
     
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("voice connect runtime");
@@ -698,6 +701,7 @@ pub fn connect_voice_call(
                         Arc::new(Mutex::new(VoiceState::Active { peer: "remote".to_string() })),
                         muted_clone,
                         config_clone,
+                        stop_flag_clone,
                     ).await;
                 }
                 Err(e) => {
@@ -710,20 +714,23 @@ pub fn connect_voice_call(
         });
     });
     
-    Some(evt_rx)
+    Some((evt_rx, stop_flag))
 }
 
 /// Start listening for incoming voice connections (used when initiating a call)
-/// Returns (listener port, event receiver)
+/// Returns (listener port, event receiver, stop flag)
+/// Set the stop flag to true to terminate the voice connection
 pub fn start_voice_listener(
     config: VoiceConfig,
     muted: Arc<Mutex<bool>>,
-) -> Option<(u16, async_channel::Receiver<VoiceEvent>)> {
+) -> Option<(u16, async_channel::Receiver<VoiceEvent>, Arc<Mutex<bool>>)> {
     let (evt_tx, evt_rx) = async_channel::unbounded();
+    let stop_flag = Arc::new(Mutex::new(false));
     
     let config_clone = config.clone();
     let evt_tx_clone = evt_tx.clone();
     let muted_clone = muted.clone();
+    let stop_flag_clone = stop_flag.clone();
     
     // Create a channel to receive the bound port
     let (port_tx, port_rx) = std::sync::mpsc::channel();
@@ -752,6 +759,7 @@ pub fn start_voice_listener(
                                 Arc::new(Mutex::new(VoiceState::Active { peer: addr.to_string() })),
                                 muted_clone,
                                 config_clone,
+                                stop_flag_clone,
                             ).await;
                         }
                         Err(e) => {
@@ -772,7 +780,7 @@ pub fn start_voice_listener(
     
     // Wait for the port
     match port_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(port) if port > 0 => Some((port, evt_rx)),
+        Ok(port) if port > 0 => Some((port, evt_rx, stop_flag)),
         _ => None,
     }
 }
@@ -870,10 +878,12 @@ async fn voice_chat_loop(core: VoiceChatCore) -> Result<(), Box<dyn std::error::
                     let state = core.state.clone();
                     let muted = core.local_muted.clone();
                     let config = core.config.clone();
+                    // Create a stop flag for this connection (no external control for now)
+                    let stop_flag = Arc::new(Mutex::new(false));
                     std::thread::spawn(move || {
                         let rt = tokio::runtime::Runtime::new().expect("voice connection runtime");
                         rt.block_on(async move {
-                            let _ = handle_voice_connection(stream, addr, evt_tx, state, muted, config).await;
+                            let _ = handle_voice_connection(stream, addr, evt_tx, state, muted, config, stop_flag).await;
                         });
                     });
                 }
@@ -931,6 +941,7 @@ async fn handle_voice_connection(
     _state: Arc<Mutex<VoiceState>>,
     muted: Arc<Mutex<bool>>,
     config: VoiceConfig,
+    stop_flag: Arc<Mutex<bool>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut read_buf = [0u8; 8192];
     // Accumulation buffer for TCP stream reassembly
@@ -961,8 +972,27 @@ async fn handle_voice_connection(
     
     log::info!("Voice audio stream started for connection from {}", addr);
     
+    // Check interval for stop flag
+    let mut stop_check_timer = tokio::time::interval(std::time::Duration::from_millis(100));
+    
     loop {
+        // Check stop flag
+        if let Ok(stopped) = stop_flag.lock() {
+            if *stopped {
+                log::info!("Voice connection stopped by user");
+                // Send hangup to peer before closing
+                let _ = stream.write_all(&VoiceCommand::Hangup.to_bytes()).await;
+                break;
+            }
+        }
+        
         tokio::select! {
+            // Check stop flag periodically
+            _ = stop_check_timer.tick() => {
+                // Just to trigger the stop check at top of loop
+                continue;
+            }
+            
             // Send encoded audio frames
             frame = frame_rx.recv() => {
                 if let Ok((seq, data)) = frame {

@@ -176,6 +176,7 @@ fn app() -> Element {
     let mut voice_local_port: Signal<u16> = use_signal(|| 0);
     let mut voice_event_rx: Signal<Option<async_channel::Receiver<crate::voice_chat::VoiceEvent>>> = use_signal(|| None);
     let voice_muted_arc: Signal<std::sync::Arc<std::sync::Mutex<bool>>> = use_signal(|| std::sync::Arc::new(std::sync::Mutex::new(false)));
+    let mut voice_stop_flag: Signal<Option<std::sync::Arc<std::sync::Mutex<bool>>>> = use_signal(|| None);
     
     // Voice debug state
     let mut voice_mic_level: Signal<f32> = use_signal(|| 0.0);
@@ -357,6 +358,8 @@ fn app() -> Element {
         let mut voice_incoming_handle = voice_incoming_call;
         let mut voice_peer_handle = voice_current_peer;
         let mut voice_session_handle = voice_session_id;
+        let mut voice_event_rx_handle = voice_event_rx;
+        let mut voice_stop_flag_handle = voice_stop_flag;
         spawn(async move {
             let mut channel_buffer: Vec<(String, u32, String)> = Vec::new();
             const BATCH_SIZE: usize = 200;
@@ -443,15 +446,31 @@ fn app() -> Element {
                                             }
                                         }
                                         crate::voice_chat::CTCP_VOICE_REJECT => {
-                                            // Our call was rejected
+                                            // Our call was rejected - stop our listener
+                                            if let Some(stop_flag) = voice_stop_flag_handle.read().clone() {
+                                                if let Ok(mut stopped) = stop_flag.lock() {
+                                                    *stopped = true;
+                                                }
+                                            }
                                             voice_state_handle.set(crate::voice_chat::VoiceState::Idle);
                                             voice_session_handle.set(None);
                                             voice_peer_handle.set(None);
+                                            voice_event_rx_handle.set(None);
+                                            voice_stop_flag_handle.set(None);
                                         }
                                         crate::voice_chat::CTCP_VOICE_CANCEL => {
-                                            // Incoming call was cancelled
+                                            // Call was cancelled by peer - stop our audio stream
+                                            if let Some(stop_flag) = voice_stop_flag_handle.read().clone() {
+                                                if let Ok(mut stopped) = stop_flag.lock() {
+                                                    *stopped = true;
+                                                }
+                                            }
                                             voice_state_handle.set(crate::voice_chat::VoiceState::Idle);
                                             voice_incoming_handle.set(None);
+                                            voice_peer_handle.set(None);
+                                            voice_session_handle.set(None);
+                                            voice_event_rx_handle.set(None);
+                                            voice_stop_flag_handle.set(None);
                                         }
                                         _ => {}
                                     }
@@ -1267,9 +1286,10 @@ fn app() -> Element {
                                                                                 let config = crate::voice_chat::VoiceConfig::default();
                                                                                 let muted_arc_clone = voice_muted_arc.read().clone();
                                                                                 
-                                                                                if let Some((port, evt_rx)) = crate::voice_chat::start_voice_listener(config, muted_arc_clone) {
+                                                                                if let Some((port, evt_rx, stop_flag)) = crate::voice_chat::start_voice_listener(config, muted_arc_clone) {
                                                                                     voice_local_port.set(port);
                                                                                     voice_event_rx.set(Some(evt_rx));
+                                                                                    voice_stop_flag.set(Some(stop_flag));
                                                                                     
                                                                                     // Update voice state
                                                                                     voice_state.set(crate::voice_chat::VoiceState::Outgoing { peer: nick.clone() });
@@ -1340,13 +1360,14 @@ fn app() -> Element {
                                     let muted_arc_clone = voice_muted_arc.read().clone();
                                     
                                     // Connect to the caller's listener
-                                    if let Some(evt_rx) = crate::voice_chat::connect_voice_call(
+                                    if let Some((evt_rx, stop_flag)) = crate::voice_chat::connect_voice_call(
                                         &caller_ip,
                                         caller_port,
                                         config.clone(),
                                         muted_arc_clone.clone(),
                                     ) {
                                         voice_event_rx.set(Some(evt_rx));
+                                        voice_stop_flag.set(Some(stop_flag));
                                         
                                         // Send CTCP VOICE_ACCEPT with our port (may not be needed if we're connecting outbound)
                                         let local_port = voice_local_port();
@@ -1761,10 +1782,18 @@ fn app() -> Element {
                                         }
                                     }
                                     
+                                    // Stop the audio stream
+                                    if let Some(stop_flag) = voice_stop_flag() {
+                                        if let Ok(mut stopped) = stop_flag.lock() {
+                                            *stopped = true;
+                                        }
+                                    }
+                                    
                                     voice_state.set(crate::voice_chat::VoiceState::Idle);
                                     voice_current_peer.set(None);
                                     voice_session_id.set(None);
                                     voice_event_rx.set(None);
+                                    voice_stop_flag.set(None);
                                 }
                             },
                             "📵 End Call"
@@ -1800,10 +1829,18 @@ fn app() -> Element {
                                         }
                                     }
                                     
+                                    // Stop the audio stream
+                                    if let Some(stop_flag) = voice_stop_flag() {
+                                        if let Ok(mut stopped) = stop_flag.lock() {
+                                            *stopped = true;
+                                        }
+                                    }
+                                    
                                     voice_state.set(crate::voice_chat::VoiceState::Idle);
                                     voice_current_peer.set(None);
                                     voice_session_id.set(None);
                                     voice_event_rx.set(None);
+                                    voice_stop_flag.set(None);
                                 }
                             },
                             "Cancel"
@@ -1985,6 +2022,7 @@ fn app() -> Element {
                                                 voice_local_port,
                                                 voice_muted_arc,
                                                 voice_event_rx,
+                                                voice_stop_flag,
                                             );
                                         }
                                     }
@@ -2074,6 +2112,7 @@ fn app() -> Element {
                                         voice_local_port,
                                         voice_muted_arc,
                                         voice_event_rx,
+                                        voice_stop_flag,
                                     );
                                 }
                             }
@@ -2831,6 +2870,7 @@ fn handle_send_message(
     mut voice_local_port: Signal<u16>,
     voice_muted_arc: Signal<std::sync::Arc<std::sync::Mutex<bool>>>,
     mut voice_event_rx: Signal<Option<async_channel::Receiver<crate::voice_chat::VoiceEvent>>>,
+    mut voice_stop_flag: Signal<Option<std::sync::Arc<std::sync::Mutex<bool>>>>,
 ) {
     let text = text.trim().to_string();
     if text.is_empty() {
@@ -3313,9 +3353,10 @@ fn handle_send_message(
                         let config = crate::voice_chat::VoiceConfig::default();
                         let muted_arc_clone = voice_muted_arc.read().clone();
                         
-                        if let Some((port, evt_rx)) = crate::voice_chat::start_voice_listener(config, muted_arc_clone) {
+                        if let Some((port, evt_rx, stop_flag)) = crate::voice_chat::start_voice_listener(config, muted_arc_clone) {
                             voice_local_port.set(port);
                             voice_event_rx.set(Some(evt_rx));
+                            voice_stop_flag.set(Some(stop_flag));
                             
                             // Update voice state
                             voice_state.set(crate::voice_chat::VoiceState::Outgoing { peer: target_nick.clone() });
@@ -3371,10 +3412,18 @@ fn handle_send_message(
                             }
                         }
                         
+                        // Stop the audio stream
+                        if let Some(stop_flag) = voice_stop_flag() {
+                            if let Ok(mut stopped) = stop_flag.lock() {
+                                *stopped = true;
+                            }
+                        }
+                        
                         voice_state.set(crate::voice_chat::VoiceState::Idle);
                         voice_current_peer.set(None);
                         voice_session_id.set(None);
                         voice_event_rx.set(None);
+                        voice_stop_flag.set(None);
                         
                         apply_event_with_config(
                             &mut state.write(),
