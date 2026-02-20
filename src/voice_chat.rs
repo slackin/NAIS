@@ -884,6 +884,45 @@ async fn voice_chat_loop(core: VoiceChatCore) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+/// Parse a single VoiceCommand from a buffer, returning (command, bytes_consumed)
+/// Returns None if buffer doesn't contain a complete message
+fn parse_voice_command_from_buffer(data: &[u8]) -> Option<(VoiceCommand, usize)> {
+    if data.is_empty() {
+        return None;
+    }
+    
+    match data[0] {
+        0x01 | 0x02 | 0x03 => {
+            // Variable length text commands - need a length prefix or delimiter
+            // For now, these are rarely used during active calls, skip
+            None
+        }
+        0x04 => Some((VoiceCommand::Hangup, 1)),
+        0x05 => Some((VoiceCommand::Ping, 1)),
+        0x06 => Some((VoiceCommand::Pong, 1)),
+        0x07 if data.len() >= 2 => {
+            Some((VoiceCommand::MuteStatus { muted: data[1] != 0 }, 2))
+        }
+        0x10 if data.len() >= 7 => {
+            let sequence = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+            let len = u16::from_be_bytes([data[5], data[6]]) as usize;
+            let total_len = 7 + len;
+            if data.len() >= total_len {
+                let audio_data = data[7..total_len].to_vec();
+                Some((VoiceCommand::AudioFrame { sequence, data: audio_data }, total_len))
+            } else {
+                // Not enough data yet - need more bytes
+                None
+            }
+        }
+        _ => {
+            // Unknown command, skip one byte
+            log::warn!("Unknown voice command byte: 0x{:02x}", data[0]);
+            Some((VoiceCommand::Ping, 1)) // Dummy to consume the byte
+        }
+    }
+}
+
 /// Handle an established voice connection
 async fn handle_voice_connection(
     mut stream: TcpStream,
@@ -893,7 +932,9 @@ async fn handle_voice_connection(
     muted: Arc<Mutex<bool>>,
     config: VoiceConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut buf = [0u8; 4096];
+    let mut read_buf = [0u8; 8192];
+    // Accumulation buffer for TCP stream reassembly
+    let mut pending_data: Vec<u8> = Vec::with_capacity(16384);
     
     // Create audio stream
     let mut audio_stream = VoiceAudioStream::new(&config);
@@ -926,15 +967,16 @@ async fn handle_voice_connection(
             frame = frame_rx.recv() => {
                 if let Ok((seq, data)) = frame {
                     let cmd = VoiceCommand::AudioFrame { sequence: seq, data };
-                    if let Err(e) = stream.write_all(&cmd.to_bytes()).await {
+                    let bytes = cmd.to_bytes();
+                    if let Err(e) = stream.write_all(&bytes).await {
                         log::error!("Failed to send audio frame: {}", e);
                         break;
                     }
                 }
             }
             
-            // Receive data from peer
-            result = stream.read(&mut buf) => {
+            // Receive data from peer - use buffered reading with message framing
+            result = stream.read(&mut read_buf) => {
                 let n = match result {
                     Ok(n) => n,
                     Err(e) => {
@@ -949,27 +991,54 @@ async fn handle_voice_connection(
                     break;
                 }
                 
-                if let Some(cmd) = VoiceCommand::from_bytes(&buf[..n]) {
-                    match cmd {
-                        VoiceCommand::AudioFrame { sequence, data } => {
-                            // Decode and play audio
-                            audio_stream.receive_frame(sequence, &data);
+                // Append new data to pending buffer
+                pending_data.extend_from_slice(&read_buf[..n]);
+                
+                // Process all complete messages in the buffer
+                let mut should_break = false;
+                loop {
+                    match parse_voice_command_from_buffer(&pending_data) {
+                        Some((cmd, consumed)) => {
+                            // Remove consumed bytes from buffer
+                            pending_data.drain(..consumed);
+                            
+                            match cmd {
+                                VoiceCommand::AudioFrame { sequence, data } => {
+                                    // Decode and play audio
+                                    audio_stream.receive_frame(sequence, &data);
+                                }
+                                VoiceCommand::Hangup => {
+                                    let _ = evt_tx.send(VoiceEvent::CallEnded {
+                                        peer: addr.to_string(),
+                                        reason: "Peer hung up".to_string(),
+                                    }).await;
+                                    should_break = true;
+                                    break;
+                                }
+                                VoiceCommand::Ping => {
+                                    let _ = stream.write_all(&VoiceCommand::Pong.to_bytes()).await;
+                                }
+                                VoiceCommand::MuteStatus { muted } => {
+                                    let _ = evt_tx.send(VoiceEvent::PeerMuteChanged { muted }).await;
+                                }
+                                _ => {}
+                            }
                         }
-                        VoiceCommand::Hangup => {
-                            let _ = evt_tx.send(VoiceEvent::CallEnded {
-                                peer: addr.to_string(),
-                                reason: "Peer hung up".to_string(),
-                            }).await;
+                        None => {
+                            // Need more data - wait for next read
                             break;
                         }
-                        VoiceCommand::Ping => {
-                            let _ = stream.write_all(&VoiceCommand::Pong.to_bytes()).await;
-                        }
-                        VoiceCommand::MuteStatus { muted } => {
-                            let _ = evt_tx.send(VoiceEvent::PeerMuteChanged { muted }).await;
-                        }
-                        _ => {}
                     }
+                }
+                
+                if should_break {
+                    break;
+                }
+                
+                // Safety: prevent unbounded buffer growth from malformed data
+                if pending_data.len() > 65536 {
+                    log::error!("Voice protocol buffer overflow, resetting");
+                    pending_data.clear();
                 }
             }
             
@@ -1035,7 +1104,7 @@ impl AudioCapture {
     }
 }
 
-/// Audio playback system using ring buffer for received audio
+/// Audio playback system using ring buffer for received audio with jitter buffering
 pub struct AudioPlayback {
     /// Ring buffer for audio samples
     buffer: Arc<Mutex<std::collections::VecDeque<f32>>>,
@@ -1043,6 +1112,10 @@ pub struct AudioPlayback {
     stop_flag: Arc<Mutex<bool>>,
     /// Output level for monitoring
     output_level: Arc<Mutex<f32>>,
+    /// Jitter buffer priming flag - wait until we have enough data before playing
+    primed: Arc<Mutex<bool>>,
+    /// Target jitter buffer size in samples (80ms at 48kHz = 3840 samples)
+    jitter_target: usize,
     /// Output stream handle (kept alive)
     _stream: Option<cpal::Stream>,
 }
@@ -1072,22 +1145,22 @@ impl AudioPlayback {
             }
         }
         
-        // Create buffer with some capacity (100ms at given sample rate)
-        let buffer_capacity = (sample_rate as usize * channels as usize) / 10;
+        // Jitter buffer: target 80ms of buffered audio before starting playback
+        // This helps smooth out network jitter and prevents choppy audio
+        let jitter_target = (sample_rate as usize * channels as usize * 80) / 1000; // 80ms
+        
+        // Create buffer with larger capacity (300ms for jitter absorption)
+        let buffer_capacity = (sample_rate as usize * channels as usize * 300) / 1000;
         let buffer = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(buffer_capacity)));
         let stop_flag = Arc::new(Mutex::new(false));
         let output_level = Arc::new(Mutex::new(0.0f32));
+        let primed = Arc::new(Mutex::new(false)); // Start unprimed - wait for jitter buffer to fill
         
         let buffer_clone = buffer.clone();
         let stop_clone = stop_flag.clone();
         let level_clone = output_level.clone();
-        
-        // Try the requested config first
-        let requested_config = cpal::StreamConfig {
-            channels,
-            sample_rate: cpal::SampleRate(sample_rate),
-            buffer_size: cpal::BufferSize::Default,
-        };
+        let primed_clone = primed.clone();
+        let jitter_target_clone = jitter_target;
         
         // On Windows, we may need stereo output even if input is mono
         // Windows audio devices often don't support mono output
@@ -1100,8 +1173,8 @@ impl AudioPlayback {
             buffer_size: cpal::BufferSize::Default,
         };
         
-        log::info!("Audio playback: Attempting config: {} Hz, {} channels (mono_to_stereo: {})", 
-            sample_rate, output_channels, is_mono_to_stereo);
+        log::info!("Audio playback: Attempting config: {} Hz, {} channels (mono_to_stereo: {}, jitter_target: {} samples)", 
+            sample_rate, output_channels, is_mono_to_stereo, jitter_target);
         
         let stream_result = device.build_output_stream(
             &config,
@@ -1112,7 +1185,28 @@ impl AudioPlayback {
                 }
                 
                 let mut buf = buffer_clone.lock().unwrap();
+                let mut is_primed = primed_clone.lock().unwrap();
                 let mut sum_sq = 0.0f32;
+                
+                // Jitter buffer logic: wait until we have enough data before playing
+                if !*is_primed {
+                    if buf.len() >= jitter_target_clone {
+                        *is_primed = true;
+                        log::info!("Audio playback: Jitter buffer primed with {} samples", buf.len());
+                    } else {
+                        // Still buffering - output silence
+                        data.fill(0.0);
+                        return;
+                    }
+                }
+                
+                // Check for buffer underrun - if we run dry, re-prime
+                if buf.is_empty() {
+                    *is_primed = false;
+                    log::debug!("Audio playback: Buffer underrun, re-priming jitter buffer");
+                    data.fill(0.0);
+                    return;
+                }
                 
                 if is_mono_to_stereo {
                     // Duplicate mono samples to stereo
@@ -1175,6 +1269,8 @@ impl AudioPlayback {
             buffer,
             stop_flag,
             output_level,
+            primed,
+            jitter_target,
             _stream: Some(stream),
         })
     }
@@ -1186,8 +1282,8 @@ impl AudioPlayback {
         }
         
         let mut buf = self.buffer.lock().unwrap();
-        // Limit buffer size to prevent unbounded growth (500ms max)
-        let max_size = 48000 / 2; // 500ms at 48kHz mono
+        // Limit buffer size to prevent unbounded growth (500ms max at 48kHz mono)
+        let max_size = 48000 / 2;
         if buf.len() + samples.len() > max_size {
             // Drop oldest samples if we're getting behind
             let to_drop = buf.len() + samples.len() - max_size;
@@ -1354,10 +1450,18 @@ impl VoiceAudioStream {
         // Spawn encoding task
         let stop_clone2 = self.stop_flag.clone();
         let stats_clone = self.stats.clone();
+        let config_clone = config.clone(); // Use actual config, not default
         
         std::thread::spawn(move || {
-            let mut encoder = AudioCapture::new(&VoiceConfig::default()).create_encoder().unwrap();
+            let mut encoder = AudioCapture::new(&config_clone).create_encoder().unwrap();
             let mut opus_output = vec![0u8; 4000]; // Max opus frame size
+            
+            // Target frame interval based on frame size and sample rate
+            // frame_size / sample_rate = time per frame
+            // e.g., 960 samples / 48000 Hz = 20ms per frame
+            let frame_duration_ms = (frame_size as u64 * 1000) / config_clone.sample_rate as u64;
+            let frame_interval = std::time::Duration::from_millis(frame_duration_ms.max(1));
+            let mut last_encode = std::time::Instant::now();
             
             loop {
                 if *stop_clone2.lock().unwrap() {
@@ -1399,9 +1503,13 @@ impl VoiceAudioStream {
                             log::error!("Opus encode error: {}", e);
                         }
                     }
+                    last_encode = std::time::Instant::now();
                 } else {
-                    // Sleep a bit if no data to encode
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    // Sleep based on time since last encode to maintain consistent timing
+                    let elapsed = last_encode.elapsed();
+                    if elapsed < frame_interval {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                 }
             }
         });
