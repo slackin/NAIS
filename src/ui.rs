@@ -62,6 +62,17 @@ struct CrossNetworkInviteInfo {
     received_on_profile: String,
 }
 
+/// Information for an incoming IRC invite (standard INVITE command)
+#[derive(Clone, Debug)]
+struct IncomingIrcInviteInfo {
+    /// User who sent the invite
+    from_nick: String,
+    /// Channel we're being invited to
+    channel: String,
+    /// Profile/server where we received the invite
+    profile: String,
+}
+
 /// A channel option for the invite selector
 #[derive(Clone, Debug)]
 struct InviteChannelOption {
@@ -274,6 +285,9 @@ fn app() -> Element {
     
     // Cross-network invite popup state (when we receive an invite to another server)
     let mut cross_network_invite: Signal<Option<CrossNetworkInviteInfo>> = use_signal(|| None);
+    
+    // Incoming IRC invite popup state (standard IRC INVITE command)
+    let mut incoming_irc_invite: Signal<Option<IncomingIrcInviteInfo>> = use_signal(|| None);
 
     // Voice chat state
     let mut voice_state: Signal<crate::voice_chat::VoiceState> = use_signal(|| crate::voice_chat::VoiceState::Idle);
@@ -495,6 +509,7 @@ fn app() -> Element {
         let mut known_nais_users_handle = known_nais_users;
         let mut pending_invite_probes_handle = pending_invite_probes;
         let mut cross_network_invite_handle = cross_network_invite;
+        let mut incoming_irc_invite_handle = incoming_irc_invite;
         spawn(async move {
             let mut channel_buffer: Vec<(String, u32, String)> = Vec::new();
             const BATCH_SIZE: usize = 200;
@@ -945,6 +960,16 @@ fn app() -> Element {
                                             }
                                         }
                                     }
+                                }
+                                IrcEvent::Invited { from, channel } => {
+                                    // Show incoming IRC invite popup
+                                    incoming_irc_invite_handle.set(Some(IncomingIrcInviteInfo {
+                                        from_nick: from.clone(),
+                                        channel: channel.clone(),
+                                        profile: profile_name.clone(),
+                                    }));
+                                    
+                                    log::info!("Received IRC INVITE from {} to channel {}", from, channel);
                                 }
                                 _ => {}
                             }
@@ -3425,6 +3450,98 @@ fn app() -> Element {
                                     },
                                     "Accept & Join"
                                 }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Incoming IRC invite popup (standard IRC INVITE command)
+            if let Some(invite) = incoming_irc_invite() {
+                div {
+                    class: "modal-backdrop",
+                    onclick: move |_| {
+                        incoming_irc_invite.set(None);
+                    },
+                    div {
+                        class: "ctcp-popup",
+                        style: "max-width: 400px;",
+                        onclick: move |e| e.stop_propagation(),
+                        div {
+                            class: "ctcp-popup-header",
+                            div {
+                                style: "display: flex; align-items: center; gap: 8px;",
+                                span {
+                                    style: "font-size: 20px;",
+                                    "📨"
+                                }
+                                "Channel Invite"
+                            }
+                            button {
+                                class: "close-button",
+                                onclick: move |_| {
+                                    incoming_irc_invite.set(None);
+                                },
+                                "×"
+                            }
+                        }
+                        div {
+                            class: "ctcp-popup-content",
+                            div {
+                                class: "ctcp-row",
+                                span { class: "ctcp-label", "From" }
+                                span { class: "ctcp-value", "{invite.from_nick}" }
+                            }
+                            div {
+                                class: "ctcp-row",
+                                span { class: "ctcp-label", "Channel" }
+                                span { class: "ctcp-value", "{invite.channel}" }
+                            }
+                            div {
+                                class: "ctcp-row",
+                                span { class: "ctcp-label", "Server" }
+                                span { 
+                                    class: "ctcp-value",
+                                    style: "font-size: 12px; color: var(--text-muted);",
+                                    "{invite.profile}"
+                                }
+                            }
+                        }
+                        div {
+                            style: "display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--border); justify-content: flex-end;",
+                            button {
+                                class: "sidebar-button",
+                                style: "padding: 6px 16px;",
+                                onclick: move |_| {
+                                    incoming_irc_invite.set(None);
+                                },
+                                "Decline"
+                            }
+                            button {
+                                class: "action-button",
+                                style: "padding: 6px 16px; background: var(--accent); color: white;",
+                                onclick: move |_| {
+                                    let channel = invite.channel.clone();
+                                    let profile = invite.profile.clone();
+                                    
+                                    // Join the channel on the same server
+                                    if let Some(core) = cores.read().get(&profile) {
+                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Join {
+                                            channel: channel.clone(),
+                                        });
+                                    }
+                                    
+                                    // Switch to that channel
+                                    if let Some(server_state) = state.write().servers.get_mut(&profile) {
+                                        if !server_state.channels.contains(&channel) {
+                                            server_state.channels.push(channel.clone());
+                                        }
+                                        server_state.current_channel = channel;
+                                    }
+                                    
+                                    incoming_irc_invite.set(None);
+                                },
+                                "Accept & Join"
                             }
                         }
                     }

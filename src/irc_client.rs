@@ -109,6 +109,8 @@ pub enum IrcEvent {
     CtcpResponse { from: String, command: String, response: String },
     /// NAIS channel CTCP message received
     NaisCtcp { from: String, command: String, args: Vec<String> },
+    /// IRC INVITE received - someone invited us to a channel
+    Invited { from: String, channel: String },
 }
 
 #[derive(Clone, Debug)]
@@ -472,6 +474,9 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent, enable_lo
         }
         IrcEvent::NaisCtcp { .. } => {
             // NAIS CTCP events are handled in the UI event loop
+        }
+        IrcEvent::Invited { .. } => {
+            // Invite events are handled in the UI event loop for popup display
         }
     }
     
@@ -1275,17 +1280,23 @@ async fn handle_connection(
                     }
                     IrcCommand::INVITE(ref invited_user, ref channel) => {
                         let user = message.source_nickname().unwrap_or("unknown");
-                        let detail = if invited_user.as_str() == self_nick {
-                            format!("{user} invited you to {channel}")
+                        if invited_user.as_str() == self_nick {
+                            // We are being invited - emit Invited event for popup handling
+                            let _ = evt_tx
+                                .send(IrcEvent::Invited {
+                                    from: user.to_string(),
+                                    channel: channel.clone(),
+                                })
+                                .await;
                         } else {
-                            format!("{user} invited {invited_user} to {channel}")
-                        };
-                        let _ = evt_tx
-                            .send(IrcEvent::System {
-                                channel: default_channel.clone(),
-                                text: detail,
-                            })
-                            .await;
+                            // Someone else was invited - show as system message
+                            let _ = evt_tx
+                                .send(IrcEvent::System {
+                                    channel: default_channel.clone(),
+                                    text: format!("{user} invited {invited_user} to {channel}"),
+                                })
+                                .await;
+                        }
                     }
                     IrcCommand::Response(Response::RPL_UMODEIS, _) => {
                         // User mode response (221) - we're fully connected, trigger auto-join
