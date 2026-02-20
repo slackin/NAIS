@@ -77,6 +77,8 @@ pub enum IrcEvent {
     Topic { channel: String, topic: String },
     ChannelListItem { channel: String, user_count: u32, topic: String },
     ChannelListEnd,
+    /// Voice chat CTCP message received
+    VoiceCtcp { from: String, command: String, args: Vec<String> },
 }
 
 #[derive(Clone, Debug)]
@@ -136,6 +138,11 @@ pub enum IrcCommandEvent {
     },
     Away {
         message: Option<String>,
+    },
+    /// Send a CTCP message to a user (for voice chat negotiation)
+    Ctcp {
+        target: String,
+        message: String,
     },
     #[allow(dead_code)]
     Disconnect,
@@ -373,6 +380,9 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent, enable_lo
         IrcEvent::ChannelListItem { .. } | IrcEvent::ChannelListEnd => {
             // These events are handled in the UI event loop, not here
         }
+        IrcEvent::VoiceCtcp { .. } => {
+            // Voice CTCP events are handled in the UI event loop, not here
+        }
     }
     
     // Apply scrollback limit - keep only the most recent messages in memory
@@ -508,7 +518,7 @@ fn handle_ctcp_query(command: &str, args: &str) -> Option<String> {
             Some(create_ctcp_response("VERSION", "NAIS-client v0.1.0 (Rust)"))
         }
         "CLIENTINFO" => {
-            Some(create_ctcp_response("CLIENTINFO", "ACTION VERSION CLIENTINFO TIME PING"))
+            Some(create_ctcp_response("CLIENTINFO", "ACTION VERSION CLIENTINFO TIME PING VOICE_CALL VOICE_ACCEPT VOICE_REJECT VOICE_CANCEL"))
         }
         "TIME" => {
             let now = chrono::Local::now();
@@ -517,8 +527,15 @@ fn handle_ctcp_query(command: &str, args: &str) -> Option<String> {
         "PING" => {
             Some(create_ctcp_response("PING", args))
         }
+        // Voice CTCP commands are handled separately - return None to let them be forwarded to voice system
+        "VOICE_CALL" | "VOICE_ACCEPT" | "VOICE_REJECT" | "VOICE_CANCEL" => None,
         _ => None,
     }
+}
+
+/// Check if a CTCP command is voice-related
+fn is_voice_ctcp(command: &str) -> bool {
+    matches!(command, "VOICE_CALL" | "VOICE_ACCEPT" | "VOICE_REJECT" | "VOICE_CANCEL")
 }
 
 async fn handle_connection(
@@ -767,6 +784,16 @@ async fn handle_connection(
                             let _ = client.send(IrcCommand::AWAY(None));
                         }
                     }
+                    IrcCommandEvent::Ctcp { target, message } => {
+                        // Send CTCP message via PRIVMSG (CTCP is wrapped in \x01)
+                        let _ = evt_tx
+                            .send(IrcEvent::System {
+                                channel: default_channel.clone(),
+                                text: format!("[CTCP] Sent to {}: {}", target, message.replace('\x01', "")),
+                            })
+                            .await;
+                        let _ = client.send_privmsg(&target, &message);
+                    }
                     IrcCommandEvent::Disconnect => {
                         let _ = evt_tx
                             .send(IrcEvent::System {
@@ -872,6 +899,26 @@ async fn handle_connection(
                                         channel: target.to_string(),
                                         user,
                                         text: args,
+                                    })
+                                    .await;
+                            } else if is_voice_ctcp(&command) {
+                                // Voice CTCP command - forward to voice system
+                                let args_vec: Vec<String> = args.split_whitespace()
+                                    .map(|s| s.to_string())
+                                    .collect();
+                                
+                                let _ = evt_tx
+                                    .send(IrcEvent::System {
+                                        channel: default_channel.clone(),
+                                        text: format!("[Voice] {} from {}", command, user),
+                                    })
+                                    .await;
+                                
+                                let _ = evt_tx
+                                    .send(IrcEvent::VoiceCtcp {
+                                        from: user,
+                                        command,
+                                        args: args_vec,
                                     })
                                     .await;
                             } else {

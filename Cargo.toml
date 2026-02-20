@@ -9,7 +9,7 @@ desktop = ["dioxus/desktop", "dep:rfd", "dep:arboard"]
 mobile = ["dioxus/mobile"]
 
 [dependencies]
-tokio02 = { package = "tokio", version = "0.2", features = ["rt-threaded", "macros", "time"] }
+tokio02 = { package = "tokio", version = "0.2", features = ["rt-threaded", "macros", "time", "io-util", "tcp"] }
 irc = "0.14"
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
@@ -32,3 +32,7 @@ base64 = "0.22"
 # Desktop-only dependencies
 rfd = { version = "0.17", optional = true }
 arboard = { version = "3.6", optional = true }
+
+# Voice chat dependencies
+opus = "0.3"
+cpal = "0.15"

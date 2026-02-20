@@ -167,6 +167,14 @@ fn app() -> Element {
     let mut userlist_collapsed = use_signal(|| false);
     let mut topic_collapsed = use_signal(|| false);
 
+    // Voice chat state
+    let mut voice_state: Signal<crate::voice_chat::VoiceState> = use_signal(|| crate::voice_chat::VoiceState::Idle);
+    let mut voice_muted = use_signal(|| false);
+    let mut voice_incoming_call: Signal<Option<(String, String, u16, String)>> = use_signal(|| None); // (from, ip, port, session_id)
+    let mut voice_current_peer: Signal<Option<String>> = use_signal(|| None);
+    let mut voice_session_id: Signal<Option<String>> = use_signal(|| None);
+    let voice_local_port: Signal<u16> = use_signal(|| 0);
+
     // Scroll behavior state
     let mut is_at_bottom = use_signal(|| true);
     let mut force_scroll_to_bottom = use_signal(|| false);
@@ -244,6 +252,10 @@ fn app() -> Element {
         let mut status_handle = profile_status;
         let mut channel_list_handle = channel_list;
         let mut list_loading_handle = list_loading;
+        let mut voice_state_handle = voice_state;
+        let mut voice_incoming_handle = voice_incoming_call;
+        let mut voice_peer_handle = voice_current_peer;
+        let mut voice_session_handle = voice_session_id;
         spawn(async move {
             let mut channel_buffer: Vec<(String, u32, String)> = Vec::new();
             const BATCH_SIZE: usize = 200;
@@ -296,6 +308,52 @@ fn app() -> Element {
                                         server_state.cached_channel_list = channel_list_handle.read().clone();
                                     }
                                     drop(state_mut);
+                                    continue;
+                                }
+                                IrcEvent::VoiceCtcp { from, command, args } => {
+                                    // Handle voice CTCP commands
+                                    match command.as_str() {
+                                        crate::voice_chat::CTCP_VOICE_CALL => {
+                                            // Incoming call: VOICE_CALL <ip> <port> <session_id>
+                                            if args.len() >= 3 {
+                                                let ip = args[0].clone();
+                                                let port = args[1].parse::<u16>().unwrap_or(0);
+                                                let session_id = args[2].clone();
+                                                if port > 0 {
+                                                    voice_incoming_handle.set(Some((from.clone(), ip, port, session_id)));
+                                                    voice_state_handle.set(crate::voice_chat::VoiceState::Incoming {
+                                                        peer: from.clone(),
+                                                        ip: args[0].clone(),
+                                                        port,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        crate::voice_chat::CTCP_VOICE_ACCEPT => {
+                                            // Our call was accepted
+                                            if args.len() >= 3 {
+                                                let session_id = args[2].clone();
+                                                if voice_session_handle.read().as_ref() == Some(&session_id) {
+                                                    voice_state_handle.set(crate::voice_chat::VoiceState::Active {
+                                                        peer: from.clone(),
+                                                    });
+                                                    voice_peer_handle.set(Some(from.clone()));
+                                                }
+                                            }
+                                        }
+                                        crate::voice_chat::CTCP_VOICE_REJECT => {
+                                            // Our call was rejected
+                                            voice_state_handle.set(crate::voice_chat::VoiceState::Idle);
+                                            voice_session_handle.set(None);
+                                            voice_peer_handle.set(None);
+                                        }
+                                        crate::voice_chat::CTCP_VOICE_CANCEL => {
+                                            // Incoming call was cancelled
+                                            voice_state_handle.set(crate::voice_chat::VoiceState::Idle);
+                                            voice_incoming_handle.set(None);
+                                        }
+                                        _ => {}
+                                    }
                                     continue;
                                 }
                                 _ => {}
@@ -1074,15 +1132,56 @@ fn app() -> Element {
                                                 li {
                                                     div {
                                                         class: "row",
-                                                        style: "display: flex; align-items: center;",
-                                                        if !symbol.is_empty() {
+                                                        style: "display: flex; align-items: center; justify-content: space-between;",
+                                                        div {
+                                                            style: "display: flex; align-items: center;",
+                                                            if !symbol.is_empty() {
+                                                                span {
+                                                                    style: "color: {color}; margin-right: 6px; font-weight: bold;",
+                                                                    "{symbol}"
+                                                                }
+                                                            }
                                                             span {
-                                                                style: "color: {color}; margin-right: 6px; font-weight: bold;",
-                                                                "{symbol}"
+                                                                "{username}"
                                                             }
                                                         }
-                                                        span {
-                                                            "{username}"
+                                                        // Voice call button (only if not in a call and not our own nick)
+                                                        {
+                                                            let user_nick = username.to_string();
+                                                            let can_call = matches!(voice_state(), crate::voice_chat::VoiceState::Idle);
+                                                            rsx! {
+                                                                if can_call {
+                                                                    button {
+                                                                        class: "voice-call-btn",
+                                                                        style: "background: none; border: none; cursor: pointer; padding: 2px 6px; font-size: 12px; opacity: 0.6; transition: opacity 0.2s;",
+                                                                        title: "Start voice call with {user_nick}",
+                                                                        onclick: {
+                                                                            let nick = user_nick.clone();
+                                                                            move |_| {
+                                                                                // Generate session ID and get local IP
+                                                                                let session_id = crate::voice_chat::VoiceChatManager::generate_session_id();
+                                                                                let local_ip = crate::voice_chat::get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
+                                                                                let local_port = voice_local_port();
+                                                                                
+                                                                                // Update voice state
+                                                                                voice_state.set(crate::voice_chat::VoiceState::Outgoing { peer: nick.clone() });
+                                                                                voice_session_id.set(Some(session_id.clone()));
+                                                                                voice_current_peer.set(Some(nick.clone()));
+                                                                                
+                                                                                // Send CTCP VOICE_CALL via IRC
+                                                                                let ctcp_msg = crate::voice_chat::create_voice_call_ctcp(&local_ip, if local_port > 0 { local_port } else { 5000 }, &session_id);
+                                                                                if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                    let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                                                        target: nick.clone(),
+                                                                                        message: ctcp_msg,
+                                                                                    });
+                                                                                }
+                                                                            }
+                                                                        },
+                                                                        "📞"
+                                                                    }
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -1096,6 +1195,171 @@ fn app() -> Element {
                     }
                 }
             }
+                }
+            }
+
+            // Voice chat incoming call notification
+            if let Some((from, ip, port, session_id)) = voice_incoming_call() {
+                div {
+                    class: "voice-incoming-call",
+                    style: "position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: var(--input-bg); border: 2px solid var(--accent-color); border-radius: 12px; padding: 24px; z-index: 1000; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.5);",
+                    h3 {
+                        style: "margin: 0 0 12px 0; color: var(--accent-color);",
+                        "📞 Incoming Voice Call"
+                    }
+                    p {
+                        style: "margin: 0 0 16px 0;",
+                        "{from} wants to start a voice call"
+                    }
+                    div {
+                        style: "display: flex; gap: 12px; justify-content: center;",
+                        button {
+                            style: "background: #4CAF50; color: white; border: none; padding: 12px 24px; border-radius: 8px; cursor: pointer; font-size: 16px;",
+                            onclick: {
+                                let from_user = from.clone();
+                                let _caller_ip = ip.clone();
+                                let _caller_port = port;
+                                let sid = session_id.clone();
+                                move |_| {
+                                    // Accept the call
+                                    let local_ip = crate::voice_chat::get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
+                                    let local_port = voice_local_port();
+                                    
+                                    // Send CTCP VOICE_ACCEPT
+                                    let ctcp_msg = crate::voice_chat::create_voice_accept_ctcp(&local_ip, if local_port > 0 { local_port } else { 5000 }, &sid);
+                                    if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                            target: from_user.clone(),
+                                            message: ctcp_msg,
+                                        });
+                                    }
+                                    
+                                    // Update state to active
+                                    voice_state.set(crate::voice_chat::VoiceState::Active { peer: from_user.clone() });
+                                    voice_current_peer.set(Some(from_user.clone()));
+                                    voice_session_id.set(Some(sid.clone()));
+                                    voice_incoming_call.set(None);
+                                }
+                            },
+                            "✓ Accept"
+                        }
+                        button {
+                            style: "background: #f44336; color: white; border: none; padding: 12px 24px; border-radius: 8px; cursor: pointer; font-size: 16px;",
+                            onclick: {
+                                let from_user = from.clone();
+                                let sid = session_id.clone();
+                                move |_| {
+                                    // Reject the call
+                                    let ctcp_msg = crate::voice_chat::create_voice_reject_ctcp(&sid, "User declined");
+                                    if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                            target: from_user.clone(),
+                                            message: ctcp_msg,
+                                        });
+                                    }
+                                    
+                                    voice_state.set(crate::voice_chat::VoiceState::Idle);
+                                    voice_incoming_call.set(None);
+                                }
+                            },
+                            "✗ Decline"
+                        }
+                    }
+                }
+            }
+
+            // Voice chat active call overlay
+            if let crate::voice_chat::VoiceState::Active { peer } = voice_state() {
+                div {
+                    class: "voice-active-call",
+                    style: "position: fixed; bottom: 80px; right: 20px; background: var(--input-bg); border: 1px solid var(--accent-color); border-radius: 12px; padding: 16px; z-index: 999; min-width: 200px; box-shadow: 0 4px 16px rgba(0,0,0,0.3);",
+                    div {
+                        style: "display: flex; align-items: center; gap: 8px; margin-bottom: 12px;",
+                        span {
+                            style: "color: #4CAF50; animation: pulse 2s infinite;",
+                            "●"
+                        }
+                        span {
+                            style: "font-weight: bold;",
+                            "Voice call with {peer}"
+                        }
+                    }
+                    div {
+                        style: "display: flex; gap: 8px; justify-content: center;",
+                        {
+                            let mute_bg = if voice_muted() { "#f44336" } else { "#333" };
+                            rsx! {
+                                button {
+                                    style: "background: {mute_bg}; color: white; border: none; padding: 8px 16px; border-radius: 8px; cursor: pointer;",
+                                    onclick: move |_| {
+                                        voice_muted.set(!voice_muted());
+                                    },
+                                    if voice_muted() { "🔇 Unmute" } else { "🎤 Mute" }
+                                }
+                            }
+                        }
+                        button {
+                            style: "background: #f44336; color: white; border: none; padding: 8px 16px; border-radius: 8px; cursor: pointer;",
+                            onclick: {
+                                let peer_nick = peer.clone();
+                                move |_| {
+                                    // End the call
+                                    if let Some(sid) = voice_session_id() {
+                                        let ctcp_msg = crate::voice_chat::create_voice_cancel_ctcp(&sid);
+                                        if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                            let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                target: peer_nick.clone(),
+                                                message: ctcp_msg,
+                                            });
+                                        }
+                                    }
+                                    
+                                    voice_state.set(crate::voice_chat::VoiceState::Idle);
+                                    voice_current_peer.set(None);
+                                    voice_session_id.set(None);
+                                }
+                            },
+                            "📵 End Call"
+                        }
+                    }
+                }
+            }
+
+            // Voice chat outgoing call indicator
+            if let crate::voice_chat::VoiceState::Outgoing { peer } = voice_state() {
+                div {
+                    class: "voice-outgoing-call",
+                    style: "position: fixed; bottom: 80px; right: 20px; background: var(--input-bg); border: 1px solid var(--accent-color); border-radius: 12px; padding: 16px; z-index: 999; min-width: 200px; box-shadow: 0 4px 16px rgba(0,0,0,0.3);",
+                    div {
+                        style: "text-align: center;",
+                        p {
+                            style: "margin: 0 0 12px 0;",
+                            "📞 Calling {peer}..."
+                        }
+                        button {
+                            style: "background: #f44336; color: white; border: none; padding: 8px 16px; border-radius: 8px; cursor: pointer;",
+                            onclick: {
+                                let peer_nick = peer.clone();
+                                move |_| {
+                                    // Cancel the call
+                                    if let Some(sid) = voice_session_id() {
+                                        let ctcp_msg = crate::voice_chat::create_voice_cancel_ctcp(&sid);
+                                        if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                            let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                target: peer_nick.clone(),
+                                                message: ctcp_msg,
+                                            });
+                                        }
+                                    }
+                                    
+                                    voice_state.set(crate::voice_chat::VoiceState::Idle);
+                                    voice_current_peer.set(None);
+                                    voice_session_id.set(None);
+                                }
+                            },
+                            "Cancel"
+                        }
+                    }
                 }
             }
 
@@ -1266,6 +1530,10 @@ fn app() -> Element {
                                                 last_used,
                                                 force_scroll_to_bottom,
                                                 default_nick.read().clone(),
+                                                voice_state,
+                                                voice_session_id,
+                                                voice_current_peer,
+                                                voice_local_port,
                                             );
                                         }
                                     }
@@ -1349,6 +1617,10 @@ fn app() -> Element {
                                         last_used,
                                         force_scroll_to_bottom,
                                         default_nick.read().clone(),
+                                        voice_state,
+                                        voice_session_id,
+                                        voice_current_peer,
+                                        voice_local_port,
                                     );
                                 }
                             }
@@ -2100,6 +2372,10 @@ fn handle_send_message(
     last_used: Signal<Option<String>>,
     mut force_scroll_to_bottom: Signal<bool>,
     default_nick: Option<String>,
+    mut voice_state: Signal<crate::voice_chat::VoiceState>,
+    mut voice_session_id: Signal<Option<String>>,
+    mut voice_current_peer: Signal<Option<String>>,
+    voice_local_port: Signal<u16>,
 ) {
     let text = text.trim().to_string();
     if text.is_empty() {
@@ -2546,6 +2822,108 @@ fn handle_send_message(
                         text: status_text,
                     },
                 );
+            }
+            "/voice" | "/call" => {
+                // Voice call command: /voice <nickname>
+                if arg.is_empty() {
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel: channel.clone(),
+                            text: "Usage: /voice <nickname> - Start a voice call with a user".to_string(),
+                        },
+                    );
+                } else {
+                    let target_nick = arg.clone();
+                    // Check if already in a call
+                    let current_voice_state = voice_state();
+                    if !matches!(current_voice_state, crate::voice_chat::VoiceState::Idle) {
+                        apply_event_with_config(
+                            &mut state.write(),
+                            &profiles.read(),
+                            &active_profile,
+                            IrcEvent::System {
+                                channel: channel.clone(),
+                                text: "Already in a voice call. End the current call first.".to_string(),
+                            },
+                        );
+                    } else {
+                        // Generate session ID and get local IP
+                        let session_id = crate::voice_chat::VoiceChatManager::generate_session_id();
+                        let local_ip = crate::voice_chat::get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string());
+                        let local_port = voice_local_port();
+                        
+                        // Update voice state
+                        voice_state.set(crate::voice_chat::VoiceState::Outgoing { peer: target_nick.clone() });
+                        voice_session_id.set(Some(session_id.clone()));
+                        voice_current_peer.set(Some(target_nick.clone()));
+                        
+                        // Send CTCP VOICE_CALL via IRC
+                        let ctcp_msg = crate::voice_chat::create_voice_call_ctcp(&local_ip, if local_port > 0 { local_port } else { 5000 }, &session_id);
+                        if let Some(h) = handle.as_ref() {
+                            let _ = h.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                target: target_nick.clone(),
+                                message: ctcp_msg,
+                            });
+                        }
+                        
+                        apply_event_with_config(
+                            &mut state.write(),
+                            &profiles.read(),
+                            &active_profile,
+                            IrcEvent::System {
+                                channel: channel.clone(),
+                                text: format!("Calling {}...", target_nick),
+                            },
+                        );
+                    }
+                }
+            }
+            "/hangup" | "/endcall" => {
+                // End current voice call
+                let current_voice_state = voice_state();
+                match current_voice_state {
+                    crate::voice_chat::VoiceState::Active { peer } |
+                    crate::voice_chat::VoiceState::Outgoing { peer } => {
+                        // Send cancel CTCP
+                        if let Some(sid) = voice_session_id() {
+                            let ctcp_msg = crate::voice_chat::create_voice_cancel_ctcp(&sid);
+                            if let Some(h) = handle.as_ref() {
+                                let _ = h.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                    target: peer.clone(),
+                                    message: ctcp_msg,
+                                });
+                            }
+                        }
+                        
+                        voice_state.set(crate::voice_chat::VoiceState::Idle);
+                        voice_current_peer.set(None);
+                        voice_session_id.set(None);
+                        
+                        apply_event_with_config(
+                            &mut state.write(),
+                            &profiles.read(),
+                            &active_profile,
+                            IrcEvent::System {
+                                channel: channel.clone(),
+                                text: "Voice call ended.".to_string(),
+                            },
+                        );
+                    }
+                    _ => {
+                        apply_event_with_config(
+                            &mut state.write(),
+                            &profiles.read(),
+                            &active_profile,
+                            IrcEvent::System {
+                                channel: channel.clone(),
+                                text: "No active voice call.".to_string(),
+                            },
+                        );
+                    }
+                }
             }
             _ => {
                 apply_event_with_config(
