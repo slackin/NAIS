@@ -1426,14 +1426,37 @@ impl VoiceChatManager {
 }
 
 /// Create CTCP message for voice call request
-/// Returns: (CTCP command string, IP, port) to be sent via IRC PRIVMSG
+/// Format: VOICE_CALL <ext_ip> <port> <session_id> [<local_ip>]
+/// The local_ip is optional and used for same-LAN detection
 pub fn create_voice_call_ctcp(ip: &str, port: u16, session_id: &str) -> String {
-    format!("\x01{} {} {} {}\x01", CTCP_VOICE_CALL, ip, port, session_id)
+    // Include local IP for same-LAN detection
+    let local_ip = get_local_ip().unwrap_or_default();
+    format!("\x01{} {} {} {} {}\x01", CTCP_VOICE_CALL, ip, port, session_id, local_ip)
 }
 
-/// Create CTCP message for accepting a voice call
+/// Create CTCP message for accepting a voice call  
+/// Format: VOICE_ACCEPT <ext_ip> <port> <session_id> [<local_ip>]
 pub fn create_voice_accept_ctcp(ip: &str, port: u16, session_id: &str) -> String {
-    format!("\x01{} {} {} {}\x01", CTCP_VOICE_ACCEPT, ip, port, session_id)
+    // Include local IP for same-LAN detection
+    let local_ip = get_local_ip().unwrap_or_default();
+    format!("\x01{} {} {} {} {}\x01", CTCP_VOICE_ACCEPT, ip, port, session_id, local_ip)
+}
+
+/// Determine the best IP to connect to a peer.
+/// If both peers share the same external IP (same LAN), use local IP.
+/// Otherwise use the external IP.
+pub fn resolve_peer_address(peer_ext_ip: &str, peer_local_ip: Option<&str>, our_ext_ip: &str) -> String {
+    // Check if we're on the same LAN (same external IP)
+    if peer_ext_ip == our_ext_ip {
+        if let Some(local_ip) = peer_local_ip {
+            if !local_ip.is_empty() {
+                log::info!("Same-LAN detected (both have external IP {}), using local IP {}", our_ext_ip, local_ip);
+                return local_ip.to_string();
+            }
+        }
+        log::warn!("Same external IP but no local IP provided - NAT hairpinning may fail");
+    }
+    peer_ext_ip.to_string()
 }
 
 /// Create CTCP message for rejecting a voice call
@@ -1760,6 +1783,175 @@ pub fn start_voice_chat(config: VoiceConfig) -> VoiceChatHandle {
     VoiceChatHandle { cmd_tx, evt_rx }
 }
 
+/// Bidirectional voice connection - tries both connecting outbound AND listening for inbound
+/// This handles double-NAT scenarios where neither side can connect to the other directly.
+/// Also handles same-LAN scenarios where both peers have the same external IP.
+/// Returns (our_external_ip, our_external_port, event receiver, stop flag)
+/// The caller should send their IP:port to the peer for reverse connection attempts.
+///
+/// Parameters:
+/// - peer_ext_ip: Peer's external IP address
+/// - peer_local_ip: Peer's local/private IP (optional, for same-LAN detection)
+/// - peer_port: Port to connect to
+/// - config: Voice configuration
+/// - muted: Mute state
+pub fn connect_voice_bidirectional(
+    peer_ext_ip: &str,
+    peer_local_ip: Option<&str>,
+    peer_port: u16,
+    config: VoiceConfig,
+    muted: Arc<Mutex<bool>>,
+) -> Option<(String, u16, async_channel::Receiver<VoiceEvent>, Arc<Mutex<bool>>)> {
+    let peer_ext = peer_ext_ip.to_string();
+    let peer_local = peer_local_ip.map(|s| s.to_string());
+    let (evt_tx, evt_rx) = async_channel::unbounded();
+    let stop_flag = Arc::new(Mutex::new(false));
+    
+    // Channel to receive our external address info
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel::<(String, u16)>();
+    
+    let config_clone = config.clone();
+    let evt_tx_clone = evt_tx.clone();
+    let muted_clone = muted.clone();
+    let stop_flag_clone = stop_flag.clone();
+    
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("voice bidirectional runtime");
+        rt.block_on(async move {
+            log::info!("=== Starting bidirectional voice connection ===");
+            log::info!("Target peer external: {}:{}", peer_ext, peer_port);
+            if let Some(ref local) = peer_local {
+                log::info!("Target peer local IP: {}", local);
+            }
+            
+            // First, set up our own listener with UPnP
+            let listener = match TcpListener::bind("0.0.0.0:0").await {
+                Ok(l) => l,
+                Err(e) => {
+                    log::error!("Failed to bind listener: {}", e);
+                    let _ = addr_tx.send(("".to_string(), 0));
+                    return;
+                }
+            };
+            
+            let local_port = listener.local_addr().unwrap().port();
+            log::info!("Local listener bound to port {}", local_port);
+            
+            // Set up UPnP for our listener
+            let (our_external_ip, our_external_port, _upnp) = setup_voice_address(local_port);
+            log::info!("Our address for peer to connect: {}:{}", our_external_ip, our_external_port);
+            
+            // Resolve the peer address: use local IP if same LAN
+            let resolved_peer_ip = resolve_peer_address(&peer_ext, peer_local.as_deref(), &our_external_ip);
+            let peer_addr = format!("{}:{}", resolved_peer_ip, peer_port);
+            log::info!("Resolved peer address: {}", peer_addr);
+            
+            // Give UPnP a moment to propagate
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            
+            // Send our address back so it can be communicated to peer
+            let _ = addr_tx.send((our_external_ip.clone(), our_external_port));
+            
+            // Now race: try to connect outbound WHILE also accepting inbound
+            log::info!("Racing: outbound to {} vs inbound on {}", peer_addr, local_port);
+            
+            let config_out = config_clone.clone();
+            let config_in = config_clone.clone();
+            let muted_out = muted_clone.clone();
+            let muted_in = muted_clone.clone();
+            let stop_out = stop_flag_clone.clone();
+            let stop_in = stop_flag_clone.clone();
+            let evt_out = evt_tx_clone.clone();
+            let evt_in = evt_tx_clone.clone();
+            let peer_for_connect = peer_addr.clone();
+            
+            tokio::select! {
+                // Try to connect outbound with retries
+                result = async {
+                    let retry_delays = [100, 500, 1000, 2000, 3000];
+                    for (attempt, delay_ms) in retry_delays.iter().enumerate() {
+                        log::info!("Outbound attempt {} to {}", attempt + 1, peer_for_connect);
+                        
+                        match tokio::time::timeout(
+                            tokio::time::Duration::from_secs(3),
+                            TcpStream::connect(&peer_for_connect)
+                        ).await {
+                            Ok(Ok(stream)) => {
+                                log::info!("*** OUTBOUND connection succeeded to {} ***", peer_for_connect);
+                                return Some(stream);
+                            }
+                            Ok(Err(e)) => {
+                                log::debug!("Outbound attempt {} failed: {}", attempt + 1, e);
+                            }
+                            Err(_) => {
+                                log::debug!("Outbound attempt {} timed out", attempt + 1);
+                            }
+                        }
+                        
+                        if attempt < retry_delays.len() - 1 {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(*delay_ms as u64)).await;
+                        }
+                    }
+                    None
+                } => {
+                    if let Some(stream) = result {
+                        let addr = stream.peer_addr().unwrap_or_else(|_| peer_for_connect.parse().unwrap());
+                        let _ = handle_voice_connection(
+                            stream, addr, evt_out,
+                            Arc::new(Mutex::new(VoiceState::Active { peer: "remote".to_string() })),
+                            muted_out, config_out, stop_out,
+                        ).await;
+                    } else {
+                        log::warn!("All outbound attempts failed, waiting for inbound...");
+                        // Continue waiting for inbound in the other branch
+                        match listener.accept().await {
+                            Ok((stream, addr)) => {
+                                log::info!("*** INBOUND connection from {} (fallback) ***", addr);
+                                let _ = handle_voice_connection(
+                                    stream, addr, evt_in,
+                                    Arc::new(Mutex::new(VoiceState::Active { peer: addr.to_string() })),
+                                    muted_in, config_in, stop_in,
+                                ).await;
+                            }
+                            Err(e) => {
+                                log::error!("Both outbound and inbound failed: {}", e);
+                                let _ = evt_tx_clone.send(VoiceEvent::Error {
+                                    message: "Connection failed in both directions".to_string(),
+                                }).await;
+                            }
+                        }
+                    }
+                }
+                
+                // Accept inbound connection
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, addr)) => {
+                            log::info!("*** INBOUND connection from {} ***", addr);
+                            let _ = handle_voice_connection(
+                                stream, addr, evt_in,
+                                Arc::new(Mutex::new(VoiceState::Active { peer: addr.to_string() })),
+                                muted_in, config_in, stop_in,
+                            ).await;
+                        }
+                        Err(e) => {
+                            log::error!("Inbound accept failed: {}", e);
+                        }
+                    }
+                }
+            }
+        });
+    });
+    
+    // Wait for our address info
+    match addr_rx.recv_timeout(std::time::Duration::from_secs(15)) {
+        Ok((ip, port)) if port > 0 => {
+            Some((ip, port, evt_rx, stop_flag))
+        }
+        _ => None,
+    }
+}
+
 /// Initiate an outgoing voice connection to a peer
 /// Returns (event receiver, stop flag)
 /// Set the stop flag to true to terminate the voice connection
@@ -1843,14 +2035,18 @@ pub fn connect_voice_call(
 }
 
 /// Start listening for incoming voice connections (used when initiating a call)
-/// Returns (external_ip, external_port, event receiver, stop flag)
+/// Returns (external_ip, external_port, event receiver, stop flag, peer_address_sender)
+/// The peer_address_sender can be used to tell the listener to also try connecting to a peer
 /// Set the stop flag to true to terminate the voice connection
 pub fn start_voice_listener(
     config: VoiceConfig,
     muted: Arc<Mutex<bool>>,
-) -> Option<(String, u16, async_channel::Receiver<VoiceEvent>, Arc<Mutex<bool>>)> {
+) -> Option<(String, u16, async_channel::Receiver<VoiceEvent>, Arc<Mutex<bool>>, async_channel::Sender<(String, u16)>)> {
     let (evt_tx, evt_rx) = async_channel::unbounded();
     let stop_flag = Arc::new(Mutex::new(false));
+    
+    // Channel for receiving peer address to try reverse connection
+    let (peer_addr_tx, peer_addr_rx) = async_channel::bounded::<(String, u16)>(1);
     
     let config_clone = config.clone();
     let evt_tx_clone = evt_tx.clone();
@@ -1883,7 +2079,6 @@ pub fn start_voice_listener(
                         external_ip, external_port, local_port, upnp_status);
                     
                     // Give UPnP mapping a moment to propagate through the router
-                    // Some routers need a brief delay before the mapping is active
                     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
                     log::info!("Voice listener now accepting connections on port {} (external: {}:{})", 
                         local_port, external_ip, external_port);
@@ -1891,26 +2086,131 @@ pub fn start_voice_listener(
                     // Send the address info back
                     let _ = addr_tx.send((external_ip.clone(), external_port, local_port));
                     
-                    // Wait for one incoming connection with logging
-                    log::info!("Waiting for incoming voice connection from remote peer...");
-                    match listener.accept().await {
-                        Ok((stream, addr)) => {
-                            log::info!("Voice connection accepted from {}", addr);
-                            let _ = handle_voice_connection(
-                                stream,
-                                addr,
-                                evt_tx_clone,
-                                Arc::new(Mutex::new(VoiceState::Active { peer: addr.to_string() })),
-                                muted_clone,
-                                config_clone,
-                                stop_flag_clone,
-                            ).await;
+                    // Wait for either:
+                    // 1. An incoming connection
+                    // 2. A peer address to try connecting to (reverse connection)
+                    log::info!("Waiting for voice connection (inbound or reverse outbound)...");
+                    
+                    let config_in = config_clone.clone();
+                    let config_out = config_clone.clone();
+                    let muted_in = muted_clone.clone();
+                    let muted_out = muted_clone.clone();
+                    let stop_in = stop_flag_clone.clone();
+                    let stop_out = stop_flag_clone.clone();
+                    let evt_in = evt_tx_clone.clone();
+                    let evt_out = evt_tx_clone.clone();
+                    
+                    tokio::select! {
+                        // Accept incoming connection
+                        result = listener.accept() => {
+                            match result {
+                                Ok((stream, addr)) => {
+                                    log::info!("*** INBOUND voice connection from {} ***", addr);
+                                    let _ = handle_voice_connection(
+                                        stream,
+                                        addr,
+                                        evt_in,
+                                        Arc::new(Mutex::new(VoiceState::Active { peer: addr.to_string() })),
+                                        muted_in,
+                                        config_in,
+                                        stop_in,
+                                    ).await;
+                                }
+                                Err(e) => {
+                                    log::error!("Voice accept error: {}", e);
+                                    let _ = evt_tx_clone.send(VoiceEvent::Error {
+                                        message: format!("Accept failed: {}", e),
+                                    }).await;
+                                }
+                            }
                         }
-                        Err(e) => {
-                            log::error!("Voice accept error: {}", e);
-                            let _ = evt_tx_clone.send(VoiceEvent::Error {
-                                message: format!("Accept failed: {}", e),
-                            }).await;
+                        
+                        // Receive peer address and try reverse connection
+                        result = peer_addr_rx.recv() => {
+                            if let Ok((peer_ip, peer_port)) = result {
+                                log::info!("Received peer address, attempting reverse connection to {}:{}", peer_ip, peer_port);
+                                let peer_addr = format!("{}:{}", peer_ip, peer_port);
+                                
+                                // Race between inbound and outbound
+                                let listen_future = listener.accept();
+                                let connect_future = async {
+                                    let retry_delays = [100, 300, 500, 1000, 2000];
+                                    for (attempt, delay_ms) in retry_delays.iter().enumerate() {
+                                        log::info!("Reverse connection attempt {} to {}", attempt + 1, peer_addr);
+                                        
+                                        match tokio::time::timeout(
+                                            tokio::time::Duration::from_secs(3),
+                                            TcpStream::connect(&peer_addr)
+                                        ).await {
+                                            Ok(Ok(stream)) => {
+                                                return Some(stream);
+                                            }
+                                            Ok(Err(e)) => {
+                                                log::debug!("Reverse attempt {} failed: {}", attempt + 1, e);
+                                            }
+                                            Err(_) => {
+                                                log::debug!("Reverse attempt {} timed out", attempt + 1);
+                                            }
+                                        }
+                                        
+                                        if attempt < retry_delays.len() - 1 {
+                                            tokio::time::sleep(tokio::time::Duration::from_millis(*delay_ms as u64)).await;
+                                        }
+                                    }
+                                    None
+                                };
+                                
+                                tokio::select! {
+                                    result = listen_future => {
+                                        match result {
+                                            Ok((stream, addr)) => {
+                                                log::info!("*** INBOUND won race (from {}) ***", addr);
+                                                let _ = handle_voice_connection(
+                                                    stream, addr, evt_in,
+                                                    Arc::new(Mutex::new(VoiceState::Active { peer: addr.to_string() })),
+                                                    muted_in, config_in, stop_in,
+                                                ).await;
+                                            }
+                                            Err(e) => {
+                                                log::error!("Accept failed during race: {}", e);
+                                            }
+                                        }
+                                    }
+                                    result = connect_future => {
+                                        if let Some(stream) = result {
+                                            let addr = stream.peer_addr().unwrap_or_else(|_| peer_addr.parse().unwrap());
+                                            log::info!("*** OUTBOUND won race (to {}) ***", peer_addr);
+                                            let _ = handle_voice_connection(
+                                                stream, addr, evt_out,
+                                                Arc::new(Mutex::new(VoiceState::Active { peer: "remote".to_string() })),
+                                                muted_out, config_out, stop_out,
+                                            ).await;
+                                        } else {
+                                            log::error!("Reverse connection failed, waiting for inbound...");
+                                            // Wait longer for inbound
+                                            match tokio::time::timeout(
+                                                tokio::time::Duration::from_secs(30),
+                                                listener.accept()
+                                            ).await {
+                                                Ok(Ok((stream, addr))) => {
+                                                    log::info!("Late inbound connection from {}", addr);
+                                                    let _ = handle_voice_connection(
+                                                        stream, addr, evt_in,
+                                                        Arc::new(Mutex::new(VoiceState::Active { peer: addr.to_string() })),
+                                                        muted_in, config_in, stop_in,
+                                                    ).await;
+                                                }
+                                                _ => {
+                                                    log::error!("All connection attempts failed");
+                                                    let _ = evt_tx_clone.send(VoiceEvent::Error {
+                                                        message: "Connection failed in both directions".to_string(),
+                                                    }).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1923,9 +2223,9 @@ pub fn start_voice_listener(
     });
     
     // Wait for the address info (allow more time for UPnP setup)
-    match addr_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+    match addr_rx.recv_timeout(std::time::Duration::from_secs(15)) {
         Ok((external_ip, external_port, _local_port)) if external_port > 0 => {
-            Some((external_ip, external_port, evt_rx, stop_flag))
+            Some((external_ip, external_port, evt_rx, stop_flag, peer_addr_tx))
         }
         _ => None,
     }
