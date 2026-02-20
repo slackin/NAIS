@@ -3123,29 +3123,36 @@ fn app() -> Element {
                                                 let is_nais_channel = channel_opt.is_nais;
                                                 let is_cross_server = profile != info.current_profile;
                                                 let is_nais_client = info.is_nais_client;
+                                                // For cross-server invites, send CTCP on the profile where we can reach the user
+                                                let send_profile = info.current_profile.clone();
                                                 
                                                 rsx! {
                                                     button {
-                                                        style: "display: flex; align-items: center; gap: 8px; padding: 10px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; text-align: left; width: 100%; transition: background 0.15s;",
+                                                        style: "display: flex; align-items: center; gap: 8px; padding: 10px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; text-align: left; width: 100%; transition: background 0.15s; color: var(--text);",
                                                         onclick: move |_| {
                                                             channel_invite_popup.set(None);
                                                             
                                                             if is_nais_client && (is_cross_server || is_nais_channel) {
                                                                 // Send NAIS channel invite CTCP with full info
+                                                                // Must send via the profile where we can reach the target user
                                                                 let invite_msg = format!(
                                                                     "\x01NAIS_CHANNEL_INVITE {} {} {}\x01",
                                                                     channel,
                                                                     server,
                                                                     if is_nais_channel { "nais" } else { "irc" }
                                                                 );
-                                                                if let Some(core) = cores.read().get(&profile) {
+                                                                log::info!("Sending NAIS_CHANNEL_INVITE to {} via profile '{}': channel={}, server={}", 
+                                                                    target_nick, send_profile, channel, server);
+                                                                if let Some(core) = cores.read().get(&send_profile) {
                                                                     let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
                                                                         target: target_nick.clone(),
                                                                         message: invite_msg,
                                                                     });
+                                                                } else {
+                                                                    log::error!("No core found for profile '{}' to send invite", send_profile);
                                                                 }
                                                             } else {
-                                                                // Standard IRC invite
+                                                                // Standard IRC invite - send on the channel's profile
                                                                 if let Some(core) = cores.read().get(&profile) {
                                                                     let _ = core.cmd_tx.try_send(IrcCommandEvent::Invite {
                                                                         nickname: target_nick.clone(),
