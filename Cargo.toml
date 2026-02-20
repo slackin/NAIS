@@ -9,8 +9,8 @@ desktop = ["dioxus/desktop", "dep:rfd", "dep:arboard"]
 mobile = ["dioxus/mobile"]
 
 [dependencies]
-tokio02 = { package = "tokio", version = "0.2", features = ["rt-threaded", "macros", "time", "io-util", "tcp"] }
-irc = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "net"] }
+irc = "0.15"
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"

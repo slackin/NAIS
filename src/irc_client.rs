@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
 use std::time::Duration;
-use tokio02::runtime::Runtime;
+use tokio::runtime::Runtime;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionStatus {
@@ -615,7 +615,7 @@ async fn handle_connection(
     let mut auto_joined = false;
 
     loop {
-        tokio02::select! {
+        tokio::select! {
             command = cmd_rx.recv() => {
                 let Some(command) = command.ok() else { break; };
                 match command {
@@ -860,7 +860,7 @@ async fn handle_connection(
                         }
                         
                         // Add a small delay to prevent tight error loop
-                        tokio02::time::delay_for(Duration::from_millis(100)).await;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
                 };

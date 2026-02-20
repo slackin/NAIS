@@ -4,8 +4,8 @@ use async_channel::{Receiver, Sender};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use tokio02::net::{TcpListener, TcpStream};
-use tokio02::prelude::*;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[allow(unused_imports)]
 use std::time::Duration;
 
@@ -532,7 +532,7 @@ pub fn start_voice_chat(config: VoiceConfig) -> VoiceChatHandle {
     
     // Spawn voice chat task
     std::thread::spawn(move || {
-        let mut runtime = tokio02::runtime::Runtime::new().expect("tokio runtime for voice chat");
+        let mut runtime = tokio::runtime::Runtime::new().expect("tokio runtime for voice chat");
         runtime.block_on(async move {
             let core = VoiceChatCore::new(config, cmd_rx, evt_tx.clone());
             let _ = voice_chat_loop(core).await;
@@ -551,7 +551,7 @@ async fn voice_chat_loop(core: VoiceChatCore) -> Result<(), Box<dyn std::error::
     log::info!("Voice chat listening on {}", local_addr);
     
     loop {
-        tokio02::select! {
+        tokio::select! {
             // Handle incoming commands
             cmd = core.cmd_rx.recv() => {
                 let Some(cmd) = cmd.ok() else { break; };
@@ -634,7 +634,7 @@ async fn voice_chat_loop(core: VoiceChatCore) -> Result<(), Box<dyn std::error::
                     let state = core.state.clone();
                     let muted = core.local_muted.clone();
                     let config = core.config.clone();
-                    tokio02::spawn(async move {
+                    tokio::spawn(async move {
                         let _ = handle_voice_connection(stream, addr, evt_tx, state, muted, config).await;
                     });
                 }
@@ -657,7 +657,7 @@ async fn handle_voice_connection(
     let mut buf = [0u8; 4096];
     
     loop {
-        tokio02::select! {
+        tokio::select! {
             result = stream.read(&mut buf) => {
                 let n = result?;
                 if n == 0 {
