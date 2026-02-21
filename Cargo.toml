@@ -45,3 +45,20 @@ biquad = "0.4"
 # NAT traversal
 igd-next = "0.15"
 tao = { version = "0.34.5", default-features = false }
+
+# Cryptography for secure channels
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+thiserror = "1"
+hex = "0.4"
+
+# QUIC Transport
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+bytes = "1"
