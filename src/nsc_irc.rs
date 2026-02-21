@@ -101,6 +101,12 @@ pub enum NscCtcpCommand {
     KeyPackage,
     /// Identity announcement
     Identity,
+    /// Request channel metadata sync
+    MetadataSync,
+    /// Channel metadata response
+    Metadata,
+    /// Acknowledgment message
+    Ack,
 }
 
 impl NscCtcpCommand {
@@ -117,6 +123,9 @@ impl NscCtcpCommand {
             Self::Presence => "NSC_PRESENCE",
             Self::KeyPackage => "NSC_KEYPACKAGE",
             Self::Identity => "NSC_IDENTITY",
+            Self::MetadataSync => "NSC_METADATA_SYNC",
+            Self::Metadata => "NSC_METADATA",
+            Self::Ack => "NSC_ACK",
         }
     }
 
@@ -133,6 +142,9 @@ impl NscCtcpCommand {
             "NSC_PRESENCE" => Some(Self::Presence),
             "NSC_KEYPACKAGE" => Some(Self::KeyPackage),
             "NSC_IDENTITY" => Some(Self::Identity),
+            "NSC_METADATA_SYNC" => Some(Self::MetadataSync),
+            "NSC_METADATA" => Some(Self::Metadata),
+            "NSC_ACK" => Some(Self::Ack),
             _ => None,
         }
     }
@@ -349,6 +361,114 @@ pub struct IdentityMessage {
     pub timestamp: u64,
     /// Signature over identity data
     pub signature: String,
+}
+
+/// Request for channel metadata synchronization
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MetadataSyncRequest {
+    /// Channel ID (hex)
+    pub channel_id: String,
+    /// Our current metadata version (0 if we have none)
+    pub current_version: u64,
+    /// Requester's peer ID
+    pub requester: String,
+    /// Timestamp
+    pub timestamp: u64,
+}
+
+impl MetadataSyncRequest {
+    pub fn new(channel_id: &ChannelId, current_version: u64, requester: &PeerId) -> Self {
+        Self {
+            channel_id: channel_id.to_hex(),
+            current_version,
+            requester: requester.to_hex(),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }
+    }
+}
+
+/// Channel metadata response
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MetadataResponse {
+    /// Channel ID (hex)
+    pub channel_id: String,
+    /// Channel name
+    pub name: String,
+    /// Channel topic
+    pub topic: String,
+    /// Metadata version
+    pub version: u64,
+    /// Creator's peer ID
+    pub creator: String,
+    /// Admin peer IDs
+    pub admins: Vec<String>,
+    /// Member count
+    pub member_count: u32,
+    /// Whether discoverable
+    pub discoverable: bool,
+    /// Whether invite-only
+    pub invite_only: bool,
+    /// Previous hash (for chain validation)
+    pub previous_hash: Option<String>,
+    /// Signature over metadata
+    pub signature: String,
+    /// Timestamp
+    pub timestamp: u64,
+}
+
+impl MetadataResponse {
+    pub fn from_metadata(metadata: &ChannelMetadata, member_count: u32) -> Self {
+        Self {
+            channel_id: metadata.channel_id.to_hex(),
+            name: metadata.name.clone(),
+            topic: metadata.topic.clone(),
+            version: metadata.version,
+            creator: hex::encode(metadata.creator.0),
+            admins: metadata.admins.iter().map(|a| hex::encode(a.0)).collect(),
+            member_count,
+            discoverable: metadata.settings.discoverable,
+            invite_only: metadata.settings.invite_only,
+            previous_hash: metadata.previous_hash.map(|h| hex::encode(h)),
+            signature: hex::encode(metadata.signature),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }
+    }
+}
+
+/// Acknowledgment message for reliable delivery
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AckMessage {
+    /// Message ID being acknowledged
+    pub message_id: String,
+    /// Channel ID (hex)
+    pub channel_id: String,
+    /// Sequence number being acknowledged
+    pub sequence: u64,
+    /// Acknowledger's peer ID
+    pub from: String,
+    /// Timestamp
+    pub timestamp: u64,
+}
+
+impl AckMessage {
+    pub fn new(message_id: &str, channel_id: &ChannelId, sequence: u64, from: &PeerId) -> Self {
+        Self {
+            message_id: message_id.to_string(),
+            channel_id: channel_id.to_hex(),
+            sequence,
+            from: from.to_hex(),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }
+    }
 }
 
 // =============================================================================
@@ -953,6 +1073,26 @@ pub enum IrcSignalingEvent {
         nick: String,
         peer_id: Option<PeerId>,
     },
+    /// Metadata sync request received
+    MetadataSyncRequested {
+        from_nick: String,
+        channel_id: String,
+        current_version: u64,
+    },
+    /// Metadata response received
+    MetadataReceived {
+        from_nick: String,
+        channel_id: String,
+        version: u64,
+        name: String,
+        topic: String,
+    },
+    /// Acknowledgment received
+    AckReceived {
+        from_nick: String,
+        message_id: String,
+        timestamp: u64,
+    },
 }
 
 /// Commands to send via IRC signaling
@@ -1109,6 +1249,44 @@ impl IrcIntegrationBridge {
 
             NscCtcpCommand::KeyPackage => {
                 // Key package handling would go here
+                Ok(None)
+            }
+
+            NscCtcpCommand::MetadataSync => {
+                // Metadata sync request - respond with channel metadata if we have it
+                if let Ok(sync_req) = decode_metadata_sync_request(args) {
+                    let _ = self.event_tx.send(IrcSignalingEvent::MetadataSyncRequested {
+                        from_nick: from_nick.to_string(),
+                        channel_id: sync_req.channel_id,
+                        current_version: sync_req.current_version,
+                    }).await;
+                }
+                Ok(None)
+            }
+
+            NscCtcpCommand::Metadata => {
+                // Metadata response received
+                if let Ok(metadata) = decode_metadata_response(args) {
+                    let _ = self.event_tx.send(IrcSignalingEvent::MetadataReceived {
+                        from_nick: from_nick.to_string(),
+                        channel_id: metadata.channel_id,
+                        version: metadata.version,
+                        name: metadata.name,
+                        topic: metadata.topic,
+                    }).await;
+                }
+                Ok(None)
+            }
+
+            NscCtcpCommand::Ack => {
+                // Acknowledgment message received
+                if let Ok(ack) = decode_ack_message(args) {
+                    let _ = self.event_tx.send(IrcSignalingEvent::AckReceived {
+                        from_nick: from_nick.to_string(),
+                        message_id: ack.message_id,
+                        timestamp: ack.timestamp,
+                    }).await;
+                }
                 Ok(None)
             }
         }
@@ -1278,6 +1456,30 @@ fn decode_presence_message(args: &str) -> IrcResult<PresenceMessage> {
 
 /// Decode identity message
 fn decode_identity_message(args: &str) -> IrcResult<IdentityMessage> {
+    let json = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, args)
+        .map_err(|e| IrcIntegrationError::SerializationError(e.to_string()))?;
+    serde_json::from_slice(&json)
+        .map_err(|e| IrcIntegrationError::SerializationError(e.to_string()))
+}
+
+/// Decode metadata sync request
+fn decode_metadata_sync_request(args: &str) -> IrcResult<MetadataSyncRequest> {
+    let json = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, args)
+        .map_err(|e| IrcIntegrationError::SerializationError(e.to_string()))?;
+    serde_json::from_slice(&json)
+        .map_err(|e| IrcIntegrationError::SerializationError(e.to_string()))
+}
+
+/// Decode metadata response
+fn decode_metadata_response(args: &str) -> IrcResult<MetadataResponse> {
+    let json = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, args)
+        .map_err(|e| IrcIntegrationError::SerializationError(e.to_string()))?;
+    serde_json::from_slice(&json)
+        .map_err(|e| IrcIntegrationError::SerializationError(e.to_string()))
+}
+
+/// Decode ack message
+fn decode_ack_message(args: &str) -> IrcResult<AckMessage> {
     let json = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, args)
         .map_err(|e| IrcIntegrationError::SerializationError(e.to_string()))?;
     serde_json::from_slice(&json)

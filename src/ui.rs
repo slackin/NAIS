@@ -386,6 +386,90 @@ fn app() -> Element {
     // Voice network stats
     let mut voice_network_stats: Signal<crate::voice_chat::VoiceNetworkStats> = use_signal(|| crate::voice_chat::VoiceNetworkStats::new());
 
+    // Nais Secure Channel state
+    let mut show_new_nsc_modal = use_signal(|| false);
+    let mut nsc_channel_name_input = use_signal(|| String::new());
+    let mut nsc_channels: Signal<Vec<crate::nsc_manager::ChannelInfo>> = use_signal(Vec::new);
+    let mut nsc_loading = use_signal(|| false);
+    let mut nsc_fingerprint = use_signal(|| String::new());
+    // Currently selected NSC channel (None = IRC channel, Some(id) = NSC channel)
+    let mut nsc_current_channel: Signal<Option<String>> = use_signal(|| None);
+    // Messages for NSC channels: channel_id -> Vec<(timestamp, sender, text)>
+    let mut nsc_messages: Signal<HashMap<String, Vec<(u64, String, String)>>> = use_signal(HashMap::new);
+    // Pending NSC invites: invite_id -> PendingInvite
+    let mut nsc_pending_invites: Signal<Vec<crate::nsc_manager::PendingInvite>> = use_signal(Vec::new);
+    // Known NSC peers in current IRC channel
+    let mut nsc_peers_in_channel: Signal<Vec<String>> = use_signal(Vec::new);
+    
+    // Load existing NSC channels on startup
+    use_effect(move || {
+        spawn(async move {
+            let manager = crate::nsc_manager::get_nsc_manager();
+            let mgr = manager.read().await;
+            let channels = mgr.list_channels().await;
+            let fp = mgr.fingerprint();
+            drop(mgr);
+            
+            // Load stored messages for all channels
+            for channel in &channels {
+                let stored = crate::nsc_manager::load_messages(&channel.channel_id);
+                if !stored.is_empty() {
+                    let mut msgs = nsc_messages.write();
+                    let channel_msgs = msgs.entry(channel.channel_id.clone()).or_insert_with(Vec::new);
+                    for m in stored {
+                        channel_msgs.push((m.timestamp, m.sender, m.text));
+                    }
+                }
+            }
+            
+            nsc_channels.set(channels);
+            nsc_fingerprint.set(fp);
+        });
+    });
+    
+    // Initialize NSC transport and start listening for incoming messages
+    use_effect(move || {
+        spawn(async move {
+            let manager = crate::nsc_manager::get_nsc_manager();
+            
+            // Initialize transport
+            {
+                let mgr = manager.read().await;
+                if let Err(e) = mgr.init_transport().await {
+                    log::warn!("Failed to initialize NSC transport: {}", e);
+                    return;
+                }
+                
+                if let Some(port) = mgr.local_port().await {
+                    log::info!("NSC transport listening on port {}", port);
+                }
+            }
+            
+            // Start message listener
+            let mut rx = {
+                let mgr = manager.read().await;
+                match mgr.start_listener().await {
+                    Ok(rx) => rx,
+                    Err(e) => {
+                        log::warn!("Failed to start NSC listener: {}", e);
+                        return;
+                    }
+                }
+            };
+            
+            // Process incoming messages
+            while let Some((channel_id, msg)) = rx.recv().await {
+                log::debug!("Received NSC message in channel {}: {} chars from {}", 
+                    &channel_id[..8], msg.text.len(), msg.sender);
+                
+                // Add message to the appropriate channel
+                let mut msgs = nsc_messages.write();
+                let channel_msgs = msgs.entry(channel_id).or_insert_with(Vec::new);
+                channel_msgs.push((msg.timestamp, msg.sender, msg.text));
+            }
+        });
+    });
+
     // Update channel_users context when channel or user list changes
     use_effect(move || {
         let state_read = state.read();
@@ -977,6 +1061,43 @@ fn app() -> Element {
                                                     from, channel, server, channel_type);
                                             }
                                         }
+                                        cmd if cmd.starts_with("NSC_") => {
+                                            // Handle NSC (Nais Secure Channels) CTCP commands
+                                            let from_nick = from.clone();
+                                            let cmd_str = command.clone();
+                                            let args_str = args.join(" ");
+                                            let pname = profile_name.clone();
+                                            let cores_clone = cores.clone();
+                                            
+                                            // Get current IRC channel from state
+                                            let irc_channel = state_handle.read().servers.get(&profile_name)
+                                                .map(|s| s.current_channel.clone())
+                                                .unwrap_or_default();
+                                            
+                                            // Spawn async handler
+                                            spawn(async move {
+                                                let manager = crate::nsc_manager::get_nsc_manager();
+                                                let mgr = manager.read().await;
+                                                
+                                                if let Some(response) = mgr.handle_nsc_ctcp(&from_nick, &irc_channel, &cmd_str, &args_str).await {
+                                                    // Send CTCP response via NOTICE
+                                                    // Note: response already includes CTCP delimiters from encode_ctcp
+                                                    if let Some(core) = cores_clone.read().get(&pname) {
+                                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Notice {
+                                                            target: from_nick.clone(),
+                                                            text: response,
+                                                        });
+                                                    }
+                                                }
+                                                
+                                                // Refresh pending invites signal
+                                                let invites = mgr.get_pending_invites().await;
+                                                drop(mgr);
+                                                nsc_pending_invites.set(invites);
+                                            });
+                                            
+                                            log::debug!("NSC CTCP {} from {}: {:?}", command, from, args);
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -1005,6 +1126,33 @@ fn app() -> Element {
                                                             });
                                                         }
                                                     }
+                                                    
+                                                    // Also send NSC probes to discover NSC-capable peers
+                                                    let users_to_probe: Vec<String> = users.iter()
+                                                        .map(|u| u.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~').to_string())
+                                                        .filter(|u| u != &our_nick)
+                                                        .collect();
+                                                    let cores_clone = cores.clone();
+                                                    let pname = profile_name.clone();
+                                                    
+                                                    spawn(async move {
+                                                        let manager = crate::nsc_manager::get_nsc_manager();
+                                                        let mgr = manager.read().await;
+                                                        let nsc_probe = mgr.create_probe_ctcp();
+                                                        drop(mgr);
+                                                        
+                                                        if !nsc_probe.is_empty() {
+                                                            for clean_user in users_to_probe {
+                                                                if let Some(core) = cores_clone.read().get(&pname) {
+                                                                    let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                                        target: clean_user,
+                                                                        message: nsc_probe.clone(),
+                                                                    });
+                                                                }
+                                                            }
+                                                            log::info!("Sent NSC probes to channel users");
+                                                        }
+                                                    });
                                                     
                                                     // Add system message
                                                     drop(state_read);
@@ -1242,6 +1390,14 @@ fn app() -> Element {
                                 }
                             }
                         }
+                    }
+                    // Nais Secure Channel button
+                    button {
+                        class: "compact-btn nsc-btn",
+                        onclick: move |_| {
+                            show_new_nsc_modal.set(true);
+                        },
+                        "🔒 Secure"
                     }
                 }
             }
@@ -1644,6 +1800,8 @@ fn app() -> Element {
                                                         if let Some(server) = state.write().servers.get_mut(&active) {
                                                             server.current_channel = channel_clone.clone();
                                                         }
+                                                        // Clear NSC channel selection
+                                                        nsc_current_channel.set(None);
                                                         // Force scroll to bottom on channel change
                                                         force_scroll_to_bottom.set(true);
                                                         // Focus the chat input
@@ -1683,6 +1841,87 @@ fn app() -> Element {
                                 }
                             }
                         }
+                        
+                        // NSC Secure Channels section
+                        if !nsc_channels.read().is_empty() {
+                            li {
+                                style: "margin-top: 12px; padding-top: 8px; border-top: 1px solid var(--border);",
+                                if !channels_collapsed() {
+                                    div {
+                                        style: "font-size: 11px; color: var(--muted); padding: 4px 8px; text-transform: uppercase; letter-spacing: 0.5px;",
+                                        "🔒 Secure Channels"
+                                    }
+                                }
+                            }
+                            for channel in nsc_channels.read().iter().cloned() {
+                                {
+                                    let channel_id = channel.channel_id.clone();
+                                    let channel_id_click = channel.channel_id.clone();
+                                    let channel_id_load = channel.channel_id.clone();
+                                    let channel_name = channel.name.clone();
+                                    let is_active = nsc_current_channel.read().as_ref() == Some(&channel_id);
+                                    
+                                    rsx! {
+                                        li {
+                                            key: "{channel_id}",
+                                            button {
+                                                class: if is_active { "row active" } else { "row" },
+                                                onclick: move |_| {
+                                                    // Select this NSC channel
+                                                    nsc_current_channel.set(Some(channel_id_click.clone()));
+                                                    // Clear IRC channel selection
+                                                    let active = state.read().active_profile.clone();
+                                                    if let Some(server) = state.write().servers.get_mut(&active) {
+                                                        server.current_channel = String::new();
+                                                    }
+                                                    
+                                                    // Load stored messages for this channel if not already loaded
+                                                    let channel_id_inner = channel_id_load.clone();
+                                                    {
+                                                        let current_msgs = nsc_messages.read();
+                                                        if current_msgs.get(&channel_id_inner).map(|m| m.is_empty()).unwrap_or(true) {
+                                                            drop(current_msgs);
+                                                            // Load from storage
+                                                            let stored = crate::nsc_manager::load_messages(&channel_id_inner);
+                                                            if !stored.is_empty() {
+                                                                let mut msgs = nsc_messages.write();
+                                                                let channel_msgs = msgs.entry(channel_id_inner).or_insert_with(Vec::new);
+                                                                for m in stored {
+                                                                    channel_msgs.push((m.timestamp, m.sender, m.text));
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    
+                                                    force_scroll_to_bottom.set(true);
+                                                    // Focus the chat input
+                                                    let _ = document::eval(
+                                                        r#"
+                                                        const input = document.getElementById('chat-input');
+                                                        if (input) input.focus();
+                                                        "#
+                                                    );
+                                                },
+                                                title: "{channel_name}",
+                                                if channels_collapsed() {
+                                                    div {
+                                                        class: "channel-icon",
+                                                        style: "background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);",
+                                                        "🔒"
+                                                    }
+                                                } else {
+                                                    div {
+                                                        style: "display: flex; align-items: center; gap: 6px;",
+                                                        span { "🔒" }
+                                                        span { "{channel_name}" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -1693,10 +1932,24 @@ fn app() -> Element {
                         class: "chat-header",
                         div {
                             class: "room",
-                            "{state.read().servers
-                                .get(&state.read().active_profile)
-                                .map(|s| s.current_channel.clone())
-                                .unwrap_or_else(|| \"No channel\".to_string())}"
+                            // Show NSC channel name or IRC channel
+                            {
+                                let nsc_ch = nsc_current_channel.read().clone();
+                                if let Some(ref nsc_id) = nsc_ch {
+                                    // Find the NSC channel name
+                                    let name = nsc_channels.read().iter()
+                                        .find(|c| &c.channel_id == nsc_id)
+                                        .map(|c| format!("🔒 {}", c.name))
+                                        .unwrap_or_else(|| "Unknown Secure Channel".to_string());
+                                    rsx! { "{name}" }
+                                } else {
+                                    let ch = state.read().servers
+                                        .get(&state.read().active_profile)
+                                        .map(|s| s.current_channel.clone())
+                                        .unwrap_or_else(|| "No channel".to_string());
+                                    rsx! { "{ch}" }
+                                }
+                            }
                         }
                         // Topic inline with channel name
                         {
@@ -1757,16 +2010,82 @@ fn app() -> Element {
                             });
                         },
                         {
-                            // Read state once and extract only what we need for the current view
-                            let state_read = state.read();
-                            let active_profile = state_read.active_profile.clone();
-                            let server_state = state_read.servers.get(&active_profile);
+                            // Check if we're in an NSC channel first
+                            let nsc_ch = nsc_current_channel.read().clone();
                             
-                            let current_channel = server_state
-                                .map(|s| s.current_channel.clone())
-                                .unwrap_or_default();
-                            
-                            if current_channel == "Server Log" {
+                            if let Some(ref nsc_id) = nsc_ch {
+                                // Display NSC channel messages
+                                let channel_name = nsc_channels.read().iter()
+                                    .find(|c| &c.channel_id == nsc_id)
+                                    .map(|c| c.name.clone())
+                                    .unwrap_or_else(|| "Secure Channel".to_string());
+                                
+                                let messages = nsc_messages.read()
+                                    .get(nsc_id)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                
+                                rsx! {
+                                    if messages.is_empty() {
+                                        div {
+                                            class: "message system",
+                                            div {
+                                                class: "system-text",
+                                                style: "text-align: center; padding: 40px 20px;",
+                                                div {
+                                                    style: "font-size: 48px; margin-bottom: 16px;",
+                                                    "🔒"
+                                                }
+                                                div {
+                                                    style: "font-weight: 600; font-size: 16px; margin-bottom: 8px;",
+                                                    "Welcome to {channel_name}"
+                                                }
+                                                div {
+                                                    style: "color: var(--muted); font-size: 13px; max-width: 400px; margin: 0 auto;",
+                                                    "This is an end-to-end encrypted channel. Messages are sent directly peer-to-peer and never pass through IRC servers."
+                                                }
+                                                div {
+                                                    style: "margin-top: 20px; padding: 12px; background: rgba(99, 102, 241, 0.1); border-radius: 8px; font-size: 12px;",
+                                                    div {
+                                                        style: "color: var(--muted); margin-bottom: 4px;",
+                                                        "To invite someone, share your identity fingerprint:"
+                                                    }
+                                                    div {
+                                                        style: "font-family: monospace; word-break: break-all; color: var(--accent);",
+                                                        "{nsc_fingerprint}"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        for (i, (timestamp, sender, text)) in messages.iter().enumerate() {
+                                            div {
+                                                key: "{i}",
+                                                class: "message",
+                                                span {
+                                                    class: "username",
+                                                    style: "color: var(--accent);",
+                                                    "{sender}"
+                                                }
+                                                span {
+                                                    class: "text",
+                                                    "{text}"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Read state once and extract only what we need for the current view
+                                let state_read = state.read();
+                                let active_profile = state_read.active_profile.clone();
+                                let server_state = state_read.servers.get(&active_profile);
+                                
+                                let current_channel = server_state
+                                    .map(|s| s.current_channel.clone())
+                                    .unwrap_or_default();
+                                
+                                if current_channel == "Server Log" {
                                 // Clone only log entries (typically small)
                                 let log_entries = server_state
                                     .map(|s| s.connection_log.clone())
@@ -1849,6 +2168,7 @@ fn app() -> Element {
                                         }
                                     }
                                 }
+                            }
                             }
                         }
                     }
@@ -2223,6 +2543,68 @@ fn app() -> Element {
                                                                             }
                                                                         },
                                                                         "📨 Invite to Channel"
+                                                                    }
+                                                                    // Invite to Secure Channel option
+                                                                    {
+                                                                        let has_nsc_channels = !nsc_channels.read().is_empty();
+                                                                        rsx! {
+                                                                            button {
+                                                                                class: if has_nsc_channels { "menu-item" } else { "menu-item disabled" },
+                                                                                disabled: !has_nsc_channels,
+                                                                                title: if has_nsc_channels { "Invite user to a secure encrypted channel" } else { "Create a secure channel first" },
+                                                                                onclick: {
+                                                                                    let nick = user_nick.clone();
+                                                                                    let profile_for_nsc = user_profile.clone();
+                                                                                    move |_| {
+                                                                                        user_menu_open.set(None);
+                                                                                        ctcp_submenu_open.set(false);
+                                                                                        if !has_nsc_channels { return; }
+                                                                                        
+                                                                                        // Get the first NSC channel to invite to
+                                                                                        let channel = nsc_channels.read().first().cloned();
+                                                                                        if let Some(ch) = channel {
+                                                                                            // Clone for async block
+                                                                                            let nick_for_async = nick.clone();
+                                                                                            let profile_for_async = profile_for_nsc.clone();
+                                                                                            
+                                                                                            // First, send an NSC probe to check capability
+                                                                                            spawn(async move {
+                                                                                                let manager = crate::nsc_manager::get_nsc_manager();
+                                                                                                let mgr = manager.read().await;
+                                                                                                
+                                                                                                // Send probe first
+                                                                                                let probe = mgr.create_probe_ctcp();
+                                                                                                if !probe.is_empty() {
+                                                                                                    if let Some(core) = cores.read().get(&profile_for_async) {
+                                                                                                        let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Ctcp {
+                                                                                                            target: nick_for_async.clone(),
+                                                                                                            message: probe,
+                                                                                                        });
+                                                                                                    }
+                                                                                                }
+                                                                                                
+                                                                                                // Create and send invite
+                                                                                                match mgr.create_invite_ctcp(&nick_for_async, &ch.channel_id).await {
+                                                                                                    Ok(invite_ctcp) => {
+                                                                                                        if let Some(core) = cores.read().get(&profile_for_async) {
+                                                                                                            let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Ctcp {
+                                                                                                                target: nick_for_async.clone(),
+                                                                                                                message: invite_ctcp,
+                                                                                                            });
+                                                                                                        }
+                                                                                                        log::info!("Sent NSC invite to {} for channel '{}'", nick_for_async, ch.name);
+                                                                                                    }
+                                                                                                    Err(e) => {
+                                                                                                        log::error!("Failed to create NSC invite: {}", e);
+                                                                                                    }
+                                                                                                }
+                                                                                            });
+                                                                                        }
+                                                                                    }
+                                                                                },
+                                                                                "🔒 Invite to Secure Channel"
+                                                                            }
+                                                                        }
                                                                     }
                                                                     // Advanced options (hidden unless advanced mode is enabled)
                                                                     if *settings_show_advanced.read() {
@@ -3822,6 +4204,9 @@ fn app() -> Element {
                                                 voice_peer_addr_tx,
                                                 settings_show_timestamps,
                                                 settings_show_advanced,
+                                                nsc_current_channel,
+                                                nsc_messages,
+                                                nsc_fingerprint,
                                             );
                                         }
                                     }
@@ -3916,6 +4301,9 @@ fn app() -> Element {
                                         voice_peer_addr_tx,
                                         settings_show_timestamps,
                                         settings_show_advanced,
+                                        nsc_current_channel,
+                                        nsc_messages,
+                                        nsc_fingerprint,
                                     );
                                 }
                             }
@@ -4994,6 +5382,301 @@ fn app() -> Element {
         }
 
         // Channel Browser Modal
+        // Nais Secure Channel modal
+        if show_new_nsc_modal.read().clone() {
+            div {
+                class: "modal-backdrop",
+                onclick: move |_| {
+                    show_new_nsc_modal.set(false);
+                },
+                div {
+                    class: "modal",
+                    onclick: move |evt| {
+                        evt.stop_propagation();
+                    },
+                    div {
+                        class: "modal-title",
+                        "🔒 Secure Channels"
+                    }
+                    div {
+                        class: "modal-body",
+                        // Show identity fingerprint
+                        div {
+                            style: "margin-bottom: 16px; padding: 10px; background: rgba(99, 102, 241, 0.08); border-radius: 8px; font-size: 12px;",
+                            div {
+                                style: "color: var(--muted); margin-bottom: 4px;",
+                                "Your Identity Fingerprint:"
+                            }
+                            div {
+                                style: "font-family: monospace; word-break: break-all; color: var(--accent);",
+                                "{nsc_fingerprint}"
+                            }
+                        }
+                        
+                        p {
+                            style: "color: var(--muted); font-size: 13px; margin-bottom: 16px;",
+                            "Create an end-to-end encrypted P2P channel. Messages never pass through IRC servers."
+                        }
+                        input {
+                            class: "input",
+                            r#type: "text",
+                            placeholder: "Channel name (e.g., Private Chat)",
+                            value: "{nsc_channel_name_input}",
+                            disabled: *nsc_loading.read(),
+                            oninput: move |evt| {
+                                nsc_channel_name_input.set(evt.value());
+                            },
+                            onkeypress: move |evt| {
+                                if evt.key() == Key::Enter && !*nsc_loading.read() {
+                                    let name = nsc_channel_name_input.read().clone();
+                                    if !name.is_empty() {
+                                        nsc_loading.set(true);
+                                        spawn(async move {
+                                            let manager = crate::nsc_manager::get_nsc_manager();
+                                            let mgr = manager.read().await;
+                                            match mgr.create_channel(name.clone()).await {
+                                                Ok(info) => {
+                                                    log::info!("Created NSC channel: {} ({})", info.name, &info.channel_id[..8]);
+                                                    // Refresh channel list
+                                                    let channels = mgr.list_channels().await;
+                                                    drop(mgr);
+                                                    nsc_channels.set(channels);
+                                                    nsc_channel_name_input.set(String::new());
+                                                    show_new_nsc_modal.set(false);
+                                                }
+                                                Err(e) => {
+                                                    log::error!("Failed to create NSC channel: {}", e);
+                                                }
+                                            }
+                                            nsc_loading.set(false);
+                                        });
+                                    }
+                                }
+                            },
+                        }
+                        
+                        // Show existing secure channels
+                        if !nsc_channels.read().is_empty() {
+                            div {
+                                style: "margin-top: 16px;",
+                                div {
+                                    style: "color: var(--muted); font-size: 12px; margin-bottom: 8px;",
+                                    "Your Secure Channels:"
+                                }
+                                for channel in nsc_channels.read().iter().cloned() {
+                                    {
+                                        let channel_id = channel.channel_id.clone();
+                                        let channel_id_display = if channel.channel_id.len() >= 8 { 
+                                            format!("{}...", &channel.channel_id[..8]) 
+                                        } else { 
+                                            channel.channel_id.clone() 
+                                        };
+                                        rsx! {
+                                            div {
+                                                key: "{channel_id}",
+                                                style: "display: flex; align-items: center; justify-content: space-between; padding: 8px; background: rgba(99, 102, 241, 0.1); border-radius: 6px; margin-bottom: 4px;",
+                                                div {
+                                                    style: "display: flex; align-items: center; gap: 8px;",
+                                                    span { "🔒" }
+                                                    span { "{channel.name}" }
+                                                    if channel.member_count > 1 {
+                                                        span {
+                                                            style: "color: var(--muted); font-size: 11px;",
+                                                            "({channel.member_count} members)"
+                                                        }
+                                                    }
+                                                }
+                                                div {
+                                                    style: "display: flex; align-items: center; gap: 8px;",
+                                                    span {
+                                                        style: "color: var(--muted); font-size: 11px;",
+                                                        "{channel_id_display}"
+                                                    }
+                                                    button {
+                                                        style: "background: rgba(239, 68, 68, 0.2); color: #ef4444; border: none; padding: 4px 8px; border-radius: 4px; font-size: 11px; cursor: pointer;",
+                                                        onclick: move |_| {
+                                                            let cid = channel_id.clone();
+                                                            spawn(async move {
+                                                                let manager = crate::nsc_manager::get_nsc_manager();
+                                                                let mgr = manager.read().await;
+                                                                if let Err(e) = mgr.leave_channel(&cid).await {
+                                                                    log::error!("Failed to leave channel: {}", e);
+                                                                } else {
+                                                                    let channels = mgr.list_channels().await;
+                                                                    drop(mgr);
+                                                                    nsc_channels.set(channels);
+                                                                }
+                                                            });
+                                                        },
+                                                        "Leave"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Show pending invites
+                        if !nsc_pending_invites.read().is_empty() {
+                            div {
+                                style: "margin-top: 16px;",
+                                div {
+                                    style: "color: var(--muted); font-size: 12px; margin-bottom: 8px;",
+                                    "Pending Invites:"
+                                }
+                                for invite in nsc_pending_invites.read().iter().cloned() {
+                                    {
+                                        let invite_id = invite.invite_id.clone();
+                                        let invite_id_accept = invite.invite_id.clone();
+                                        let invite_id_decline = invite.invite_id.clone();
+                                        rsx! {
+                                            div {
+                                                key: "{invite_id}",
+                                                style: "padding: 10px; background: rgba(76, 175, 80, 0.1); border: 1px solid rgba(76, 175, 80, 0.2); border-radius: 6px; margin-bottom: 4px;",
+                                                div {
+                                                    style: "display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;",
+                                                    div {
+                                                        style: "display: flex; align-items: center; gap: 8px;",
+                                                        span { "📨" }
+                                                        span { style: "font-weight: 500;", "{invite.from_nick}" }
+                                                        span { style: "color: var(--muted);", "invites you to" }
+                                                    }
+                                                }
+                                                div {
+                                                    style: "display: flex; align-items: center; gap: 8px; margin-bottom: 8px;",
+                                                    span { "🔒" }
+                                                    span { style: "color: #4CAF50; font-weight: 500;", "{invite.channel_name}" }
+                                                    if invite.member_count > 0 {
+                                                        span {
+                                                            style: "color: var(--muted); font-size: 11px;",
+                                                            "({invite.member_count} members)"
+                                                        }
+                                                    }
+                                                }
+                                                div {
+                                                    style: "display: flex; gap: 8px;",
+                                                    button {
+                                                        style: "flex: 1; padding: 6px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; font-size: 12px;",
+                                                        onclick: move |_| {
+                                                            let iid = invite_id_decline.clone();
+                                                            spawn(async move {
+                                                                let manager = crate::nsc_manager::get_nsc_manager();
+                                                                let mgr = manager.read().await;
+                                                                match mgr.decline_invite(&iid).await {
+                                                                    Ok((target_nick, ctcp_response)) => {
+                                                                        // Send CTCP decline to inviter
+                                                                        let active = state.read().active_profile.clone();
+                                                                        if let Some(core) = cores.read().get(&active) {
+                                                                            let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Notice {
+                                                                                target: target_nick,
+                                                                                text: ctcp_response,
+                                                                            });
+                                                                        }
+                                                                    }
+                                                                    Err(e) => {
+                                                                        log::error!("Failed to decline invite: {}", e);
+                                                                    }
+                                                                }
+                                                                let invites = mgr.get_pending_invites().await;
+                                                                drop(mgr);
+                                                                nsc_pending_invites.set(invites);
+                                                            });
+                                                        },
+                                                        "Decline"
+                                                    }
+                                                    button {
+                                                        style: "flex: 1; padding: 6px 12px; background: #4CAF50; border: none; border-radius: 4px; cursor: pointer; color: white; font-weight: 500; font-size: 12px;",
+                                                        onclick: move |_| {
+                                                            let iid = invite_id_accept.clone();
+                                                            spawn(async move {
+                                                                let manager = crate::nsc_manager::get_nsc_manager();
+                                                                let mgr = manager.read().await;
+                                                                match mgr.accept_invite(&iid).await {
+                                                                    Ok((target_nick, ctcp_response)) => {
+                                                                        log::info!("Accepted invite, sending response to {}", target_nick);
+                                                                        // Send CTCP response to inviter via active IRC connection
+                                                                        let active = state.read().active_profile.clone();
+                                                                        if let Some(core) = cores.read().get(&active) {
+                                                                            let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Notice {
+                                                                                target: target_nick,
+                                                                                text: ctcp_response,
+                                                                            });
+                                                                        }
+                                                                    }
+                                                                    Err(e) => {
+                                                                        log::error!("Failed to accept invite: {}", e);
+                                                                    }
+                                                                }
+                                                                let invites = mgr.get_pending_invites().await;
+                                                                let channels = mgr.list_channels().await;
+                                                                drop(mgr);
+                                                                nsc_pending_invites.set(invites);
+                                                                nsc_channels.set(channels);
+                                                            });
+                                                        },
+                                                        "Accept"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Loading indicator
+                        if *nsc_loading.read() {
+                            div {
+                                style: "text-align: center; padding: 10px; color: var(--muted);",
+                                "Creating channel..."
+                            }
+                        }
+                    }
+                    div {
+                        class: "modal-actions",
+                        button {
+                            class: "send",
+                            onclick: move |_| {
+                                show_new_nsc_modal.set(false);
+                            },
+                            "Close"
+                        }
+                        button {
+                            class: "send primary",
+                            disabled: *nsc_loading.read() || nsc_channel_name_input.read().is_empty(),
+                            onclick: move |_| {
+                                let name = nsc_channel_name_input.read().clone();
+                                if !name.is_empty() && !*nsc_loading.read() {
+                                    nsc_loading.set(true);
+                                    spawn(async move {
+                                        let manager = crate::nsc_manager::get_nsc_manager();
+                                        let mgr = manager.read().await;
+                                        match mgr.create_channel(name.clone()).await {
+                                            Ok(info) => {
+                                                log::info!("Created NSC channel: {} ({})", info.name, &info.channel_id[..8]);
+                                                // Refresh channel list
+                                                let channels = mgr.list_channels().await;
+                                                drop(mgr);
+                                                nsc_channels.set(channels);
+                                                nsc_channel_name_input.set(String::new());
+                                            }
+                                            Err(e) => {
+                                                log::error!("Failed to create NSC channel: {}", e);
+                                            }
+                                        }
+                                        nsc_loading.set(false);
+                                    });
+                                }
+                            },
+                            "Create Channel"
+                        }
+                    }
+                }
+            }
+        }
+
         if show_channel_browser.read().clone() {
             div {
                 class: "modal-backdrop",
@@ -5205,6 +5888,9 @@ fn handle_send_message(
     mut voice_peer_addr_tx: Signal<Option<async_channel::Sender<(String, u16)>>>,
     settings_show_timestamps: Signal<bool>,
     settings_show_advanced: Signal<bool>,
+    nsc_current_channel: Signal<Option<String>>,
+    mut nsc_messages: Signal<HashMap<String, Vec<(u64, String, String)>>>,
+    nsc_fingerprint: Signal<String>,
 ) {
     let text = text.trim().to_string();
     if text.is_empty() {
@@ -5219,6 +5905,56 @@ fn handle_send_message(
     }
     history_index.set(None);
 
+    // Handle NSC channel messages
+    if let Some(channel_id) = nsc_current_channel.read().clone() {
+        // For NSC channels, only handle regular messages (not commands)
+        if !text.starts_with('/') {
+            let text_clone = text.clone();
+            let channel_id_clone = channel_id.clone();
+            
+            // Send via NSC transport layer
+            spawn(async move {
+                let manager = crate::nsc_manager::get_nsc_manager();
+                let mgr = manager.read().await;
+                
+                // Initialize transport if not already done
+                if !mgr.is_transport_running().await {
+                    if let Err(e) = mgr.init_transport().await {
+                        log::error!("Failed to init transport: {}", e);
+                    }
+                }
+                
+                // Send the message (this broadcasts to connected peers)
+                match mgr.send_message(&channel_id_clone, text_clone.clone()).await {
+                    Ok(msg) => {
+                        // Add to local messages for display
+                        let mut msgs = nsc_messages.write();
+                        let channel_msgs = msgs.entry(channel_id_clone).or_insert_with(Vec::new);
+                        channel_msgs.push((msg.timestamp, msg.sender, msg.text));
+                    }
+                    Err(e) => {
+                        log::error!("Failed to send NSC message: {}", e);
+                        // Still add locally so user sees their message
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let sender = nsc_fingerprint.read().clone();
+                        let sender_short = if sender.len() > 8 { sender[..8].to_string() } else { sender };
+                        let mut msgs = nsc_messages.write();
+                        let channel_msgs = msgs.entry(channel_id_clone).or_insert_with(Vec::new);
+                        channel_msgs.push((timestamp, sender_short, text_clone));
+                    }
+                }
+                
+                force_scroll_to_bottom.set(true);
+            });
+            
+            input.set(String::new());
+            return;
+        }
+    }
+
     let active_profile = state.read().active_profile.clone();
     let server_state = state.read().servers.get(&active_profile).cloned();
     let Some(server_state) = server_state else {
@@ -5232,6 +5968,184 @@ fn handle_send_message(
         let mut parts = text.splitn(2, ' ');
         let command = parts.next().unwrap_or("").to_lowercase();
         let arg = parts.next().unwrap_or("").trim().to_string();
+        
+        // NSC commands (work in any channel)
+        if command == "/nsc" {
+            let mut nsc_parts = arg.splitn(2, ' ');
+            let subcommand = nsc_parts.next().unwrap_or("").to_lowercase();
+            let subarg = nsc_parts.next().unwrap_or("").trim().to_string();
+            
+            match subcommand.as_str() {
+                "info" | "status" => {
+                    // Show NSC info
+                    spawn(async move {
+                        let manager = crate::nsc_manager::get_nsc_manager();
+                        let mgr = manager.read().await;
+                        
+                        let peer_id = mgr.peer_id_hex();
+                        let fingerprint = mgr.fingerprint();
+                        let port = mgr.local_port().await;
+                        let peer_count = mgr.connected_peer_count().await;
+                        
+                        let port_str = port.map(|p| p.to_string()).unwrap_or_else(|| "not running".to_string());
+                        
+                        // Add system message to current channel
+                        let info = format!(
+                            "NSC Info:\n  Fingerprint: {}\n  Peer ID: {}...\n  Listening: port {}\n  Connected peers: {}",
+                            fingerprint, &peer_id[..16], port_str, peer_count
+                        );
+                        
+                        // Display in NSC channel if selected, otherwise show in IRC channel
+                        if let Some(nsc_ch) = nsc_current_channel.read().clone() {
+                            let timestamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let mut msgs = nsc_messages.write();
+                            let channel_msgs = msgs.entry(nsc_ch).or_insert_with(Vec::new);
+                            channel_msgs.push((timestamp, "System".to_string(), info));
+                        } else {
+                            let active_profile_local = state.read().active_profile.clone();
+                            let channel_local = state.read().servers.get(&active_profile_local)
+                                .map(|s| s.current_channel.clone())
+                                .unwrap_or_default();
+                            apply_event_with_config(
+                                &mut state.write(),
+                                &profiles.read(),
+                                &active_profile_local,
+                                IrcEvent::System {
+                                    channel: channel_local,
+                                    text: info,
+                                },
+                            );
+                        }
+                    });
+                    input.set(String::new());
+                    return;
+                }
+                "connect" => {
+                    // Connect to a peer
+                    if subarg.is_empty() {
+                        apply_event_with_config(
+                            &mut state.write(),
+                            &profiles.read(),
+                            &active_profile,
+                            IrcEvent::System {
+                                channel,
+                                text: "Usage: /nsc connect <ip:port> [peer_id]".to_string(),
+                            },
+                        );
+                    } else {
+                        let addr_str = subarg.clone();
+                        spawn(async move {
+                            let manager = crate::nsc_manager::get_nsc_manager();
+                            let mgr = manager.read().await;
+                            
+                            // Parse address
+                            let addr: std::net::SocketAddr = match addr_str.parse() {
+                                Ok(a) => a,
+                                Err(_) => {
+                                    log::error!("Invalid address: {}", addr_str);
+                                    return;
+                                }
+                            };
+                            
+                            // Use a placeholder peer ID for now (peer will identify itself)
+                            let peer_id_placeholder = "0".repeat(64);
+                            
+                            match mgr.connect_to_peer(&peer_id_placeholder, addr).await {
+                                Ok(_) => {
+                                    log::info!("Connected to {}", addr);
+                                    // Add system message
+                                    if let Some(nsc_ch) = nsc_current_channel.read().clone() {
+                                        let timestamp = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_secs())
+                                            .unwrap_or(0);
+                                        let mut msgs = nsc_messages.write();
+                                        let channel_msgs = msgs.entry(nsc_ch).or_insert_with(Vec::new);
+                                        channel_msgs.push((timestamp, "System".to_string(), format!("Connected to {}", addr)));
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to connect: {}", e);
+                                }
+                            }
+                        });
+                    }
+                    input.set(String::new());
+                    return;
+                }
+                "peers" => {
+                    // List connected peers
+                    spawn(async move {
+                        let manager = crate::nsc_manager::get_nsc_manager();
+                        let mgr = manager.read().await;
+                        
+                        let peer_count = mgr.connected_peer_count().await;
+                        let addresses = mgr.get_peer_addresses().await;
+                        
+                        let mut info = format!("Connected peers: {}", peer_count);
+                        for (peer_id, addr) in addresses.iter() {
+                            info.push_str(&format!("\n  {} @ {}", &peer_id[..8], addr));
+                        }
+                        
+                        if let Some(nsc_ch) = nsc_current_channel.read().clone() {
+                            let timestamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let mut msgs = nsc_messages.write();
+                            let channel_msgs = msgs.entry(nsc_ch).or_insert_with(Vec::new);
+                            channel_msgs.push((timestamp, "System".to_string(), info));
+                        } else {
+                            let active_profile_local = state.read().active_profile.clone();
+                            let channel_local = state.read().servers.get(&active_profile_local)
+                                .map(|s| s.current_channel.clone())
+                                .unwrap_or_default();
+                            apply_event_with_config(
+                                &mut state.write(),
+                                &profiles.read(),
+                                &active_profile_local,
+                                IrcEvent::System {
+                                    channel: channel_local,
+                                    text: info,
+                                },
+                            );
+                        }
+                    });
+                    input.set(String::new());
+                    return;
+                }
+                "help" | "" => {
+                    let help_text = "NSC Commands:\n  /nsc info - Show your NSC info (fingerprint, port)\n  /nsc connect <ip:port> - Connect to a peer\n  /nsc peers - List connected peers";
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel: channel.clone(),
+                            text: help_text.to_string(),
+                        },
+                    );
+                    input.set(String::new());
+                    return;
+                }
+                _ => {
+                    apply_event_with_config(
+                        &mut state.write(),
+                        &profiles.read(),
+                        &active_profile,
+                        IrcEvent::System {
+                            channel,
+                            text: format!("Unknown NSC command: {}. Use /nsc help for available commands.", subcommand),
+                        },
+                    );
+                    input.set(String::new());
+                    return;
+                }
+            }
+        }
         match command.as_str() {
             "/join" => {
                 if arg.is_empty() {
@@ -7995,6 +8909,17 @@ body {
     background: rgba(76, 175, 80, 0.3);
     border-color: #4CAF50;
     color: #4CAF50;
+}
+
+/* NSC (Nais Secure Channel) button */
+.nsc-btn {
+    background: rgba(99, 102, 241, 0.15);
+    border-color: rgba(99, 102, 241, 0.4);
+}
+
+.nsc-btn:hover {
+    background: rgba(99, 102, 241, 0.25);
+    border-color: rgba(99, 102, 241, 0.6);
 }
 
 .voice-call-dropdown {

@@ -9,6 +9,10 @@
 //! - Group key management (MLS-lite)
 
 use bytes::Bytes;
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    ChaCha20Poly1305, Nonce,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -85,6 +89,12 @@ pub const KEY_ROTATION_MESSAGE_THRESHOLD: u32 = 100;
 
 /// Key rotation threshold (time)
 pub const KEY_ROTATION_TIME_THRESHOLD: Duration = Duration::from_secs(3600); // 1 hour
+
+/// Switch to sender keys threshold (member count)
+pub const SENDER_KEYS_THRESHOLD: usize = 100;
+
+/// Maximum sender key chain length before refresh
+pub const MAX_SENDER_KEY_CHAIN: u32 = 1000;
 
 // =============================================================================
 // Channel Identity
@@ -721,7 +731,7 @@ impl Default for MessageQueue {
 // =============================================================================
 
 /// Group epoch secrets (simplified MLS)
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct EpochSecrets {
     /// Current epoch number
     pub epoch: u64,
@@ -814,6 +824,412 @@ impl EpochSecrets {
         };
 
         self.message_count > KEY_ROTATION_MESSAGE_THRESHOLD || time_exceeded
+    }
+    
+    /// Encrypt a message using channel group key
+    /// Returns nonce || ciphertext
+    pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        let cipher = ChaCha20Poly1305::new_from_slice(&self.encryption_key)
+            .map_err(|e| format!("Failed to create cipher: {}", e))?;
+        
+        // Generate random nonce (12 bytes for ChaCha20-Poly1305)
+        let mut nonce_bytes = [0u8; 12];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        
+        let ciphertext = cipher.encrypt(nonce, plaintext)
+            .map_err(|e| format!("Encryption failed: {}", e))?;
+        
+        // Prepend nonce to ciphertext
+        let mut result = Vec::with_capacity(12 + ciphertext.len());
+        result.extend_from_slice(&nonce_bytes);
+        result.extend_from_slice(&ciphertext);
+        
+        Ok(result)
+    }
+    
+    /// Decrypt a message using channel group key
+    /// Input format: nonce (12 bytes) || ciphertext
+    pub fn decrypt(&self, encrypted: &[u8]) -> Result<Vec<u8>, String> {
+        if encrypted.len() < 12 {
+            return Err("Encrypted data too short".to_string());
+        }
+        
+        let cipher = ChaCha20Poly1305::new_from_slice(&self.encryption_key)
+            .map_err(|e| format!("Failed to create cipher: {}", e))?;
+        
+        let nonce = Nonce::from_slice(&encrypted[..12]);
+        let ciphertext = &encrypted[12..];
+        
+        cipher.decrypt(nonce, ciphertext)
+            .map_err(|e| format!("Decryption failed (authentication error): {}", e))
+    }
+}
+
+// =============================================================================
+// Sender Keys (for large groups > 100 members)
+// =============================================================================
+
+/// Sender key for large group messaging
+/// Each sender maintains their own chain key that others use to derive message keys
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SenderKey {
+    /// Sender's peer ID
+    pub sender_id: PeerId,
+    /// Current chain key
+    pub chain_key: [u8; 32],
+    /// Current iteration (message index)
+    pub iteration: u32,
+    /// Sender's signing public key (for verification)
+    pub signing_key: [u8; 32],
+    /// Distribution ID (changes when sender key is rotated)
+    pub distribution_id: u32,
+}
+
+impl SenderKey {
+    /// Create a new sender key for ourselves
+    pub fn generate(sender_id: PeerId, signing_key: [u8; 32]) -> Self {
+        let mut chain_key = [0u8; 32];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut chain_key);
+        
+        Self {
+            sender_id,
+            chain_key,
+            iteration: 0,
+            signing_key,
+            distribution_id: 0,
+        }
+    }
+    
+    /// Derive message key and advance chain
+    pub fn derive_message_key(&mut self) -> MessageKey {
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+        
+        let hkdf = Hkdf::<Sha256>::new(None, &self.chain_key);
+        
+        // Derive message key
+        let mut message_key = [0u8; 32];
+        let info = format!("SenderKey_Msg_{}", self.iteration);
+        hkdf.expand(info.as_bytes(), &mut message_key).unwrap();
+        
+        // Advance chain key
+        let mut new_chain_key = [0u8; 32];
+        let chain_info = format!("SenderKey_Chain_{}", self.iteration);
+        hkdf.expand(chain_info.as_bytes(), &mut new_chain_key).unwrap();
+        self.chain_key = new_chain_key;
+        
+        self.iteration += 1;
+        
+        MessageKey {
+            key: message_key,
+            iteration: self.iteration - 1,
+        }
+    }
+    
+    /// Derive message key at specific iteration (for decryption)
+    /// Returns None if iteration is in the past
+    pub fn derive_at_iteration(&self, target_iteration: u32) -> Option<MessageKey> {
+        if target_iteration < self.iteration {
+            return None; // Cannot derive past keys
+        }
+        
+        // Clone and advance to target
+        let mut temp = self.clone();
+        while temp.iteration < target_iteration {
+            let _ = temp.derive_message_key();
+        }
+        
+        if temp.iteration == target_iteration {
+            Some(temp.derive_message_key())
+        } else {
+            None
+        }
+    }
+    
+    /// Check if sender key should be rotated
+    pub fn should_rotate(&self) -> bool {
+        self.iteration >= MAX_SENDER_KEY_CHAIN
+    }
+    
+    /// Rotate sender key (creates a new chain)
+    pub fn rotate(&mut self) {
+        let mut new_chain_key = [0u8; 32];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut new_chain_key);
+        
+        self.chain_key = new_chain_key;
+        self.iteration = 0;
+        self.distribution_id += 1;
+    }
+    
+    /// Serialize for distribution to other members
+    pub fn to_distribution(&self) -> SenderKeyDistribution {
+        SenderKeyDistribution {
+            sender_id: self.sender_id,
+            chain_key: self.chain_key,
+            iteration: self.iteration,
+            signing_key: self.signing_key,
+            distribution_id: self.distribution_id,
+        }
+    }
+}
+
+/// Message key derived from sender key
+#[derive(Clone)]
+pub struct MessageKey {
+    pub key: [u8; 32],
+    pub iteration: u32,
+}
+
+impl MessageKey {
+    /// Encrypt message with this key
+    pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        let cipher = ChaCha20Poly1305::new_from_slice(&self.key)
+            .map_err(|e| format!("Failed to create cipher: {}", e))?;
+        
+        let mut nonce_bytes = [0u8; 12];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        
+        let ciphertext = cipher.encrypt(nonce, plaintext)
+            .map_err(|e| format!("Encryption failed: {}", e))?;
+        
+        let mut result = Vec::with_capacity(4 + 12 + ciphertext.len());
+        result.extend_from_slice(&self.iteration.to_be_bytes());
+        result.extend_from_slice(&nonce_bytes);
+        result.extend_from_slice(&ciphertext);
+        
+        Ok(result)
+    }
+    
+    /// Decrypt message with this key
+    pub fn decrypt(&self, encrypted: &[u8]) -> Result<Vec<u8>, String> {
+        if encrypted.len() < 16 {
+            return Err("Encrypted data too short".to_string());
+        }
+        
+        let cipher = ChaCha20Poly1305::new_from_slice(&self.key)
+            .map_err(|e| format!("Failed to create cipher: {}", e))?;
+        
+        // Skip iteration (4 bytes) - already extracted by caller
+        let nonce = Nonce::from_slice(&encrypted[4..16]);
+        let ciphertext = &encrypted[16..];
+        
+        cipher.decrypt(nonce, ciphertext)
+            .map_err(|e| format!("Decryption failed: {}", e))
+    }
+}
+
+/// Sender key distribution message (sent to new members or when rotating)
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SenderKeyDistribution {
+    pub sender_id: PeerId,
+    pub chain_key: [u8; 32],
+    pub iteration: u32,
+    pub signing_key: [u8; 32],
+    pub distribution_id: u32,
+}
+
+impl SenderKeyDistribution {
+    /// Serialize to bytes
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(104);
+        bytes.extend_from_slice(&self.sender_id.0);
+        bytes.extend_from_slice(&self.chain_key);
+        bytes.extend_from_slice(&self.iteration.to_be_bytes());
+        bytes.extend_from_slice(&self.signing_key);
+        bytes.extend_from_slice(&self.distribution_id.to_be_bytes());
+        bytes
+    }
+    
+    /// Deserialize from bytes
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 104 {
+            return None;
+        }
+        
+        let mut sender_id = [0u8; 32];
+        sender_id.copy_from_slice(&bytes[0..32]);
+        
+        let mut chain_key = [0u8; 32];
+        chain_key.copy_from_slice(&bytes[32..64]);
+        
+        let mut iteration_bytes = [0u8; 4];
+        iteration_bytes.copy_from_slice(&bytes[64..68]);
+        let iteration = u32::from_be_bytes(iteration_bytes);
+        
+        let mut signing_key = [0u8; 32];
+        signing_key.copy_from_slice(&bytes[68..100]);
+        
+        let mut distribution_id_bytes = [0u8; 4];
+        distribution_id_bytes.copy_from_slice(&bytes[100..104]);
+        let distribution_id = u32::from_be_bytes(distribution_id_bytes);
+        
+        Some(Self {
+            sender_id: PeerId(sender_id),
+            chain_key,
+            iteration,
+            signing_key,
+            distribution_id,
+        })
+    }
+    
+    /// Convert to a SenderKey for storing
+    pub fn to_sender_key(&self) -> SenderKey {
+        SenderKey {
+            sender_id: self.sender_id,
+            chain_key: self.chain_key,
+            iteration: self.iteration,
+            signing_key: self.signing_key,
+            distribution_id: self.distribution_id,
+        }
+    }
+}
+
+/// Manages sender keys for a large group channel
+pub struct SenderKeyStore {
+    /// Our own sender key
+    our_key: SenderKey,
+    /// Sender keys from other members (peer_id -> sender_key)
+    peer_keys: HashMap<PeerId, SenderKey>,
+    /// Cached message keys for out-of-order decryption (sender_id || iteration -> key)
+    cached_keys: HashMap<(PeerId, u32), MessageKey>,
+    /// Maximum cached keys per sender
+    max_cache_per_sender: usize,
+}
+
+impl SenderKeyStore {
+    /// Create a new sender key store
+    pub fn new(our_peer_id: PeerId, signing_key: [u8; 32]) -> Self {
+        Self {
+            our_key: SenderKey::generate(our_peer_id, signing_key),
+            peer_keys: HashMap::new(),
+            cached_keys: HashMap::new(),
+            max_cache_per_sender: 100,
+        }
+    }
+    
+    /// Get our sender key distribution (for sending to others)
+    pub fn our_distribution(&self) -> SenderKeyDistribution {
+        self.our_key.to_distribution()
+    }
+    
+    /// Encrypt a message using our sender key
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        let mk = self.our_key.derive_message_key();
+        mk.encrypt(plaintext)
+    }
+    
+    /// Decrypt a message from a peer
+    pub fn decrypt(&mut self, sender_id: &PeerId, encrypted: &[u8]) -> Result<Vec<u8>, String> {
+        if encrypted.len() < 4 {
+            return Err("Encrypted data too short".to_string());
+        }
+        
+        // Extract iteration
+        let mut iteration_bytes = [0u8; 4];
+        iteration_bytes.copy_from_slice(&encrypted[0..4]);
+        let iteration = u32::from_be_bytes(iteration_bytes);
+        
+        // Check cache first
+        if let Some(mk) = self.cached_keys.get(&(*sender_id, iteration)) {
+            return mk.decrypt(encrypted);
+        }
+        
+        // Get peer's sender key
+        let peer_key = self.peer_keys.get_mut(sender_id)
+            .ok_or_else(|| format!("No sender key for peer {}", sender_id.short()))?;
+        
+        // Derive key at iteration
+        if iteration < peer_key.iteration {
+            return Err(format!("Message key already consumed (iteration {})", iteration));
+        }
+        
+        // Advance and cache keys up to target
+        while peer_key.iteration <= iteration {
+            let mk = peer_key.derive_message_key();
+            // Cache for potential out-of-order messages
+            self.cached_keys.insert((*sender_id, mk.iteration), mk);
+        }
+        
+        // Get the key we need
+        let mk = self.cached_keys.get(&(*sender_id, iteration))
+            .ok_or_else(|| "Failed to derive message key".to_string())?;
+        
+        let result = mk.decrypt(encrypted);
+        
+        // Remove used key
+        self.cached_keys.remove(&(*sender_id, iteration));
+        
+        // Prune old cached keys for this sender
+        self.prune_cached_keys(sender_id);
+        
+        result
+    }
+    
+    /// Add or update a peer's sender key
+    pub fn add_peer_key(&mut self, distribution: SenderKeyDistribution) {
+        // Check if this is a newer distribution
+        if let Some(existing) = self.peer_keys.get(&distribution.sender_id) {
+            if distribution.distribution_id <= existing.distribution_id 
+               && distribution.iteration <= existing.iteration {
+                return; // Already have newer or same key
+            }
+        }
+        
+        // Clear cached keys for this sender if distribution changed
+        if let Some(existing) = self.peer_keys.get(&distribution.sender_id) {
+            if distribution.distribution_id != existing.distribution_id {
+                self.cached_keys.retain(|(peer, _), _| *peer != distribution.sender_id);
+            }
+        }
+        
+        self.peer_keys.insert(distribution.sender_id, distribution.to_sender_key());
+    }
+    
+    /// Check if we should rotate our sender key
+    pub fn should_rotate(&self) -> bool {
+        self.our_key.should_rotate()
+    }
+    
+    /// Rotate our sender key
+    pub fn rotate(&mut self) -> SenderKeyDistribution {
+        self.our_key.rotate();
+        self.our_key.to_distribution()
+    }
+    
+    /// Prune old cached keys for a sender
+    fn prune_cached_keys(&mut self, sender_id: &PeerId) {
+        let keys_for_sender: Vec<_> = self.cached_keys.keys()
+            .filter(|(peer, _)| peer == sender_id)
+            .copied()
+            .collect();
+        
+        if keys_for_sender.len() > self.max_cache_per_sender {
+            // Remove oldest keys
+            let mut sorted_keys = keys_for_sender;
+            sorted_keys.sort_by_key(|(_, iter)| *iter);
+            
+            let to_remove = sorted_keys.len() - self.max_cache_per_sender;
+            for key in sorted_keys.into_iter().take(to_remove) {
+                self.cached_keys.remove(&key);
+            }
+        }
+    }
+    
+    /// Get all peer IDs with sender keys
+    pub fn peer_ids(&self) -> Vec<PeerId> {
+        self.peer_keys.keys().copied().collect()
+    }
+    
+    /// Remove a peer's sender key
+    pub fn remove_peer(&mut self, peer_id: &PeerId) {
+        self.peer_keys.remove(peer_id);
+        self.cached_keys.retain(|(peer, _), _| peer != peer_id);
     }
 }
 
@@ -1318,6 +1734,124 @@ impl ChannelManager {
     pub async fn pending_invites(&self) -> Vec<ChannelInvite> {
         self.pending_invites.read().await.values().cloned().collect()
     }
+    
+    /// Encrypt a message for a specific channel
+    pub async fn encrypt_for_channel(&self, channel_id: &ChannelId, plaintext: &[u8]) -> ChannelResult<Vec<u8>> {
+        let channels = self.channels.read().await;
+        let channel = channels.get(channel_id)
+            .ok_or_else(|| ChannelError::NotFound(channel_id.to_hex()))?;
+        
+        channel.epoch_secrets.encrypt(plaintext)
+            .map_err(|e| ChannelError::InvalidMetadata(e))
+    }
+    
+    /// Decrypt a message for a specific channel
+    pub async fn decrypt_for_channel(&self, channel_id: &ChannelId, ciphertext: &[u8]) -> ChannelResult<Vec<u8>> {
+        let channels = self.channels.read().await;
+        let channel = channels.get(channel_id)
+            .ok_or_else(|| ChannelError::NotFound(channel_id.to_hex()))?;
+        
+        channel.epoch_secrets.decrypt(ciphertext)
+            .map_err(|e| ChannelError::InvalidMetadata(e))
+    }
+    
+    /// Get epoch secrets for a channel (to share with new members)
+    pub async fn get_epoch_secrets(&self, channel_id: &ChannelId) -> Option<EpochSecrets> {
+        let channels = self.channels.read().await;
+        channels.get(channel_id).map(|c| c.epoch_secrets.clone())
+    }
+    
+    /// Join a channel with provided epoch secrets (used when receiving Welcome message)
+    pub async fn join_channel_with_secrets(
+        &self,
+        channel_id: &ChannelId,
+        name: String,
+        epoch_secrets: EpochSecrets,
+    ) -> ChannelResult<()> {
+        // Check if we already have this channel
+        if self.channels.read().await.contains_key(channel_id) {
+            // Update existing channel's epoch secrets
+            let mut channels = self.channels.write().await;
+            if let Some(channel) = channels.get_mut(channel_id) {
+                channel.epoch_secrets = epoch_secrets;
+            }
+            return Ok(());
+        }
+        
+        // Create channel metadata
+        let metadata = ChannelMetadata {
+            channel_id: *channel_id,
+            name,
+            topic: String::new(),
+            avatar: None,
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            version: 1,
+            creator: self.local_peer_id, // We're joining, not creating, but need a value
+            admins: vec![],
+            settings: ChannelSettings::default(),
+            signature: [0u8; 64],
+            previous_hash: None,
+        };
+        
+        // Create the channel with the provided secrets
+        let channel = NaisSecureChannel::join(
+            metadata,
+            epoch_secrets,
+            self.identity.clone(),
+            self.local_peer_id,
+        );
+        
+        self.channels.write().await.insert(*channel_id, channel);
+        Ok(())
+    }
+    
+    /// Advance epoch for a channel (key rotation)
+    /// Returns the new epoch secrets to send as a Commit message
+    pub async fn advance_epoch(&self, channel_id: &ChannelId) -> ChannelResult<EpochSecrets> {
+        let mut channels = self.channels.write().await;
+        let channel = channels.get_mut(channel_id)
+            .ok_or_else(|| ChannelError::NotFound(channel_id.to_hex()))?;
+        
+        // Advance to new epoch
+        let new_secrets = channel.epoch_secrets.advance();
+        channel.epoch_secrets = new_secrets.clone();
+        
+        log::info!("Advanced channel {} to epoch {}", channel_id.to_hex(), new_secrets.epoch);
+        Ok(new_secrets)
+    }
+    
+    /// Process a Commit message (epoch advancement from another member)
+    pub async fn process_commit(&self, channel_id: &ChannelId, new_epoch_secrets: EpochSecrets) -> ChannelResult<()> {
+        let mut channels = self.channels.write().await;
+        let channel = channels.get_mut(channel_id)
+            .ok_or_else(|| ChannelError::NotFound(channel_id.to_hex()))?;
+        
+        // Only accept if epoch is newer
+        if new_epoch_secrets.epoch <= channel.epoch_secrets.epoch {
+            log::warn!("Received stale Commit: got epoch {}, have epoch {}", 
+                new_epoch_secrets.epoch, channel.epoch_secrets.epoch);
+            return Err(ChannelError::StaleVersion { 
+                expected: channel.epoch_secrets.epoch + 1, 
+                got: new_epoch_secrets.epoch 
+            });
+        }
+        
+        channel.epoch_secrets = new_epoch_secrets;
+        log::info!("Applied Commit, now at epoch {}", channel.epoch_secrets.epoch);
+        Ok(())
+    }
+    
+    /// Check if any channel needs key rotation
+    pub async fn check_rotation_needed(&self) -> Vec<ChannelId> {
+        let channels = self.channels.read().await;
+        channels.iter()
+            .filter(|(_, ch)| ch.epoch_secrets.should_rotate())
+            .map(|(id, _)| *id)
+            .collect()
+    }
 }
 
 // =============================================================================
@@ -1492,5 +2026,51 @@ mod tests {
         assert!(!settings.discoverable);
         assert!(settings.invite_only);
         assert!(settings.members_can_invite);
+    }
+    
+    #[test]
+    fn test_epoch_secrets_encryption() {
+        // Create epoch secrets from a test shared secret
+        let mut shared_secret = [0u8; 32];
+        for (i, b) in shared_secret.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let epoch = EpochSecrets::initial(&shared_secret);
+        
+        // Test encryption and decryption
+        let plaintext = b"Hello, secure channel!";
+        let encrypted = epoch.encrypt(plaintext).expect("encryption should work");
+        
+        // Encrypted should be longer (nonce + ciphertext + auth tag)
+        assert!(encrypted.len() > plaintext.len());
+        // Should have 12-byte nonce prefix
+        assert!(encrypted.len() >= 12);
+        
+        // Decrypt
+        let decrypted = epoch.decrypt(&encrypted).expect("decryption should work");
+        assert_eq!(decrypted, plaintext);
+        
+        // Wrong key should fail
+        let other_secret = [99u8; 32];
+        let other_epoch = EpochSecrets::initial(&other_secret);
+        assert!(other_epoch.decrypt(&encrypted).is_err());
+    }
+    
+    #[test]
+    fn test_epoch_secrets_key_rotation() {
+        let mut shared_secret = [42u8; 32];
+        let epoch0 = EpochSecrets::initial(&shared_secret);
+        assert_eq!(epoch0.epoch, 0);
+        
+        let epoch1 = epoch0.advance();
+        assert_eq!(epoch1.epoch, 1);
+        
+        // Different epochs should have different encryption keys
+        assert_ne!(epoch0.encryption_key, epoch1.encryption_key);
+        
+        // Message encrypted with epoch0 should not decrypt with epoch1
+        let plaintext = b"Secret message";
+        let encrypted = epoch0.encrypt(plaintext).unwrap();
+        assert!(epoch1.decrypt(&encrypted).is_err());
     }
 }

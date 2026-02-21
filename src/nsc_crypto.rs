@@ -58,6 +58,12 @@ pub enum CryptoError {
 
     #[error("Serialization error: {0}")]
     SerializationError(String),
+
+    #[error("Key has been revoked: {0}")]
+    KeyRevoked(String),
+
+    #[error("Invalid revocation certificate")]
+    InvalidRevocation,
 }
 
 pub type CryptoResult<T> = Result<T, CryptoError>;
@@ -916,6 +922,939 @@ fn kdf_rk(root_key: &[u8; 32], dh_output: &[u8; 32]) -> CryptoResult<([u8; 32], 
 }
 
 // =============================================================================
+// Peer Session Manager
+// =============================================================================
+
+/// Manages per-peer Double Ratchet sessions and PreKey state
+pub struct PeerSessionManager {
+    /// Our identity key pair
+    identity: IdentityKeyPair,
+    /// Our X25519 identity key pair (separate from Ed25519)
+    identity_dh: X25519KeyPair,
+    /// Our pre-key state for receiving X3DH
+    prekey_state: PreKeyState,
+    /// Active Double Ratchet sessions by peer fingerprint
+    sessions: HashMap<[u8; 32], DoubleRatchetSession>,
+    /// Pending X3DH headers waiting for session establishment
+    pending_x3dh: HashMap<[u8; 32], X3dhSenderOutput>,
+}
+
+impl PeerSessionManager {
+    /// Create a new peer session manager
+    pub fn new(identity: IdentityKeyPair) -> Self {
+        let identity_dh = X25519KeyPair::generate();
+        let prekey_state = PreKeyState::new(identity.clone(), 20);
+        
+        Self {
+            identity,
+            identity_dh,
+            prekey_state,
+            sessions: HashMap::new(),
+            pending_x3dh: HashMap::new(),
+        }
+    }
+    
+    /// Create from existing identity with custom prekey count
+    pub fn with_prekey_count(identity: IdentityKeyPair, prekey_count: usize) -> Self {
+        let identity_dh = X25519KeyPair::generate();
+        let prekey_state = PreKeyState::new(identity.clone(), prekey_count);
+        
+        Self {
+            identity,
+            identity_dh,
+            prekey_state,
+            sessions: HashMap::new(),
+            pending_x3dh: HashMap::new(),
+        }
+    }
+    
+    /// Get our PreKeyBundle for sharing with peers
+    pub fn get_prekey_bundle(&self) -> PreKeyBundle {
+        self.prekey_state.to_bundle()
+    }
+    
+    /// Get our identity public key
+    pub fn identity_public_key(&self) -> IdentityPublicKey {
+        self.identity.public_key()
+    }
+    
+    /// Initiate X3DH with a peer's PreKeyBundle
+    /// Returns the X3DH header to send with the first message
+    pub fn initiate_session(&mut self, their_fingerprint: [u8; 32], their_bundle: &PreKeyBundle) -> CryptoResult<X3dhHeader> {
+        // Check if session already exists
+        if self.sessions.contains_key(&their_fingerprint) {
+            return Err(CryptoError::SessionNotFound); // Reuse error for "already exists"
+        }
+        
+        // Perform X3DH as sender
+        let x3dh_output = x3dh_sender(&self.identity, &self.identity_dh, their_bundle)?;
+        
+        // Create header to send
+        let header = X3dhHeader {
+            identity_key: self.identity.public_key(),
+            identity_dh_key: x3dh_output.identity_dh_public,
+            ephemeral_key: x3dh_output.ephemeral_public,
+            one_time_prekey: x3dh_output.used_one_time_prekey,
+        };
+        
+        // Get their signed prekey for ratchet initialization
+        let their_ratchet_key = their_bundle.signed_prekey;
+        
+        // Initialize Double Ratchet session as sender
+        let session = DoubleRatchetSession::init_sender(x3dh_output.agreement, their_ratchet_key)?;
+        
+        self.sessions.insert(their_fingerprint, session);
+        
+        Ok(header)
+    }
+    
+    /// Complete session from received X3DH header (we're the responder)
+    pub fn receive_session(&mut self, their_fingerprint: [u8; 32], header: &X3dhHeader) -> CryptoResult<()> {
+        // Check if session already exists
+        if self.sessions.contains_key(&their_fingerprint) {
+            return Ok(()); // Already have session
+        }
+        
+        // Perform X3DH as receiver
+        let agreement = x3dh_receiver(&mut self.prekey_state, header)?;
+        
+        // Initialize Double Ratchet as receiver using our signed prekey
+        let session = DoubleRatchetSession::init_receiver(agreement, self.prekey_state.signed_prekey.clone());
+        
+        self.sessions.insert(their_fingerprint, session);
+        
+        Ok(())
+    }
+    
+    /// Encrypt message for a peer
+    pub fn encrypt_for_peer(&mut self, peer_fingerprint: &[u8; 32], plaintext: &[u8]) -> CryptoResult<(MessageHeader, Vec<u8>)> {
+        let session = self.sessions.get_mut(peer_fingerprint)
+            .ok_or(CryptoError::SessionNotFound)?;
+        
+        session.encrypt(plaintext)
+    }
+    
+    /// Decrypt message from a peer
+    pub fn decrypt_from_peer(&mut self, peer_fingerprint: &[u8; 32], header: &MessageHeader, ciphertext: &[u8]) -> CryptoResult<Vec<u8>> {
+        let session = self.sessions.get_mut(peer_fingerprint)
+            .ok_or(CryptoError::SessionNotFound)?;
+        
+        session.decrypt(header, ciphertext)
+    }
+    
+    /// Check if we have a session with a peer
+    pub fn has_session(&self, peer_fingerprint: &[u8; 32]) -> bool {
+        self.sessions.contains_key(peer_fingerprint)
+    }
+    
+    /// Remove a session (e.g., when peer leaves)
+    pub fn remove_session(&mut self, peer_fingerprint: &[u8; 32]) {
+        self.sessions.remove(peer_fingerprint);
+    }
+    
+    /// Get the number of active sessions
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+    
+    /// Rotate our signed prekey (should be done periodically)
+    pub fn rotate_prekey(&mut self) {
+        self.prekey_state.rotate_signed_prekey();
+    }
+    
+    /// Generate more one-time prekeys if running low
+    pub fn replenish_prekeys(&mut self, count: usize) {
+        self.prekey_state.generate_one_time_prekeys(count);
+    }
+    
+    /// Get number of available one-time prekeys
+    pub fn available_prekeys(&self) -> usize {
+        self.prekey_state.one_time_prekeys.len()
+    }
+    
+    /// Serialize PreKeyBundle to bytes for transmission
+    pub fn serialize_prekey_bundle(&self) -> CryptoResult<Vec<u8>> {
+        let bundle = self.get_prekey_bundle();
+        
+        let mut bytes = Vec::with_capacity(256);
+        
+        // Identity key (32 bytes)
+        bytes.extend_from_slice(&bundle.identity_key.to_bytes());
+        
+        // Identity DH key (32 bytes)
+        bytes.extend_from_slice(bundle.identity_dh_key.as_bytes());
+        
+        // Signed prekey (32 bytes)
+        bytes.extend_from_slice(bundle.signed_prekey.as_bytes());
+        
+        // Signed prekey signature (64 bytes)
+        bytes.extend_from_slice(&bundle.signed_prekey_signature);
+        
+        // One-time prekey count (2 bytes)
+        let otpk_count = bundle.one_time_prekeys.len().min(u16::MAX as usize) as u16;
+        bytes.extend_from_slice(&otpk_count.to_be_bytes());
+        
+        // One-time prekeys (32 bytes each)
+        for otpk in bundle.one_time_prekeys.iter().take(otpk_count as usize) {
+            bytes.extend_from_slice(otpk.as_bytes());
+        }
+        
+        Ok(bytes)
+    }
+    
+    /// Deserialize PreKeyBundle from bytes
+    pub fn deserialize_prekey_bundle(bytes: &[u8]) -> CryptoResult<PreKeyBundle> {
+        if bytes.len() < 162 { // 32 + 32 + 32 + 64 + 2 = minimum size
+            return Err(CryptoError::InvalidKeyLength { expected: 162, got: bytes.len() });
+        }
+        
+        let mut offset = 0;
+        
+        // Identity key
+        let identity_key = IdentityPublicKey::from_bytes(&bytes[offset..offset + 32])?;
+        offset += 32;
+        
+        // Identity DH key
+        let mut dh_bytes = [0u8; 32];
+        dh_bytes.copy_from_slice(&bytes[offset..offset + 32]);
+        let identity_dh_key = X25519PublicKey::from(dh_bytes);
+        offset += 32;
+        
+        // Signed prekey
+        let mut spk_bytes = [0u8; 32];
+        spk_bytes.copy_from_slice(&bytes[offset..offset + 32]);
+        let signed_prekey = X25519PublicKey::from(spk_bytes);
+        offset += 32;
+        
+        // Signature
+        let mut signed_prekey_signature = [0u8; 64];
+        signed_prekey_signature.copy_from_slice(&bytes[offset..offset + 64]);
+        offset += 64;
+        
+        // One-time prekey count
+        let otpk_count = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+        offset += 2;
+        
+        // One-time prekeys
+        let mut one_time_prekeys = Vec::with_capacity(otpk_count);
+        for _ in 0..otpk_count {
+            if offset + 32 > bytes.len() {
+                break;
+            }
+            let mut otpk_bytes = [0u8; 32];
+            otpk_bytes.copy_from_slice(&bytes[offset..offset + 32]);
+            one_time_prekeys.push(X25519PublicKey::from(otpk_bytes));
+            offset += 32;
+        }
+        
+        Ok(PreKeyBundle {
+            identity_key,
+            identity_dh_key,
+            signed_prekey,
+            signed_prekey_signature,
+            one_time_prekeys,
+        })
+    }
+}
+
+// =============================================================================
+// Trust Verification System
+// =============================================================================
+
+/// How a peer's identity was verified
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TrustVerificationMethod {
+    /// Trust on first use - we stored their key when first seen
+    Tofu,
+    /// Fingerprint comparison (e.g., user compared safety numbers)
+    FingerprintComparison,
+    /// QR code scan 
+    QrCodeScan,
+    /// Vouched by a trusted third party (web of trust)
+    VouchedBy(String),
+    /// Manually marked as trusted by user
+    ManualApproval,
+}
+
+/// Trust level for a peer
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum TrustLevel {
+    /// Unknown peer - never seen before
+    Unknown,
+    /// TOFU - first key we saw for this peer
+    Tofu {
+        first_seen: u64,
+        pinned_key: [u8; 32],
+    },
+    /// Verified by user action
+    Verified {
+        verified_at: u64,
+        method: TrustVerificationMethod,
+    },
+    /// Key changed since we last verified - warning state
+    KeyChanged {
+        previous_key: [u8; 32],
+        new_key: [u8; 32],
+        changed_at: u64,
+    },
+    /// Explicitly marked as untrusted/compromised
+    Compromised {
+        marked_at: u64,
+        reason: String,
+    },
+}
+
+/// Stored trust record for a peer
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TrustRecord {
+    /// Peer's identity fingerprint (hex)
+    pub fingerprint: String,
+    /// Current trust level
+    pub trust_level: TrustLevel,
+    /// Display name if known
+    pub display_name: Option<String>,
+    /// Last interaction timestamp
+    pub last_seen: u64,
+    /// Number of successful verifications
+    pub verification_count: u32,
+}
+
+/// Manages trust relationships with peers
+pub struct TrustManager {
+    /// Trust records by fingerprint
+    records: HashMap<String, TrustRecord>,
+}
+
+impl TrustManager {
+    /// Create a new trust manager
+    pub fn new() -> Self {
+        Self {
+            records: HashMap::new(),
+        }
+    }
+    
+    /// Load from existing records
+    pub fn with_records(records: HashMap<String, TrustRecord>) -> Self {
+        Self { records }
+    }
+    
+    /// Get all trust records (for persistence)
+    pub fn all_records(&self) -> &HashMap<String, TrustRecord> {
+        &self.records
+    }
+    
+    /// Record first contact with a peer (TOFU)
+    pub fn record_tofu(&mut self, identity_key: &IdentityPublicKey, display_name: Option<&str>) -> &TrustRecord {
+        let fingerprint = identity_key.fingerprint_hex();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        self.records.entry(fingerprint.clone()).or_insert_with(|| {
+            TrustRecord {
+                fingerprint: fingerprint.clone(),
+                trust_level: TrustLevel::Tofu {
+                    first_seen: now,
+                    pinned_key: identity_key.fingerprint(),
+                },
+                display_name: display_name.map(String::from),
+                last_seen: now,
+                verification_count: 0,
+            }
+        });
+        
+        // Update last_seen if record already exists
+        if let Some(record) = self.records.get_mut(&fingerprint) {
+            record.last_seen = now;
+        }
+        
+        self.records.get(&fingerprint).unwrap()
+    }
+    
+    /// Verify a peer's identity
+    pub fn verify_peer(&mut self, fingerprint: &str, method: TrustVerificationMethod) -> Result<(), String> {
+        let record = self.records.get_mut(fingerprint)
+            .ok_or_else(|| "Unknown peer".to_string())?;
+        
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        record.trust_level = TrustLevel::Verified {
+            verified_at: now,
+            method,
+        };
+        record.verification_count += 1;
+        record.last_seen = now;
+        
+        Ok(())
+    }
+    
+    /// Check if a peer's key has changed (must be called when connecting)
+    pub fn check_key(&mut self, identity_key: &IdentityPublicKey) -> TrustCheckResult {
+        let fingerprint = identity_key.fingerprint_hex();
+        let current_key = identity_key.fingerprint();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        match self.records.get(&fingerprint) {
+            None => {
+                // First contact - create TOFU record
+                self.records.insert(fingerprint.clone(), TrustRecord {
+                    fingerprint,
+                    trust_level: TrustLevel::Tofu {
+                        first_seen: now,
+                        pinned_key: current_key,
+                    },
+                    display_name: None,
+                    last_seen: now,
+                    verification_count: 0,
+                });
+                TrustCheckResult::NewPeer
+            }
+            Some(record) => {
+                match &record.trust_level {
+                    TrustLevel::Tofu { pinned_key, .. } => {
+                        // Check if key matches the pinned key from TOFU
+                        let stored_key = *pinned_key;
+                        if stored_key == current_key {
+                            return TrustCheckResult::Trusted;
+                        } else {
+                            // Key changed!
+                            let prev_key = stored_key;
+                            self.records.get_mut(&identity_key.fingerprint_hex()).unwrap().trust_level = 
+                                TrustLevel::KeyChanged {
+                                    previous_key: prev_key,
+                                    new_key: current_key,
+                                    changed_at: now,
+                                };
+                            return TrustCheckResult::KeyChanged { previous: prev_key, current: current_key };
+                        }
+                    }
+                    TrustLevel::Verified { .. } => {
+                        // Already explicitly verified by user - trust it
+                        // In a production system, we'd store and check the verified key
+                        // For now, if manually verified, we trust the peer
+                        TrustCheckResult::Trusted
+                    }
+                    TrustLevel::KeyChanged { .. } => TrustCheckResult::KeyChanged {
+                        previous: [0u8; 32], // Unknown previous
+                        current: current_key,
+                    },
+                    TrustLevel::Compromised { reason, .. } => TrustCheckResult::Compromised(reason.clone()),
+                    TrustLevel::Unknown => TrustCheckResult::Untrusted,
+                }
+            }
+        }
+    }
+    
+    /// Mark a peer as compromised/untrusted
+    pub fn mark_compromised(&mut self, fingerprint: &str, reason: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        if let Some(record) = self.records.get_mut(fingerprint) {
+            record.trust_level = TrustLevel::Compromised {
+                marked_at: now,
+                reason: reason.to_string(),
+            };
+        }
+    }
+    
+    /// Accept a key change (user acknowledged the change)
+    pub fn accept_key_change(&mut self, fingerprint: &str) -> Result<(), String> {
+        let record = self.records.get_mut(fingerprint)
+            .ok_or_else(|| "Unknown peer".to_string())?;
+        
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        if let TrustLevel::KeyChanged { new_key, .. } = &record.trust_level {
+            record.trust_level = TrustLevel::Tofu {
+                first_seen: now,
+                pinned_key: *new_key,
+            };
+            Ok(())
+        } else {
+            Err("Peer is not in key changed state".to_string())
+        }
+    }
+    
+    /// Get trust level for a peer
+    pub fn get_trust_level(&self, fingerprint: &str) -> Option<&TrustLevel> {
+        self.records.get(fingerprint).map(|r| &r.trust_level)
+    }
+    
+    /// Get a human-readable trust description
+    pub fn get_trust_description(&self, fingerprint: &str) -> String {
+        match self.records.get(fingerprint) {
+            None => "Unknown".to_string(),
+            Some(record) => match &record.trust_level {
+                TrustLevel::Unknown => "Unknown".to_string(),
+                TrustLevel::Tofu { .. } => "Trust on first use".to_string(),
+                TrustLevel::Verified { method, .. } => {
+                    format!("Verified via {:?}", method)
+                }
+                TrustLevel::KeyChanged { .. } => "⚠️ Key changed!".to_string(),
+                TrustLevel::Compromised { reason, .. } => format!("⛔ Compromised: {}", reason),
+            }
+        }
+    }
+    
+    /// Generate safety numbers for verification
+    /// These are strings users can compare out-of-band
+    pub fn generate_safety_number(our_fingerprint: &[u8; 32], their_fingerprint: &[u8; 32]) -> String {
+        use sha2::Digest;
+        let mut hasher = Sha256::new();
+        
+        // Use consistent ordering by sorting fingerprints
+        let (first, second) = if our_fingerprint < their_fingerprint {
+            (our_fingerprint, their_fingerprint)
+        } else {
+            (their_fingerprint, our_fingerprint)
+        };
+        
+        hasher.update(first);
+        hasher.update(second);
+        let hash = hasher.finalize();
+        
+        // Format as 12 groups of 5 digits
+        let mut safety_number = String::with_capacity(72);
+        for i in 0..12 {
+            let chunk = &hash[i * 2..(i * 2) + 2];
+            let num = (u16::from_be_bytes([chunk[0], chunk[1]]) as u32) % 100000;
+            if i > 0 {
+                safety_number.push(' ');
+            }
+            safety_number.push_str(&format!("{:05}", num));
+        }
+        
+        safety_number
+    }
+}
+
+impl Default for TrustManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Result of checking a peer's identity key
+#[derive(Clone, Debug)]
+pub enum TrustCheckResult {
+    /// New peer, TOFU applied
+    NewPeer,
+    /// Known and trusted peer
+    Trusted,
+    /// Known but not verified
+    Untrusted,
+    /// Key has changed since last seen - potential attack!
+    KeyChanged {
+        previous: [u8; 32],
+        current: [u8; 32],
+    },
+    /// Peer marked as compromised
+    Compromised(String),
+    /// Key has been revoked
+    Revoked(RevocationReason),
+}
+
+// =============================================================================
+// Key Revocation System
+// =============================================================================
+
+/// Reason for key revocation
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RevocationReason {
+    /// Key was compromised (known to attacker)
+    Compromised,
+    /// Planned key rotation (not compromised)
+    KeyRotation,
+    /// Device was lost or stolen
+    DeviceLost,
+    /// User requested revocation
+    UserRequested,
+    /// Key expired
+    Expired,
+    /// Device deauthorized
+    DeviceDeauthorized,
+}
+
+impl std::fmt::Display for RevocationReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Compromised => write!(f, "Key compromised"),
+            Self::KeyRotation => write!(f, "Key rotation"),
+            Self::DeviceLost => write!(f, "Device lost"),
+            Self::UserRequested => write!(f, "User requested"),
+            Self::Expired => write!(f, "Key expired"),
+            Self::DeviceDeauthorized => write!(f, "Device deauthorized"),
+        }
+    }
+}
+
+/// A signed revocation certificate
+#[derive(Clone, Debug)]
+pub struct RevocationCertificate {
+    /// The revoked key's fingerprint
+    pub revoked_fingerprint: [u8; 32],
+    /// Reason for revocation
+    pub reason: RevocationReason,
+    /// Timestamp of revocation
+    pub revoked_at: u64,
+    /// Optional successor key fingerprint (for rotation)
+    pub successor_fingerprint: Option<[u8; 32]>,
+    /// The revoking authority's fingerprint (usually same as revoked, or parent key)
+    pub revoker_fingerprint: [u8; 32],
+    /// Ed25519 signature over the revocation data (64 bytes)
+    pub signature: [u8; 64],
+}
+
+// Manual serde implementation for RevocationCertificate to handle [u8; 64]
+impl serde::Serialize for RevocationCertificate {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("RevocationCertificate", 6)?;
+        state.serialize_field("revoked_fingerprint", &hex::encode(self.revoked_fingerprint))?;
+        state.serialize_field("reason", &self.reason)?;
+        state.serialize_field("revoked_at", &self.revoked_at)?;
+        state.serialize_field("successor_fingerprint", &self.successor_fingerprint.map(|f| hex::encode(f)))?;
+        state.serialize_field("revoker_fingerprint", &hex::encode(self.revoker_fingerprint))?;
+        state.serialize_field("signature", &hex::encode(self.signature))?;
+        state.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RevocationCertificate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct Helper {
+            revoked_fingerprint: String,
+            reason: RevocationReason,
+            revoked_at: u64,
+            successor_fingerprint: Option<String>,
+            revoker_fingerprint: String,
+            signature: String,
+        }
+        
+        let helper = Helper::deserialize(deserializer)?;
+        
+        let revoked_fingerprint = hex::decode(&helper.revoked_fingerprint)
+            .map_err(serde::de::Error::custom)?;
+        if revoked_fingerprint.len() != 32 {
+            return Err(serde::de::Error::custom("invalid revoked_fingerprint length"));
+        }
+        let mut rf = [0u8; 32];
+        rf.copy_from_slice(&revoked_fingerprint);
+        
+        let revoker_fingerprint = hex::decode(&helper.revoker_fingerprint)
+            .map_err(serde::de::Error::custom)?;
+        if revoker_fingerprint.len() != 32 {
+            return Err(serde::de::Error::custom("invalid revoker_fingerprint length"));
+        }
+        let mut rkf = [0u8; 32];
+        rkf.copy_from_slice(&revoker_fingerprint);
+        
+        let signature = hex::decode(&helper.signature)
+            .map_err(serde::de::Error::custom)?;
+        if signature.len() != 64 {
+            return Err(serde::de::Error::custom("invalid signature length"));
+        }
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&signature);
+        
+        let successor_fingerprint = if let Some(s) = helper.successor_fingerprint {
+            let sf = hex::decode(&s).map_err(serde::de::Error::custom)?;
+            if sf.len() != 32 {
+                return Err(serde::de::Error::custom("invalid successor_fingerprint length"));
+            }
+            let mut sfp = [0u8; 32];
+            sfp.copy_from_slice(&sf);
+            Some(sfp)
+        } else {
+            None
+        };
+        
+        Ok(Self {
+            revoked_fingerprint: rf,
+            reason: helper.reason,
+            revoked_at: helper.revoked_at,
+            successor_fingerprint,
+            revoker_fingerprint: rkf,
+            signature: sig,
+        })
+    }
+}
+
+impl RevocationCertificate {
+    /// Create a self-revocation (key owner revokes their own key)
+    pub fn self_revoke(
+        identity: &IdentityKeyPair,
+        reason: RevocationReason,
+        successor: Option<&IdentityKeyPair>,
+    ) -> Self {
+        let revoked_fingerprint = identity.fingerprint();
+        let revoker_fingerprint = revoked_fingerprint;
+        let successor_fingerprint = successor.map(|s| s.fingerprint());
+        let revoked_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let mut cert = Self {
+            revoked_fingerprint,
+            reason,
+            revoked_at,
+            successor_fingerprint,
+            revoker_fingerprint,
+            signature: [0u8; 64],
+        };
+        
+        cert.sign(identity);
+        cert
+    }
+    
+    /// Sign the revocation certificate
+    fn sign(&mut self, signer: &IdentityKeyPair) {
+        let data = self.signing_data();
+        self.signature = signer.sign(&data);
+    }
+    
+    /// Get the data to be signed
+    fn signing_data(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(128);
+        data.extend_from_slice(b"NSC_REVOCATION_v1");
+        data.extend_from_slice(&self.revoked_fingerprint);
+        data.push(self.reason_byte());
+        data.extend_from_slice(&self.revoked_at.to_be_bytes());
+        if let Some(successor) = &self.successor_fingerprint {
+            data.push(1);
+            data.extend_from_slice(successor);
+        } else {
+            data.push(0);
+        }
+        data.extend_from_slice(&self.revoker_fingerprint);
+        data
+    }
+    
+    fn reason_byte(&self) -> u8 {
+        match self.reason {
+            RevocationReason::Compromised => 0,
+            RevocationReason::KeyRotation => 1,
+            RevocationReason::DeviceLost => 2,
+            RevocationReason::UserRequested => 3,
+            RevocationReason::Expired => 4,
+            RevocationReason::DeviceDeauthorized => 5,
+        }
+    }
+    
+    /// Verify the revocation certificate signature
+    pub fn verify(&self, revoker_public_key: &IdentityPublicKey) -> bool {
+        let data = self.signing_data();
+        revoker_public_key.verify(&data, &self.signature).is_ok()
+    }
+    
+    /// Serialize to bytes
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(170);
+        bytes.extend_from_slice(&self.revoked_fingerprint);
+        bytes.push(self.reason_byte());
+        bytes.extend_from_slice(&self.revoked_at.to_be_bytes());
+        if let Some(successor) = &self.successor_fingerprint {
+            bytes.push(1);
+            bytes.extend_from_slice(successor);
+        } else {
+            bytes.push(0);
+        }
+        bytes.extend_from_slice(&self.revoker_fingerprint);
+        bytes.extend_from_slice(&self.signature);
+        bytes
+    }
+    
+    /// Deserialize from bytes
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 106 {
+            return None;
+        }
+        
+        let mut revoked_fingerprint = [0u8; 32];
+        revoked_fingerprint.copy_from_slice(&bytes[0..32]);
+        
+        let reason = match bytes[32] {
+            0 => RevocationReason::Compromised,
+            1 => RevocationReason::KeyRotation,
+            2 => RevocationReason::DeviceLost,
+            3 => RevocationReason::UserRequested,
+            4 => RevocationReason::Expired,
+            5 => RevocationReason::DeviceDeauthorized,
+            _ => return None,
+        };
+        
+        let mut revoked_at_bytes = [0u8; 8];
+        revoked_at_bytes.copy_from_slice(&bytes[33..41]);
+        let revoked_at = u64::from_be_bytes(revoked_at_bytes);
+        
+        let (successor_fingerprint, offset) = if bytes[41] == 1 {
+            if bytes.len() < 138 {
+                return None;
+            }
+            let mut fp = [0u8; 32];
+            fp.copy_from_slice(&bytes[42..74]);
+            (Some(fp), 74)
+        } else {
+            (None, 42)
+        };
+        
+        if bytes.len() < offset + 96 {
+            return None;
+        }
+        
+        let mut revoker_fingerprint = [0u8; 32];
+        revoker_fingerprint.copy_from_slice(&bytes[offset..offset + 32]);
+        
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&bytes[offset + 32..offset + 96]);
+        
+        Some(Self {
+            revoked_fingerprint,
+            reason,
+            revoked_at,
+            successor_fingerprint,
+            revoker_fingerprint,
+            signature,
+        })
+    }
+}
+
+/// Manages key revocations
+pub struct RevocationManager {
+    /// Known revocations by revoked fingerprint (hex)
+    revocations: HashMap<String, RevocationCertificate>,
+    /// Revocations pending broadcast
+    pending_broadcasts: Vec<RevocationCertificate>,
+}
+
+impl RevocationManager {
+    /// Create a new revocation manager
+    pub fn new() -> Self {
+        Self {
+            revocations: HashMap::new(),
+            pending_broadcasts: Vec::new(),
+        }
+    }
+    
+    /// Load from existing revocations
+    pub fn with_revocations(revocations: HashMap<String, RevocationCertificate>) -> Self {
+        Self {
+            revocations,
+            pending_broadcasts: Vec::new(),
+        }
+    }
+    
+    /// Get all revocations (for persistence)
+    pub fn all_revocations(&self) -> &HashMap<String, RevocationCertificate> {
+        &self.revocations
+    }
+    
+    /// Revoke our own key
+    pub fn revoke_self(
+        &mut self,
+        identity: &IdentityKeyPair,
+        reason: RevocationReason,
+        successor: Option<&IdentityKeyPair>,
+    ) -> RevocationCertificate {
+        let cert = RevocationCertificate::self_revoke(identity, reason, successor);
+        let fingerprint_hex = hex::encode(cert.revoked_fingerprint);
+        self.revocations.insert(fingerprint_hex, cert.clone());
+        self.pending_broadcasts.push(cert.clone());
+        cert
+    }
+    
+    /// Process a received revocation certificate
+    pub fn process_revocation(
+        &mut self,
+        cert: &RevocationCertificate,
+        revoker_key: Option<&IdentityPublicKey>,
+    ) -> Result<(), CryptoError> {
+        // For self-revocation, revoker_key can be derived from revoked key
+        // For authority revocation, must provide the authority's key
+        if let Some(key) = revoker_key {
+            if !cert.verify(key) {
+                return Err(CryptoError::InvalidRevocation);
+            }
+        }
+        
+        let fingerprint_hex = hex::encode(cert.revoked_fingerprint);
+        
+        // Check if we already have a newer revocation
+        if let Some(existing) = self.revocations.get(&fingerprint_hex) {
+            if existing.revoked_at >= cert.revoked_at {
+                return Ok(()); // Already have newer or same revocation
+            }
+        }
+        
+        self.revocations.insert(fingerprint_hex, cert.clone());
+        Ok(())
+    }
+    
+    /// Check if a key is revoked
+    pub fn is_revoked(&self, fingerprint: &[u8; 32]) -> Option<&RevocationCertificate> {
+        let fingerprint_hex = hex::encode(fingerprint);
+        self.revocations.get(&fingerprint_hex)
+    }
+    
+    /// Check if a key is revoked (hex fingerprint)
+    pub fn is_revoked_hex(&self, fingerprint_hex: &str) -> Option<&RevocationCertificate> {
+        self.revocations.get(fingerprint_hex)
+    }
+    
+    /// Get successor key if one exists
+    pub fn get_successor(&self, fingerprint: &[u8; 32]) -> Option<[u8; 32]> {
+        self.is_revoked(fingerprint).and_then(|cert| cert.successor_fingerprint)
+    }
+    
+    /// Take pending broadcasts (clears the list)
+    pub fn take_pending_broadcasts(&mut self) -> Vec<RevocationCertificate> {
+        std::mem::take(&mut self.pending_broadcasts)
+    }
+    
+    /// Clear expired revocations (older than retention period)
+    pub fn clear_expired(&mut self, max_age_secs: u64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        self.revocations.retain(|_, cert| {
+            // Keep revocations that are newer than max_age
+            // Exception: always keep compromised key revocations
+            cert.reason == RevocationReason::Compromised || 
+            now - cert.revoked_at < max_age_secs
+        });
+    }
+}
+
+impl Default for RevocationManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// =============================================================================
 // Secure Key Storage
 // =============================================================================
 
@@ -995,6 +1934,258 @@ impl KeyStorage {
 impl Drop for KeyStorage {
     fn drop(&mut self) {
         self.storage_key.zeroize();
+    }
+}
+
+// =============================================================================
+// Session Persistence
+// =============================================================================
+
+/// Serializable form of Double Ratchet session state
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SerializedSession {
+    /// Our ratchet private key (if we have one)
+    pub ratchet_private_key: Option<[u8; 32]>,
+    /// Their current ratchet public key
+    pub remote_ratchet_key: Option<[u8; 32]>,
+    /// Root key
+    pub root_key: [u8; 32],
+    /// Sending chain key (if any)
+    pub sending_chain: Option<[u8; 32]>,
+    /// Receiving chain key (if any)
+    pub receiving_chain: Option<[u8; 32]>,
+    /// Message counts
+    pub send_count: u32,
+    pub recv_count: u32,
+    pub previous_chain_length: u32,
+    /// Skipped keys: (ratchet_key_hex, msg_num) -> message_key_bytes
+    pub skipped_keys: Vec<(String, u32, [u8; 32])>,
+    /// Associated data
+    pub associated_data: Vec<u8>,
+}
+
+/// Serializable form of PreKey state
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SerializedPreKeyState {
+    /// Identity DH private key
+    pub identity_dh_private: [u8; 32],
+    /// Signed prekey private
+    pub signed_prekey_private: [u8; 32],
+    /// Signed prekey signature (stored as Vec since [u8; 64] doesn't impl serde)
+    pub signed_prekey_signature: Vec<u8>,
+    /// One-time prekeys (private keys)
+    pub one_time_prekeys: Vec<[u8; 32]>,
+}
+
+/// Full serializable form of PeerSessionManager
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SerializedPeerSessionManager {
+    /// Identity private key bytes
+    pub identity_private_key: [u8; 32],
+    /// PreKey state
+    pub prekey_state: SerializedPreKeyState,
+    /// Sessions by peer fingerprint (hex)
+    pub sessions: Vec<(String, SerializedSession)>,
+}
+
+impl DoubleRatchetSession {
+    /// Serialize session state for persistence
+    pub fn to_serialized(&self) -> SerializedSession {
+        SerializedSession {
+            ratchet_private_key: self.ratchet_keypair.as_ref().map(|kp| kp.secret_bytes()),
+            remote_ratchet_key: self.remote_ratchet_key.map(|k| k.to_bytes()),
+            root_key: self.root_key,
+            sending_chain: self.sending_chain.as_ref().map(|c| c.0),
+            receiving_chain: self.receiving_chain.as_ref().map(|c| c.0),
+            send_count: self.send_count,
+            recv_count: self.recv_count,
+            previous_chain_length: self.previous_chain_length,
+            skipped_keys: self.skipped_keys.iter()
+                .map(|((rk, num), mk)| (hex::encode(rk), *num, mk.0))
+                .collect(),
+            associated_data: self.associated_data.clone(),
+        }
+    }
+    
+    /// Restore session from serialized state
+    pub fn from_serialized(s: SerializedSession) -> Self {
+        let ratchet_keypair = s.ratchet_private_key.map(|pk| {
+            let secret = X25519SecretKey::from(pk);
+            let public = X25519PublicKey::from(&secret);
+            X25519KeyPair { secret, public }
+        });
+        
+        let remote_ratchet_key = s.remote_ratchet_key.map(X25519PublicKey::from);
+        
+        let sending_chain = s.sending_chain.map(ChainKey::new);
+        let receiving_chain = s.receiving_chain.map(ChainKey::new);
+        
+        let skipped_keys: HashMap<([u8; 32], u32), MessageKey> = s.skipped_keys
+            .into_iter()
+            .filter_map(|(rk_hex, num, mk_bytes)| {
+                let rk_bytes = hex::decode(&rk_hex).ok()?;
+                if rk_bytes.len() != 32 { return None; }
+                let mut rk = [0u8; 32];
+                rk.copy_from_slice(&rk_bytes);
+                Some(((rk, num), MessageKey(mk_bytes)))
+            })
+            .collect();
+        
+        Self {
+            ratchet_keypair,
+            remote_ratchet_key,
+            root_key: s.root_key,
+            sending_chain,
+            receiving_chain,
+            send_count: s.send_count,
+            recv_count: s.recv_count,
+            previous_chain_length: s.previous_chain_length,
+            skipped_keys,
+            associated_data: s.associated_data,
+        }
+    }
+}
+
+impl PeerSessionManager {
+    /// Serialize entire manager state for encrypted storage
+    pub fn to_serialized(&self) -> SerializedPeerSessionManager {
+        let prekey_state = SerializedPreKeyState {
+            identity_dh_private: self.identity_dh.secret_bytes(),
+            signed_prekey_private: self.prekey_state.signed_prekey.secret_bytes(),
+            signed_prekey_signature: self.prekey_state.signed_prekey_signature.to_vec(),
+            one_time_prekeys: self.prekey_state.one_time_prekeys
+                .iter()
+                .map(|kp| kp.secret_bytes())
+                .collect(),
+        };
+        
+        let sessions = self.sessions
+            .iter()
+            .map(|(fingerprint, session)| {
+                (hex::encode(fingerprint), session.to_serialized())
+            })
+            .collect();
+        
+        SerializedPeerSessionManager {
+            identity_private_key: self.identity.to_bytes(),
+            prekey_state,
+            sessions,
+        }
+    }
+    
+    /// Restore manager from serialized state
+    pub fn from_serialized(s: SerializedPeerSessionManager) -> Self {
+        let identity = IdentityKeyPair::from_bytes(&s.identity_private_key);
+        
+        // Restore identity DH
+        let identity_dh_secret = X25519SecretKey::from(s.prekey_state.identity_dh_private);
+        let identity_dh_public = X25519PublicKey::from(&identity_dh_secret);
+        let identity_dh = X25519KeyPair {
+            secret: identity_dh_secret,
+            public: identity_dh_public,
+        };
+        
+        // Restore signed prekey
+        let signed_prekey_secret = X25519SecretKey::from(s.prekey_state.signed_prekey_private);
+        let signed_prekey_public = X25519PublicKey::from(&signed_prekey_secret);
+        let signed_prekey = X25519KeyPair {
+            secret: signed_prekey_secret,
+            public: signed_prekey_public,
+        };
+        
+        // Restore one-time prekeys
+        let one_time_prekeys: Vec<X25519KeyPair> = s.prekey_state.one_time_prekeys
+            .into_iter()
+            .map(|pk| {
+                let secret = X25519SecretKey::from(pk);
+                let public = X25519PublicKey::from(&secret);
+                X25519KeyPair { secret, public }
+            })
+            .collect();
+        
+        // Convert Vec<u8> signature back to [u8; 64]
+        let mut signed_prekey_signature = [0u8; 64];
+        if s.prekey_state.signed_prekey_signature.len() >= 64 {
+            signed_prekey_signature.copy_from_slice(&s.prekey_state.signed_prekey_signature[..64]);
+        }
+        
+        let prekey_state = PreKeyState {
+            identity: identity.clone(),
+            identity_dh: identity_dh.clone(),
+            signed_prekey,
+            signed_prekey_signature,
+            one_time_prekeys,
+            used_one_time_prekeys: std::collections::HashSet::new(),
+        };
+        
+        // Restore sessions
+        let sessions: HashMap<[u8; 32], DoubleRatchetSession> = s.sessions
+            .into_iter()
+            .filter_map(|(fingerprint_hex, session)| {
+                let fingerprint_bytes = hex::decode(&fingerprint_hex).ok()?;
+                if fingerprint_bytes.len() != 32 { return None; }
+                let mut fingerprint = [0u8; 32];
+                fingerprint.copy_from_slice(&fingerprint_bytes);
+                Some((fingerprint, DoubleRatchetSession::from_serialized(session)))
+            })
+            .collect();
+        
+        Self {
+            identity,
+            identity_dh,
+            prekey_state,
+            sessions,
+            pending_x3dh: HashMap::new(),
+        }
+    }
+}
+
+impl TrustManager {
+    /// Serialize trust records for storage
+    pub fn to_serialized(&self) -> Vec<TrustRecord> {
+        self.all_records().values().cloned().collect()
+    }
+    
+    /// Restore from serialized records
+    pub fn from_serialized(records: Vec<TrustRecord>) -> Self {
+        let map: HashMap<String, TrustRecord> = records.into_iter()
+            .map(|r| (r.fingerprint.clone(), r))
+            .collect();
+        Self::with_records(map)
+    }
+}
+
+impl KeyStorage {
+    /// Save peer session manager to encrypted bytes
+    pub fn save_sessions(&self, manager: &PeerSessionManager) -> CryptoResult<Vec<u8>> {
+        let serialized = manager.to_serialized();
+        let json = serde_json::to_vec(&serialized)
+            .map_err(|e| CryptoError::EncryptionFailed(format!("Serialization failed: {}", e)))?;
+        self.encrypt(&json)
+    }
+    
+    /// Load peer session manager from encrypted bytes
+    pub fn load_sessions(&self, encrypted: &[u8]) -> CryptoResult<PeerSessionManager> {
+        let json = self.decrypt(encrypted)?;
+        let serialized: SerializedPeerSessionManager = serde_json::from_slice(&json)
+            .map_err(|e| CryptoError::DecryptionFailed(format!("Deserialization failed: {}", e)))?;
+        Ok(PeerSessionManager::from_serialized(serialized))
+    }
+    
+    /// Save trust manager to encrypted bytes
+    pub fn save_trust(&self, manager: &TrustManager) -> CryptoResult<Vec<u8>> {
+        let records = manager.to_serialized();
+        let json = serde_json::to_vec(&records)
+            .map_err(|e| CryptoError::EncryptionFailed(format!("Serialization failed: {}", e)))?;
+        self.encrypt(&json)
+    }
+    
+    /// Load trust manager from encrypted bytes
+    pub fn load_trust(&self, encrypted: &[u8]) -> CryptoResult<TrustManager> {
+        let json = self.decrypt(encrypted)?;
+        let records: Vec<TrustRecord> = serde_json::from_slice(&json)
+            .map_err(|e| CryptoError::DecryptionFailed(format!("Deserialization failed: {}", e)))?;
+        Ok(TrustManager::from_serialized(records))
     }
 }
 

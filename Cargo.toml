@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "relay-hub"]
+resolver = "2"
+
 [package]
 name = "nais_client"
 version = "0.1.0"
@@ -56,6 +60,11 @@ rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
 thiserror = "1"
 hex = "0.4"
+
+# TURN authentication
+md5 = "0.7"
+hmac = "0.12"
+sha1 = "0.10"
 
 # QUIC Transport
 quinn = "0.11"

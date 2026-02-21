@@ -647,9 +647,9 @@ fn is_voice_ctcp(command: &str) -> bool {
     matches!(command, "VOICE_CALL" | "VOICE_ACCEPT" | "VOICE_REJECT" | "VOICE_CANCEL")
 }
 
-/// Check if a CTCP command is NAIS channel-related
+/// Check if a CTCP command is NAIS channel-related (NSC = Nais Secure Channels)
 fn is_nais_ctcp(command: &str) -> bool {
-    matches!(command, "NAIS_PROBE" | "NAIS_INFO" | "NAIS_JOIN" | "NAIS_ACCEPT" | "NAIS_CONNECT" | "NAIS_LEAVE" | "NAIS_CHANNEL_INVITE" | "NAIS_MSG")
+    command.starts_with("NSC_") || matches!(command, "NAIS_PROBE" | "NAIS_INFO" | "NAIS_JOIN" | "NAIS_ACCEPT" | "NAIS_CONNECT" | "NAIS_LEAVE" | "NAIS_CHANNEL_INVITE" | "NAIS_MSG")
 }
 
 async fn handle_connection(

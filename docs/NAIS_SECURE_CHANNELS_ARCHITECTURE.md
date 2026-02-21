@@ -1795,7 +1795,8 @@ pub mod config {
     
     /// Federation hubs (default)
     pub const DEFAULT_HUBS: &[&str] = &[
-        "hub.nais.example.com:4433",
+        "127.0.0.1:4433",       // Local test relay
+        "pugbot.net:4433",      // Primary relay hub
     ];
 }
 ```

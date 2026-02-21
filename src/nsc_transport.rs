@@ -108,6 +108,8 @@ pub enum MessageType {
     KeyPackage = 0x20,
     Welcome = 0x21,
     Commit = 0x22,
+    KeyRevocation = 0x23,
+    SenderKeyDistribution = 0x24,
 
     // Control
     Ack = 0x30,
@@ -122,6 +124,19 @@ pub enum MessageType {
     // Relay
     RelayRequest = 0x50,
     RelayData = 0x51,
+    RelayRegister = 0x52,
+    RelayUnregister = 0x53,
+
+    // Store-and-Forward
+    StoreRequest = 0x60,
+    StoredMessage = 0x61,
+    StoredMessageAck = 0x62,
+    FetchStoredMessages = 0x63,
+
+    // Federation
+    HubAnnounce = 0x70,
+    HubQuery = 0x71,
+    HubRoute = 0x72,
 }
 
 impl MessageType {
@@ -136,6 +151,8 @@ impl MessageType {
             0x20 => Some(Self::KeyPackage),
             0x21 => Some(Self::Welcome),
             0x22 => Some(Self::Commit),
+            0x23 => Some(Self::KeyRevocation),
+            0x24 => Some(Self::SenderKeyDistribution),
             0x30 => Some(Self::Ack),
             0x31 => Some(Self::Heartbeat),
             0x32 => Some(Self::RoutingUpdate),
@@ -144,6 +161,15 @@ impl MessageType {
             0x42 => Some(Self::IceAnswer),
             0x50 => Some(Self::RelayRequest),
             0x51 => Some(Self::RelayData),
+            0x52 => Some(Self::RelayRegister),
+            0x53 => Some(Self::RelayUnregister),
+            0x60 => Some(Self::StoreRequest),
+            0x61 => Some(Self::StoredMessage),
+            0x62 => Some(Self::StoredMessageAck),
+            0x63 => Some(Self::FetchStoredMessages),
+            0x70 => Some(Self::HubAnnounce),
+            0x71 => Some(Self::HubQuery),
+            0x72 => Some(Self::HubRoute),
             _ => None,
         }
     }
@@ -372,7 +398,7 @@ impl NscEnvelope {
 // =============================================================================
 
 /// Peer identifier (32-byte hash of identity public key)
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PeerId(pub [u8; 32]);
 
 impl PeerId {
@@ -1010,6 +1036,1110 @@ impl MessageRouter {
         }
 
         Ok(())
+    }
+}
+
+// =============================================================================
+// Relay Client - Fallback for Symmetric NAT
+// =============================================================================
+
+/// Default relay hub addresses
+/// Local hub (127.0.0.1:4433) is tried first for development/testing.
+/// Run `cargo run -p nais-relay-hub` to start a local relay.
+pub const DEFAULT_RELAY_HUBS: &[&str] = &[
+    "127.0.0.1:4433",       // Local test relay (run relay-hub first)
+    "pugbot.net:4433",      // Primary relay hub
+];
+
+/// Relay message for registering with hub
+#[derive(Clone, Debug)]
+pub struct RelayRegister {
+    /// Our peer ID
+    pub peer_id: PeerId,
+    /// Channels we're interested in
+    pub channels: Vec<[u8; 32]>,
+}
+
+impl RelayRegister {
+    pub fn new(peer_id: PeerId, channels: Vec<[u8; 32]>) -> Self {
+        Self { peer_id, channels }
+    }
+    
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32 + 4 + self.channels.len() * 32);
+        buf.extend_from_slice(&self.peer_id.0);
+        buf.extend_from_slice(&(self.channels.len() as u32).to_be_bytes());
+        for ch in &self.channels {
+            buf.extend_from_slice(ch);
+        }
+        buf
+    }
+    
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        if data.len() < 36 {
+            return None;
+        }
+        let mut peer_id = [0u8; 32];
+        peer_id.copy_from_slice(&data[..32]);
+        let channel_count = u32::from_be_bytes([data[32], data[33], data[34], data[35]]) as usize;
+        if data.len() < 36 + channel_count * 32 {
+            return None;
+        }
+        let mut channels = Vec::with_capacity(channel_count);
+        for i in 0..channel_count {
+            let start = 36 + i * 32;
+            let mut ch = [0u8; 32];
+            ch.copy_from_slice(&data[start..start + 32]);
+            channels.push(ch);
+        }
+        Some(Self { peer_id: PeerId(peer_id), channels })
+    }
+}
+
+/// Relay wrapper for forwarding messages through hub
+#[derive(Clone, Debug)]
+pub struct RelayForward {
+    /// Target peer ID
+    pub target_peer_id: PeerId,
+    /// Inner envelope (encrypted)
+    pub envelope: Vec<u8>,
+}
+
+impl RelayForward {
+    pub fn new(target: PeerId, envelope: Vec<u8>) -> Self {
+        Self { target_peer_id: target, envelope }
+    }
+    
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32 + 4 + self.envelope.len());
+        buf.extend_from_slice(&self.target_peer_id.0);
+        buf.extend_from_slice(&(self.envelope.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&self.envelope);
+        buf
+    }
+    
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        if data.len() < 36 {
+            return None;
+        }
+        let mut target = [0u8; 32];
+        target.copy_from_slice(&data[..32]);
+        let envelope_len = u32::from_be_bytes([data[32], data[33], data[34], data[35]]) as usize;
+        if data.len() < 36 + envelope_len {
+            return None;
+        }
+        let envelope = data[36..36 + envelope_len].to_vec();
+        Some(Self { target_peer_id: PeerId(target), envelope })
+    }
+}
+
+/// Relay client state
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayState {
+    /// Not connected to any relay
+    Disconnected,
+    /// Connecting to relay hub
+    Connecting,
+    /// Connected and registered
+    Connected,
+    /// Connection error
+    Error,
+}
+
+// =============================================================================
+// Federation Hub Discovery
+// =============================================================================
+
+/// Capabilities advertised by a federation hub
+#[derive(Clone, Debug, Default)]
+pub struct HubCapabilities {
+    /// Can relay encrypted messages
+    pub relay: bool,
+    /// Provides TURN server for NAT traversal
+    pub turn: bool,
+    /// Stores messages for offline peers
+    pub store_forward: bool,
+    /// Maximum relay message size (bytes)
+    pub max_relay_size: usize,
+    /// Rate limit (messages per minute)
+    pub rate_limit_per_min: u32,
+}
+
+/// Health status of a federation hub
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HubHealth {
+    /// Hub is healthy and responding
+    Healthy,
+    /// Hub is degraded (high latency or errors)
+    Degraded,
+    /// Hub is unreachable
+    Unreachable,
+    /// Hub status unknown (not yet checked)
+    Unknown,
+}
+
+/// A federation hub for relay connectivity
+#[derive(Clone, Debug)]
+pub struct FederationHub {
+    /// Hub address (host:port)
+    pub address: String,
+    /// Hub identity public key (if known)
+    pub public_key: Option<[u8; 32]>,
+    /// Geographic region for latency optimization
+    pub region: String,
+    /// Hub capabilities
+    pub capabilities: HubCapabilities,
+    /// Current health status
+    pub health: HubHealth,
+    /// Last successful ping latency (ms)
+    pub latency_ms: Option<u32>,
+    /// Load factor (0.0 = idle, 1.0 = fully loaded)
+    pub load_factor: f32,
+    /// Last health check timestamp
+    pub last_check: u64,
+    /// Consecutive failure count
+    pub failure_count: u32,
+}
+
+impl FederationHub {
+    /// Create a new hub entry with default values
+    pub fn new(address: &str) -> Self {
+        Self {
+            address: address.to_string(),
+            public_key: None,
+            region: "unknown".to_string(),
+            capabilities: HubCapabilities::default(),
+            health: HubHealth::Unknown,
+            latency_ms: None,
+            load_factor: 0.0,
+            last_check: 0,
+            failure_count: 0,
+        }
+    }
+    
+    /// Check if hub should be retried based on failure count
+    pub fn should_retry(&self) -> bool {
+        // Exponential backoff: wait 2^failures seconds between retries, max 300s
+        if self.failure_count == 0 {
+            return true;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let backoff_secs = std::cmp::min(2u64.pow(self.failure_count), 300);
+        now >= self.last_check + backoff_secs
+    }
+    
+    /// Record a successful connection
+    pub fn record_success(&mut self, latency_ms: u32) {
+        self.health = HubHealth::Healthy;
+        self.latency_ms = Some(latency_ms);
+        self.failure_count = 0;
+        self.last_check = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+    }
+    
+    /// Record a failed connection attempt
+    pub fn record_failure(&mut self) {
+        self.failure_count += 1;
+        self.last_check = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.health = if self.failure_count >= 5 {
+            HubHealth::Unreachable
+        } else {
+            HubHealth::Degraded
+        };
+    }
+}
+
+/// Registry of known federation hubs
+pub struct HubRegistry {
+    /// Known hubs by address
+    hubs: RwLock<HashMap<String, FederationHub>>,
+    /// Currently connected hub address
+    connected_hub: RwLock<Option<String>>,
+}
+
+impl HubRegistry {
+    /// Create a new hub registry with default hubs
+    pub fn new() -> Self {
+        let mut hubs = HashMap::new();
+        
+        // Add default hubs
+        for addr in DEFAULT_RELAY_HUBS {
+            let mut hub = FederationHub::new(addr);
+            hub.capabilities = HubCapabilities {
+                relay: true,
+                turn: true,
+                store_forward: true,
+                max_relay_size: 64 * 1024, // 64KB
+                rate_limit_per_min: 100,
+            };
+            hubs.insert(addr.to_string(), hub);
+        }
+        
+        Self {
+            hubs: RwLock::new(hubs),
+            connected_hub: RwLock::new(None),
+        }
+    }
+    
+    /// Add a hub to the registry
+    pub async fn add_hub(&self, hub: FederationHub) {
+        self.hubs.write().await.insert(hub.address.clone(), hub);
+    }
+    
+    /// Remove a hub from the registry
+    pub async fn remove_hub(&self, address: &str) {
+        self.hubs.write().await.remove(address);
+    }
+    
+    /// Get all known hubs
+    pub async fn all_hubs(&self) -> Vec<FederationHub> {
+        self.hubs.read().await.values().cloned().collect()
+    }
+    
+    /// Get healthy hubs sorted by latency
+    pub async fn healthy_hubs(&self) -> Vec<FederationHub> {
+        let hubs = self.hubs.read().await;
+        let mut healthy: Vec<_> = hubs.values()
+            .filter(|h| h.health == HubHealth::Healthy || h.health == HubHealth::Unknown)
+            .filter(|h| h.should_retry())
+            .cloned()
+            .collect();
+        
+        // Sort by latency (unknown latency goes last)
+        healthy.sort_by(|a, b| {
+            match (a.latency_ms, b.latency_ms) {
+                (Some(la), Some(lb)) => la.cmp(&lb),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        });
+        
+        healthy
+    }
+    
+    /// Select the best hub for connection
+    pub async fn select_best_hub(&self) -> Option<FederationHub> {
+        let healthy = self.healthy_hubs().await;
+        healthy.into_iter().next()
+    }
+    
+    /// Record successful connection to a hub
+    pub async fn record_connection_success(&self, address: &str, latency_ms: u32) {
+        let mut hubs = self.hubs.write().await;
+        if let Some(hub) = hubs.get_mut(address) {
+            hub.record_success(latency_ms);
+        }
+        drop(hubs);
+        *self.connected_hub.write().await = Some(address.to_string());
+    }
+    
+    /// Record failed connection to a hub
+    pub async fn record_connection_failure(&self, address: &str) {
+        let mut hubs = self.hubs.write().await;
+        if let Some(hub) = hubs.get_mut(address) {
+            hub.record_failure();
+        }
+    }
+    
+    /// Get currently connected hub
+    pub async fn connected_hub(&self) -> Option<String> {
+        self.connected_hub.read().await.clone()
+    }
+    
+    /// Clear connected hub
+    pub async fn clear_connected(&self) {
+        *self.connected_hub.write().await = None;
+    }
+    
+    /// Discover hubs from DNS TXT records
+    /// Format: _nsc-hub.<domain> TXT "addr=host:port,region=us-west,relay=1,turn=1"
+    pub async fn discover_from_dns(&self, domain: &str) -> Vec<FederationHub> {
+        let record_name = format!("_nsc-hub.{}", domain);
+        log::debug!("Looking up DNS TXT record: {}", record_name);
+        
+        // Use tokio's DNS resolver
+        let addrs = match tokio::net::lookup_host(&record_name).await {
+            Ok(addrs) => addrs.collect::<Vec<_>>(),
+            Err(e) => {
+                log::debug!("DNS hub discovery failed for {}: {}", domain, e);
+                return Vec::new();
+            }
+        };
+        
+        let mut discovered = Vec::new();
+        for addr in addrs {
+            let hub = FederationHub::new(&addr.to_string());
+            discovered.push(hub);
+        }
+        discovered
+    }
+    
+    /// Check health of all hubs
+    pub async fn check_all_health(&self) {
+        let addresses: Vec<String> = {
+            self.hubs.read().await.keys().cloned().collect()
+        };
+        
+        for address in addresses {
+            let should_check = {
+                let hubs = self.hubs.read().await;
+                if let Some(hub) = hubs.get(&address) {
+                    hub.should_retry()
+                } else {
+                    false
+                }
+            };
+            
+            if should_check {
+                // Simple TCP connect check as health probe
+                let start = Instant::now();
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    tokio::net::TcpStream::connect(&address)
+                ).await {
+                    Ok(Ok(_)) => {
+                        let latency = start.elapsed().as_millis() as u32;
+                        self.record_connection_success(&address, latency).await;
+                        log::debug!("Hub {} healthy, latency {}ms", address, latency);
+                    }
+                    _ => {
+                        self.record_connection_failure(&address).await;
+                        log::debug!("Hub {} health check failed", address);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Default for HubRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Weak reference to relay client state for background tasks
+struct RelayClientWeak {
+    peer_id: PeerId,
+    state: Arc<RwLock<RelayState>>,
+    relay_addr: Arc<RwLock<Option<String>>>,
+}
+
+/// Relay client for fallback connectivity
+pub struct RelayClient {
+    /// Our peer ID
+    peer_id: PeerId,
+    /// Identity for TLS
+    identity: Arc<IdentityKeyPair>,
+    /// Current state
+    state: Arc<RwLock<RelayState>>,
+    /// QUIC endpoint (client mode)
+    endpoint: Arc<RwLock<Option<Endpoint>>>,
+    /// Current relay connection
+    connection: Arc<RwLock<Option<Connection>>>,
+    /// Relay hub address we're connected to
+    relay_addr: Arc<RwLock<Option<String>>>,
+    /// Channels we're interested in
+    channels: Arc<RwLock<Vec<[u8; 32]>>>,
+    /// Handler for incoming relayed messages
+    message_handler: Arc<RwLock<Option<mpsc::Sender<(PeerId, NscEnvelope)>>>>,
+    /// Hub registry for discovery and failover
+    hub_registry: Arc<HubRegistry>,
+}
+
+impl RelayClient {
+    /// Create new relay client
+    pub fn new(peer_id: PeerId, identity: Arc<IdentityKeyPair>) -> Self {
+        Self {
+            peer_id,
+            identity,
+            state: Arc::new(RwLock::new(RelayState::Disconnected)),
+            endpoint: Arc::new(RwLock::new(None)),
+            connection: Arc::new(RwLock::new(None)),
+            relay_addr: Arc::new(RwLock::new(None)),
+            channels: Arc::new(RwLock::new(Vec::new())),
+            message_handler: Arc::new(RwLock::new(None)),
+            hub_registry: Arc::new(HubRegistry::new()),
+        }
+    }
+    
+    /// Set message handler for incoming relayed messages
+    pub async fn set_message_handler(&self, handler: mpsc::Sender<(PeerId, NscEnvelope)>) {
+        *self.message_handler.write().await = Some(handler);
+    }
+    
+    /// Register channels we want to receive messages for
+    pub async fn register_channels(&self, channels: Vec<[u8; 32]>) {
+        *self.channels.write().await = channels;
+    }
+    
+    /// Connect to a relay hub
+    pub async fn connect(&self, relay_addr: &str) -> TransportResult<()> {
+        *self.state.write().await = RelayState::Connecting;
+        
+        // Create QUIC client config with self-signed cert (relay validates our identity later)
+        let client_config = self.create_client_config()
+            .map_err(|e| TransportError::TlsError(e))?;
+        
+        // Create endpoint
+        let endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
+            .map_err(|e| TransportError::QuinnError(e.to_string()))?;
+        
+        // Resolve relay address
+        let addr: SocketAddr = tokio::net::lookup_host(relay_addr)
+            .await
+            .map_err(|e| TransportError::ConnectionFailed(format!("DNS lookup failed: {}", e)))?
+            .next()
+            .ok_or_else(|| TransportError::ConnectionFailed("No addresses found".into()))?;
+        
+        // Extract hostname for SNI (strip port)
+        let sni_host = relay_addr.split(':').next().unwrap_or("pugbot.net");
+        
+        // Connect with timeout
+        let connecting = endpoint.connect_with(client_config, addr, sni_host)
+            .map_err(|e| TransportError::QuinnError(e.to_string()))?;
+        
+        let connection = tokio::time::timeout(CONNECTION_TIMEOUT, connecting)
+            .await
+            .map_err(|_| TransportError::Timeout)?
+            .map_err(|e| TransportError::ConnectionFailed(e.to_string()))?;
+        
+        // Register with the relay
+        let channels = self.channels.read().await.clone();
+        self.send_register(&connection, &channels).await?;
+        
+        // Store connection state
+        *self.endpoint.write().await = Some(endpoint);
+        *self.connection.write().await = Some(connection.clone());
+        *self.relay_addr.write().await = Some(relay_addr.to_string());
+        *self.state.write().await = RelayState::Connected;
+        
+        // Start listening for incoming messages
+        self.start_listener(connection).await;
+        
+        log::info!("Connected to relay hub: {}", relay_addr);
+        Ok(())
+    }
+    
+    /// Try to connect to any available relay hub using the registry
+    pub async fn connect_any(&self) -> TransportResult<()> {
+        // First try hubs from registry sorted by health/latency
+        let healthy_hubs = self.hub_registry.healthy_hubs().await;
+        
+        for hub in healthy_hubs {
+            log::info!("Trying relay hub: {} (latency: {:?}ms)", hub.address, hub.latency_ms);
+            let start = Instant::now();
+            match self.connect(&hub.address).await {
+                Ok(_) => {
+                    let latency = start.elapsed().as_millis() as u32;
+                    self.hub_registry.record_connection_success(&hub.address, latency).await;
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.hub_registry.record_connection_failure(&hub.address).await;
+                    log::warn!("Failed to connect to relay {}: {}", hub.address, e);
+                    continue;
+                }
+            }
+        }
+        
+        // Fallback to static list if registry hubs failed
+        for hub in DEFAULT_RELAY_HUBS {
+            // Skip if already tried from registry
+            if self.hub_registry.all_hubs().await.iter().any(|h| h.address == *hub) {
+                continue;
+            }
+            
+            log::info!("Trying fallback relay hub: {}", hub);
+            match self.connect(hub).await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    log::warn!("Failed to connect to relay {}: {}", hub, e);
+                    continue;
+                }
+            }
+        }
+        
+        Err(TransportError::ConnectionFailed("All relay hubs failed".into()))
+    }
+    
+    /// Attempt failover to another hub when current connection fails
+    pub async fn failover(&self) -> TransportResult<()> {
+        // Get current hub address
+        let current = self.relay_addr.read().await.clone();
+        
+        // Mark current hub as failed if we have one
+        if let Some(addr) = &current {
+            self.hub_registry.record_connection_failure(addr).await;
+            log::info!("Hub {} failed, attempting failover", addr);
+        }
+        
+        // Disconnect from failed hub
+        self.disconnect().await;
+        self.hub_registry.clear_connected().await;
+        
+        // Try to connect to another hub
+        self.connect_any().await
+    }
+    
+    /// Get the hub registry for external access
+    pub fn hub_registry(&self) -> Arc<HubRegistry> {
+        Arc::clone(&self.hub_registry)
+    }
+    
+    /// Start background health check task
+    pub async fn start_health_monitor(&self) {
+        let registry = Arc::clone(&self.hub_registry);
+        let relay_client = RelayClientWeak {
+            peer_id: self.peer_id,
+            state: Arc::clone(&self.state),
+            relay_addr: Arc::clone(&self.relay_addr),
+        };
+        
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            
+            loop {
+                interval.tick().await;
+                
+                // Check health of all known hubs
+                registry.check_all_health().await;
+                
+                // Check if we need to failover
+                let state = *relay_client.state.read().await;
+                if state == RelayState::Error {
+                    log::info!("Relay in error state, will try reconnect on next message");
+                }
+            }
+        });
+    }
+    
+    /// Disconnect from relay
+    pub async fn disconnect(&self) {
+        if let Some(conn) = self.connection.write().await.take() {
+            conn.close(0u32.into(), b"bye");
+        }
+        *self.state.write().await = RelayState::Disconnected;
+        *self.relay_addr.write().await = None;
+    }
+    
+    /// Send a message through the relay to a peer
+    pub async fn send_to_peer(&self, target: &PeerId, envelope: &NscEnvelope) -> TransportResult<()> {
+        let conn = self.connection.read().await.clone()
+            .ok_or_else(|| TransportError::ConnectionFailed("Not connected to relay".into()))?;
+        
+        // Serialize the envelope
+        let envelope_bytes = envelope.to_bytes().to_vec();
+        
+        // Wrap in RelayForward
+        let forward = RelayForward::new(*target, envelope_bytes);
+        
+        // Create RelayData message
+        let relay_envelope = NscEnvelope::new(
+            MessageType::RelayData,
+            self.peer_id.0,
+            [0u8; 32], // No specific channel for relay control
+            0,
+            Bytes::from(forward.encode()),
+        );
+        
+        // Send through relay
+        let mut send = conn.open_uni().await
+            .map_err(|e| TransportError::SendFailed(e.to_string()))?;
+        
+        let data = relay_envelope.to_bytes();
+        send.write_all(&(data.len() as u32).to_be_bytes()).await
+            .map_err(|e| TransportError::SendFailed(e.to_string()))?;
+        send.write_all(&data).await
+            .map_err(|e| TransportError::SendFailed(e.to_string()))?;
+        send.finish()
+            .map_err(|e| TransportError::SendFailed(e.to_string()))?;
+        
+        Ok(())
+    }
+    
+    /// Get current state
+    pub async fn state(&self) -> RelayState {
+        *self.state.read().await
+    }
+    
+    /// Check if connected
+    pub async fn is_connected(&self) -> bool {
+        *self.state.read().await == RelayState::Connected
+    }
+    
+    /// Get connected relay address
+    pub async fn relay_address(&self) -> Option<String> {
+        self.relay_addr.read().await.clone()
+    }
+    
+    // Internal: Create QUIC client config
+    fn create_client_config(&self) -> Result<ClientConfig, String> {
+        // For relay connection, we accept any server cert (relay validates us via message signing)
+        let crypto = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+            .with_no_client_auth();
+        
+        let mut config = ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+                .map_err(|e| format!("Crypto config error: {}", e))?
+        ));
+        
+        let mut transport = TransportConfig::default();
+        transport.keep_alive_interval(Some(KEEPALIVE_INTERVAL));
+        config.transport_config(Arc::new(transport));
+        
+        Ok(config)
+    }
+    
+    // Internal: Send register message to relay
+    async fn send_register(&self, conn: &Connection, channels: &[[u8; 32]]) -> TransportResult<()> {
+        let register = RelayRegister::new(self.peer_id, channels.to_vec());
+        
+        let envelope = NscEnvelope::new(
+            MessageType::RelayRequest,
+            self.peer_id.0,
+            [0u8; 32],
+            0,
+            Bytes::from(register.encode()),
+        );
+        
+        let mut send = conn.open_uni().await
+            .map_err(|e| TransportError::SendFailed(e.to_string()))?;
+        
+        let data = envelope.to_bytes();
+        send.write_all(&(data.len() as u32).to_be_bytes()).await
+            .map_err(|e| TransportError::SendFailed(e.to_string()))?;
+        send.write_all(&data).await
+            .map_err(|e| TransportError::SendFailed(e.to_string()))?;
+        send.finish()
+            .map_err(|e| TransportError::SendFailed(e.to_string()))?;
+        
+        Ok(())
+    }
+    
+    // Internal: Start listening for incoming relayed messages
+    async fn start_listener(&self, connection: Connection) {
+        let handler = self.message_handler.clone();
+        let state = self.state.clone();
+        
+        tokio::spawn(async move {
+            loop {
+                match connection.accept_uni().await {
+                    Ok(mut recv) => {
+                        // Read length prefix
+                        let mut len_buf = [0u8; 4];
+                        if recv.read_exact(&mut len_buf).await.is_err() {
+                            continue;
+                        }
+                        let len = u32::from_be_bytes(len_buf) as usize;
+                        if len > MAX_MESSAGE_SIZE {
+                            continue;
+                        }
+                        
+                        // Read message
+                        let mut buf = vec![0u8; len];
+                        if recv.read_exact(&mut buf).await.is_err() {
+                            continue;
+                        }
+                        
+                        // Parse envelope
+                        let envelope = match NscEnvelope::from_bytes(Bytes::from(buf)) {
+                            Ok(env) => env,
+                            Err(_) => continue,
+                        };
+                        
+                        // Handle RelayData messages
+                        if envelope.message_type == MessageType::RelayData {
+                            if let Some(forward) = RelayForward::decode(&envelope.payload) {
+                                // Parse the inner envelope
+                                if let Ok(inner) = NscEnvelope::from_bytes(Bytes::from(forward.envelope)) {
+                                    let sender = PeerId(envelope.sender_id);
+                                    if let Some(ref h) = *handler.read().await {
+                                        let _ = h.send((sender, inner)).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Relay connection error: {}", e);
+                        *state.write().await = RelayState::Disconnected;
+                        break;
+                    }
+                }
+            }
+        });
+    }
+}
+
+// =============================================================================
+// Store-and-Forward System
+// =============================================================================
+
+/// A message stored for offline delivery
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct StoredMessage {
+    /// Unique message identifier
+    pub message_id: [u8; 32],
+    /// Target peer ID who should receive this
+    pub target_peer: PeerId,
+    /// Channel ID the message belongs to
+    pub channel_id: [u8; 32],
+    /// The encrypted envelope bytes
+    pub envelope_data: Vec<u8>,
+    /// When the message was stored
+    pub stored_at: u64,
+    /// Message expiry time
+    pub expires_at: u64,
+    /// Number of delivery attempts
+    pub delivery_attempts: u32,
+    /// Priority (higher = more urgent)
+    pub priority: u8,
+}
+
+impl StoredMessage {
+    /// Create a new stored message
+    pub fn new(target: PeerId, channel_id: [u8; 32], envelope: &NscEnvelope, ttl_secs: u64) -> Self {
+        use sha2::{Sha256, Digest};
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        // Generate message ID from content hash
+        let mut hasher = Sha256::new();
+        hasher.update(&envelope.sender_id);
+        hasher.update(&envelope.channel_id);
+        hasher.update(&envelope.sequence_number.to_be_bytes());
+        hasher.update(&envelope.timestamp.to_be_bytes());
+        let hash = hasher.finalize();
+        let mut message_id = [0u8; 32];
+        message_id.copy_from_slice(&hash);
+        
+        Self {
+            message_id,
+            target_peer: target,
+            channel_id,
+            envelope_data: envelope.to_bytes().to_vec(),
+            stored_at: now,
+            expires_at: now + ttl_secs,
+            delivery_attempts: 0,
+            priority: 0,
+        }
+    }
+    
+    /// Check if message has expired
+    pub fn is_expired(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now >= self.expires_at
+    }
+    
+    /// Serialize for transmission
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(128 + self.envelope_data.len());
+        bytes.extend_from_slice(&self.message_id);
+        bytes.extend_from_slice(&self.target_peer.0);
+        bytes.extend_from_slice(&self.channel_id);
+        bytes.extend_from_slice(&self.stored_at.to_be_bytes());
+        bytes.extend_from_slice(&self.expires_at.to_be_bytes());
+        bytes.extend_from_slice(&self.delivery_attempts.to_be_bytes());
+        bytes.push(self.priority);
+        bytes.extend_from_slice(&(self.envelope_data.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&self.envelope_data);
+        bytes
+    }
+    
+    /// Deserialize from bytes
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 117 {
+            return None;
+        }
+        
+        let mut message_id = [0u8; 32];
+        message_id.copy_from_slice(&bytes[0..32]);
+        
+        let mut target_peer = [0u8; 32];
+        target_peer.copy_from_slice(&bytes[32..64]);
+        
+        let mut channel_id = [0u8; 32];
+        channel_id.copy_from_slice(&bytes[64..96]);
+        
+        let stored_at = u64::from_be_bytes([
+            bytes[96], bytes[97], bytes[98], bytes[99],
+            bytes[100], bytes[101], bytes[102], bytes[103],
+        ]);
+        
+        let expires_at = u64::from_be_bytes([
+            bytes[104], bytes[105], bytes[106], bytes[107],
+            bytes[108], bytes[109], bytes[110], bytes[111],
+        ]);
+        
+        let delivery_attempts = u32::from_be_bytes([
+            bytes[112], bytes[113], bytes[114], bytes[115],
+        ]);
+        
+        let priority = bytes[116];
+        
+        let envelope_len = u32::from_be_bytes([
+            bytes[117], bytes[118], bytes[119], bytes[120],
+        ]) as usize;
+        
+        if bytes.len() < 121 + envelope_len {
+            return None;
+        }
+        
+        let envelope_data = bytes[121..121 + envelope_len].to_vec();
+        
+        Some(Self {
+            message_id,
+            target_peer: PeerId(target_peer),
+            channel_id,
+            stored_at,
+            expires_at,
+            delivery_attempts,
+            priority,
+            envelope_data,
+        })
+    }
+}
+
+/// Store-and-forward request to hub
+#[derive(Clone, Debug)]
+pub struct StoreForwardRequest {
+    /// Messages to store for offline delivery
+    pub messages: Vec<StoredMessage>,
+}
+
+impl StoreForwardRequest {
+    /// Create a new store request
+    pub fn new(messages: Vec<StoredMessage>) -> Self {
+        Self { messages }
+    }
+    
+    /// Encode for transmission
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(self.messages.len() as u32).to_be_bytes());
+        for msg in &self.messages {
+            let msg_bytes = msg.to_bytes();
+            bytes.extend_from_slice(&(msg_bytes.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(&msg_bytes);
+        }
+        bytes
+    }
+    
+    /// Decode from bytes
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 4 {
+            return None;
+        }
+        
+        let count = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        if count > 1000 {
+            return None; // Sanity check
+        }
+        
+        let mut messages = Vec::with_capacity(count);
+        let mut offset = 4;
+        
+        for _ in 0..count {
+            if offset + 4 > bytes.len() {
+                return None;
+            }
+            
+            let msg_len = u32::from_be_bytes([
+                bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
+            ]) as usize;
+            offset += 4;
+            
+            if offset + msg_len > bytes.len() {
+                return None;
+            }
+            
+            if let Some(msg) = StoredMessage::from_bytes(&bytes[offset..offset + msg_len]) {
+                messages.push(msg);
+            }
+            offset += msg_len;
+        }
+        
+        Some(Self { messages })
+    }
+}
+
+/// Request to fetch stored messages from hub
+#[derive(Clone, Debug)]
+pub struct FetchStoredRequest {
+    /// Our peer ID
+    pub peer_id: PeerId,
+    /// Channel IDs we're interested in
+    pub channel_ids: Vec<[u8; 32]>,
+    /// Fetch messages since this timestamp
+    pub since: u64,
+    /// Maximum number of messages to fetch
+    pub limit: u32,
+}
+
+impl FetchStoredRequest {
+    /// Encode for transmission
+    pub fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(44 + self.channel_ids.len() * 32);
+        bytes.extend_from_slice(&self.peer_id.0);
+        bytes.extend_from_slice(&self.since.to_be_bytes());
+        bytes.extend_from_slice(&self.limit.to_be_bytes());
+        bytes.extend_from_slice(&(self.channel_ids.len() as u32).to_be_bytes());
+        for id in &self.channel_ids {
+            bytes.extend_from_slice(id);
+        }
+        bytes
+    }
+    
+    /// Decode from bytes
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 48 {
+            return None;
+        }
+        
+        let mut peer_id = [0u8; 32];
+        peer_id.copy_from_slice(&bytes[0..32]);
+        
+        let since = u64::from_be_bytes([
+            bytes[32], bytes[33], bytes[34], bytes[35],
+            bytes[36], bytes[37], bytes[38], bytes[39],
+        ]);
+        
+        let limit = u32::from_be_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]);
+        
+        let channel_count = u32::from_be_bytes([bytes[44], bytes[45], bytes[46], bytes[47]]) as usize;
+        
+        if bytes.len() < 48 + channel_count * 32 {
+            return None;
+        }
+        
+        let mut channel_ids = Vec::with_capacity(channel_count);
+        for i in 0..channel_count {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&bytes[48 + i * 32..48 + (i + 1) * 32]);
+            channel_ids.push(id);
+        }
+        
+        Some(Self {
+            peer_id: PeerId(peer_id),
+            channel_ids,
+            since,
+            limit,
+        })
+    }
+}
+
+/// Local store-forward manager for client-side queuing
+pub struct StoreForwardManager {
+    /// Messages queued for offline peers (target_peer -> messages)
+    queued_messages: RwLock<HashMap<PeerId, Vec<StoredMessage>>>,
+    /// Maximum messages per peer
+    max_per_peer: usize,
+    /// Default message TTL (7 days)
+    default_ttl: u64,
+    /// Message delivery callback
+    on_delivery: RwLock<Option<mpsc::Sender<StoredMessage>>>,
+}
+
+impl StoreForwardManager {
+    /// Create a new store-forward manager
+    pub fn new() -> Self {
+        Self {
+            queued_messages: RwLock::new(HashMap::new()),
+            max_per_peer: 1000,
+            default_ttl: 7 * 24 * 3600, // 7 days
+            on_delivery: RwLock::new(None),
+        }
+    }
+    
+    /// Queue a message for an offline peer
+    pub async fn queue_message(&self, target: PeerId, channel_id: [u8; 32], envelope: &NscEnvelope) {
+        let msg = StoredMessage::new(target, channel_id, envelope, self.default_ttl);
+        
+        let mut queued = self.queued_messages.write().await;
+        let queue = queued.entry(target).or_insert_with(Vec::new);
+        
+        // Check limit
+        if queue.len() >= self.max_per_peer {
+            // Remove oldest message
+            queue.remove(0);
+        }
+        
+        queue.push(msg);
+    }
+    
+    /// Get queued messages for a peer (and clear them)
+    pub async fn take_queued(&self, target: &PeerId) -> Vec<StoredMessage> {
+        self.queued_messages.write().await.remove(target).unwrap_or_default()
+    }
+    
+    /// Get all queued messages for upload to hub
+    pub async fn take_all_queued(&self) -> Vec<StoredMessage> {
+        let mut all = Vec::new();
+        let mut queued = self.queued_messages.write().await;
+        for (_, messages) in queued.drain() {
+            all.extend(messages);
+        }
+        all
+    }
+    
+    /// Process received stored messages
+    pub async fn process_received(&self, messages: Vec<StoredMessage>) {
+        if let Some(ref callback) = *self.on_delivery.read().await {
+            for msg in messages {
+                if !msg.is_expired() {
+                    let _ = callback.send(msg).await;
+                }
+            }
+        }
+    }
+    
+    /// Clear expired messages
+    pub async fn clear_expired(&self) {
+        let mut queued = self.queued_messages.write().await;
+        for queue in queued.values_mut() {
+            queue.retain(|msg| !msg.is_expired());
+        }
+        // Remove empty queues
+        queued.retain(|_, q| !q.is_empty());
+    }
+    
+    /// Set delivery callback
+    pub async fn set_delivery_callback(&self, callback: mpsc::Sender<StoredMessage>) {
+        *self.on_delivery.write().await = Some(callback);
+    }
+    
+    /// Get total queued message count
+    pub async fn queued_count(&self) -> usize {
+        self.queued_messages.read().await.values().map(|q| q.len()).sum()
+    }
+    
+    /// Get queued message count for a specific peer
+    pub async fn queued_for_peer(&self, peer: &PeerId) -> usize {
+        self.queued_messages.read().await.get(peer).map(|q| q.len()).unwrap_or(0)
+    }
+}
+
+impl Default for StoreForwardManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
