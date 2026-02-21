@@ -3267,12 +3267,15 @@ fn app() -> Element {
                                                                     log::error!("No core found for profile '{}' to send invite", send_profile);
                                                                 }
                                                             } else {
-                                                                // Standard IRC invite - send on the channel's profile
-                                                                if let Some(core) = cores.read().get(&profile) {
+                                                                // Standard IRC invite - always send on the user's current network
+                                                                // so they actually receive it (not the channel's network)
+                                                                if let Some(core) = cores.read().get(&send_profile) {
                                                                     let _ = core.cmd_tx.try_send(IrcCommandEvent::Invite {
                                                                         nickname: target_nick.clone(),
                                                                         channel: channel.clone(),
                                                                     });
+                                                                } else {
+                                                                    log::error!("No core found for profile '{}' to send invite", send_profile);
                                                                 }
                                                             }
                                                         },
