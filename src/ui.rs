@@ -1965,9 +1965,12 @@ fn app() -> Element {
                             }
                         } else {
                             // Show regular users list
+                            // IMPORTANT: Capture active_profile here so click handlers use the profile
+                            // that was active when the user list was rendered, not when clicked
+                            let userlist_profile = state.read().active_profile.clone();
                             let mut users = state.read()
                                 .servers
-                                .get(&state.read().active_profile)
+                                .get(&userlist_profile)
                                 .and_then(|s| {
                                     s.users_by_channel.get(&current_channel).cloned()
                                 })
@@ -2024,6 +2027,8 @@ fn app() -> Element {
                                             };
                                             let user_nick = username.to_string();
                                             let menu_key = user_nick.clone();
+                                            // Clone userlist_profile for use in click handlers within this iteration
+                                            let user_profile = userlist_profile.clone();
                                             let is_menu_open = user_menu_open.read().as_ref() == Some(&menu_key);
                                             
                                             rsx! {
@@ -2075,11 +2080,12 @@ fn app() -> Element {
                                                                         class: "menu-item",
                                                                         onclick: {
                                                                             let nick = user_nick.clone();
+                                                                            let profile_for_pm = user_profile.clone();
                                                                             move |_| {
                                                                                 user_menu_open.set(None);
                                                                                 ctcp_submenu_open.set(false);
                                                                                 // Open private message tab with this user
-                                                                                let active = state.read().active_profile.clone();
+                                                                                let active = profile_for_pm.clone();
                                                                                 {
                                                                                     let mut state_write = state.write();
                                                                                     if let Some(server) = state_write.servers.get_mut(&active) {
@@ -2113,6 +2119,7 @@ fn app() -> Element {
                                                                                 title: if can_invite { "Invite this user to your voice channel" } else { "Start a voice channel first" },
                                                                                 onclick: {
                                                                                     let nick = user_nick.clone();
+                                                                                    let profile_for_voice = user_profile.clone();
                                                                                     move |_| {
                                                                                         user_menu_open.set(None);
                                                                                         ctcp_submenu_open.set(false);
@@ -2124,7 +2131,7 @@ fn app() -> Element {
                                                                                         let session_id = voice_session_id().unwrap_or_else(|| "unknown".to_string());
                                                                                         
                                                                                         let ctcp_msg = crate::voice_chat::create_voice_call_ctcp(&external_ip, port, &session_id);
-                                                                                        if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                        if let Some(core) = cores.read().get(&profile_for_voice) {
                                                                                             let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
                                                                                                 target: nick.clone(),
                                                                                                 message: ctcp_msg,
@@ -2147,6 +2154,7 @@ fn app() -> Element {
                                                                                 title: if can_call { "Start a direct voice call" } else { "Already in a call" },
                                                                                 onclick: {
                                                                                     let nick = user_nick.clone();
+                                                                                    let profile_for_call = user_profile.clone();
                                                                                     move |_| {
                                                                                         user_menu_open.set(None);
                                                                                         ctcp_submenu_open.set(false);
@@ -2172,7 +2180,7 @@ fn app() -> Element {
                                                                                             
                                                                                             // Send CTCP VOICE_CALL via IRC
                                                                                             let ctcp_msg = crate::voice_chat::create_voice_call_ctcp(&external_ip, port, &session_id);
-                                                                                            if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                            if let Some(core) = cores.read().get(&profile_for_call) {
                                                                                                 let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
                                                                                                     target: nick.clone(),
                                                                                                     message: ctcp_msg,
@@ -2193,20 +2201,24 @@ fn app() -> Element {
                                                                         class: "menu-item",
                                                                         onclick: {
                                                                             let nick = user_nick.clone();
+                                                                            let profile_for_invite = user_profile.clone();
                                                                             move |_| {
                                                                                 user_menu_open.set(None);
                                                                                 ctcp_submenu_open.set(false);
                                                                                 
                                                                                 // Add to pending invite probes (lowercase for case-insensitive matching)
-                                                                                log::info!("Adding '{}' (lowercase: '{}') to pending_invite_probes", nick, nick.to_lowercase());
+                                                                                log::info!("Adding '{}' (lowercase: '{}') to pending_invite_probes for profile '{}'", nick, nick.to_lowercase(), profile_for_invite);
                                                                                 pending_invite_probes.write().insert(nick.to_lowercase(), true);
                                                                                 
                                                                                 // Send VERSION probe to detect if they're a NAIS client
-                                                                                if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                // Use the profile where the user list is displayed, not the active profile
+                                                                                if let Some(core) = cores.read().get(&profile_for_invite) {
                                                                                     let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
                                                                                         target: nick.clone(),
                                                                                         message: "\x01VERSION\x01".to_string(),
                                                                                     });
+                                                                                } else {
+                                                                                    log::error!("No core found for profile '{}' to send VERSION probe", profile_for_invite);
                                                                                 }
                                                                             }
                                                                         },
@@ -2224,11 +2236,12 @@ fn app() -> Element {
                                                                             class: "menu-item",
                                                                             onclick: {
                                                                                 let nick = user_nick.clone();
+                                                                                let profile_for_whois = user_profile.clone();
                                                                                 move |_| {
                                                                                     user_menu_open.set(None);
                                                                                     ctcp_submenu_open.set(false);
                                                                                     // Send /whois command directly
-                                                                                    if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                    if let Some(core) = cores.read().get(&profile_for_whois) {
                                                                                         let _ = core.cmd_tx.try_send(IrcCommandEvent::Whois { nickname: nick.clone() });
                                                                                     }
                                                                                 }
@@ -2263,10 +2276,11 @@ fn app() -> Element {
                                                                                         title: "Request client name and version",
                                                                                         onclick: {
                                                                                             let nick = user_nick.clone();
+                                                                                            let profile_for_ctcp = user_profile.clone();
                                                                                             move |_| {
                                                                                                 user_menu_open.set(None);
                                                                                                 ctcp_submenu_open.set(false);
-                                                                                                if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                                if let Some(core) = cores.read().get(&profile_for_ctcp) {
                                                                                                     let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
                                                                                                         target: nick.clone(),
                                                                                                         message: "\x01VERSION\x01".to_string(),
@@ -2282,11 +2296,12 @@ fn app() -> Element {
                                                                                         title: "Measure latency to user",
                                                                                         onclick: {
                                                                                             let nick = user_nick.clone();
+                                                                                            let profile_for_ctcp = user_profile.clone();
                                                                                             move |_| {
                                                                                                 user_menu_open.set(None);
                                                                                                 ctcp_submenu_open.set(false);
                                                                                                 let timestamp = chrono::Utc::now().timestamp().to_string();
-                                                                                                if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                                if let Some(core) = cores.read().get(&profile_for_ctcp) {
                                                                                                     let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
                                                                                                         target: nick.clone(),
                                                                                                         message: format!("\x01PING {}\x01", timestamp),
@@ -2302,10 +2317,11 @@ fn app() -> Element {
                                                                                         title: "Request local time",
                                                                                         onclick: {
                                                                                             let nick = user_nick.clone();
+                                                                                            let profile_for_ctcp = user_profile.clone();
                                                                                             move |_| {
                                                                                                 user_menu_open.set(None);
                                                                                                 ctcp_submenu_open.set(false);
-                                                                                                if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                                if let Some(core) = cores.read().get(&profile_for_ctcp) {
                                                                                                     let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
                                                                                                         target: nick.clone(),
                                                                                                         message: "\x01TIME\x01".to_string(),
@@ -2321,10 +2337,11 @@ fn app() -> Element {
                                                                                         title: "Request user info and idle time",
                                                                                         onclick: {
                                                                                             let nick = user_nick.clone();
+                                                                                            let profile_for_ctcp = user_profile.clone();
                                                                                             move |_| {
                                                                                                 user_menu_open.set(None);
                                                                                                 ctcp_submenu_open.set(false);
-                                                                                                if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                                if let Some(core) = cores.read().get(&profile_for_ctcp) {
                                                                                                     let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
                                                                                                         target: nick.clone(),
                                                                                                         message: "\x01FINGER\x01".to_string(),
@@ -2340,10 +2357,11 @@ fn app() -> Element {
                                                                                         title: "List supported CTCP commands",
                                                                                         onclick: {
                                                                                             let nick = user_nick.clone();
+                                                                                            let profile_for_ctcp = user_profile.clone();
                                                                                             move |_| {
                                                                                                 user_menu_open.set(None);
                                                                                                 ctcp_submenu_open.set(false);
-                                                                                                if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                                if let Some(core) = cores.read().get(&profile_for_ctcp) {
                                                                                                     let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
                                                                                                         target: nick.clone(),
                                                                                                         message: "\x01CLIENTINFO\x01".to_string(),
@@ -2359,10 +2377,11 @@ fn app() -> Element {
                                                                                         title: "Request client source URL",
                                                                                         onclick: {
                                                                                             let nick = user_nick.clone();
+                                                                                            let profile_for_ctcp = user_profile.clone();
                                                                                             move |_| {
                                                                                                 user_menu_open.set(None);
                                                                                                 ctcp_submenu_open.set(false);
-                                                                                                if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                                if let Some(core) = cores.read().get(&profile_for_ctcp) {
                                                                                                     let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
                                                                                                         target: nick.clone(),
                                                                                                         message: "\x01SOURCE\x01".to_string(),
@@ -2378,10 +2397,11 @@ fn app() -> Element {
                                                                                         title: "Request user-defined info string",
                                                                                         onclick: {
                                                                                             let nick = user_nick.clone();
+                                                                                            let profile_for_ctcp = user_profile.clone();
                                                                                             move |_| {
                                                                                                 user_menu_open.set(None);
                                                                                                 ctcp_submenu_open.set(false);
-                                                                                                if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                                if let Some(core) = cores.read().get(&profile_for_ctcp) {
                                                                                                     let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
                                                                                                         target: nick.clone(),
                                                                                                         message: "\x01USERINFO\x01".to_string(),
@@ -2406,10 +2426,11 @@ fn app() -> Element {
                                                                             onclick: {
                                                                                 let nick = user_nick.clone();
                                                                                 let chan = current_channel.clone();
+                                                                                let profile_for_mode = user_profile.clone();
                                                                                 move |_| {
                                                                                     user_menu_open.set(None);
                                                                                     ctcp_submenu_open.set(false);
-                                                                                    if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                    if let Some(core) = cores.read().get(&profile_for_mode) {
                                                                                         let _ = core.cmd_tx.try_send(IrcCommandEvent::Mode {
                                                                                             target: chan.clone(),
                                                                                             modes: "+o".to_string(),
@@ -2427,10 +2448,11 @@ fn app() -> Element {
                                                                             onclick: {
                                                                                 let nick = user_nick.clone();
                                                                                 let chan = current_channel.clone();
+                                                                                let profile_for_mode = user_profile.clone();
                                                                                 move |_| {
                                                                                     user_menu_open.set(None);
                                                                                     ctcp_submenu_open.set(false);
-                                                                                    if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                    if let Some(core) = cores.read().get(&profile_for_mode) {
                                                                                         let _ = core.cmd_tx.try_send(IrcCommandEvent::Mode {
                                                                                             target: chan.clone(),
                                                                                             modes: "-o".to_string(),
@@ -2448,10 +2470,11 @@ fn app() -> Element {
                                                                             onclick: {
                                                                                 let nick = user_nick.clone();
                                                                                 let chan = current_channel.clone();
+                                                                                let profile_for_mode = user_profile.clone();
                                                                                 move |_| {
                                                                                     user_menu_open.set(None);
                                                                                     ctcp_submenu_open.set(false);
-                                                                                    if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                    if let Some(core) = cores.read().get(&profile_for_mode) {
                                                                                         let _ = core.cmd_tx.try_send(IrcCommandEvent::Mode {
                                                                                             target: chan.clone(),
                                                                                             modes: "+v".to_string(),
@@ -2469,10 +2492,11 @@ fn app() -> Element {
                                                                             onclick: {
                                                                                 let nick = user_nick.clone();
                                                                                 let chan = current_channel.clone();
+                                                                                let profile_for_mode = user_profile.clone();
                                                                                 move |_| {
                                                                                     user_menu_open.set(None);
                                                                                     ctcp_submenu_open.set(false);
-                                                                                    if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                    if let Some(core) = cores.read().get(&profile_for_mode) {
                                                                                         let _ = core.cmd_tx.try_send(IrcCommandEvent::Mode {
                                                                                             target: chan.clone(),
                                                                                             modes: "-v".to_string(),
@@ -2495,10 +2519,11 @@ fn app() -> Element {
                                                                             onclick: {
                                                                                 let nick = user_nick.clone();
                                                                                 let chan = current_channel.clone();
+                                                                                let profile_for_kick = user_profile.clone();
                                                                                 move |_| {
                                                                                     user_menu_open.set(None);
                                                                                     ctcp_submenu_open.set(false);
-                                                                                    if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                    if let Some(core) = cores.read().get(&profile_for_kick) {
                                                                                         let _ = core.cmd_tx.try_send(IrcCommandEvent::Kick {
                                                                                             channel: chan.clone(),
                                                                                             user: nick.clone(),
@@ -2516,11 +2541,12 @@ fn app() -> Element {
                                                                             onclick: {
                                                                                 let nick = user_nick.clone();
                                                                                 let chan = current_channel.clone();
+                                                                                let profile_for_ban = user_profile.clone();
                                                                                 move |_| {
                                                                                     user_menu_open.set(None);
                                                                                     ctcp_submenu_open.set(false);
                                                                                     let ban_mask = format!("{}!*@*", nick);
-                                                                                    if let Some(core) = cores.read().get(&state.read().active_profile) {
+                                                                                    if let Some(core) = cores.read().get(&profile_for_ban) {
                                                                                         let _ = core.cmd_tx.try_send(IrcCommandEvent::Mode {
                                                                                             target: chan.clone(),
                                                                                             modes: "+b".to_string(),
