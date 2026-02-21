@@ -15,6 +15,9 @@
 //! - End-to-end encryption (IRC server never sees message content)
 //! - Decentralized routing (no central server for messages)
 //! - IRC-based discovery (leverages existing IRC infrastructure)
+//!
+//! ## Debugging
+//! Set `NAIS_DEBUG` to `true` to enable verbose debug logging to stderr.
 
 #![allow(dead_code)]
 
@@ -27,6 +30,9 @@ use serde::{Serialize, Deserialize};
 // ============================================================================
 // Constants
 // ============================================================================
+
+/// Enable/disable debug logging for NAIS secure channels
+pub const NAIS_DEBUG: bool = true;
 
 /// NAIS protocol version identifier
 pub const NAIS_PROTOCOL_VERSION: &str = "v1";
@@ -65,6 +71,70 @@ pub const DEFAULT_PORT_RANGE_END: u16 = 45100;
 
 /// Maximum number of peers in a channel
 pub const MAX_PEERS: usize = 50;
+
+// ============================================================================
+// Debug Logging
+// ============================================================================
+
+/// Log a debug message if NAIS_DEBUG is enabled
+#[macro_export]
+macro_rules! nais_debug {
+    ($($arg:tt)*) => {
+        if $crate::nais_channel::NAIS_DEBUG {
+            eprintln!("[NAIS DEBUG] {}", format!($($arg)*));
+        }
+    };
+}
+
+/// Log a debug message with context (channel_id, operation)
+pub fn debug_log(context: &str, operation: &str, message: &str) {
+    if NAIS_DEBUG {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        eprintln!("[NAIS DEBUG {}] [{}] {}: {}", timestamp, context, operation, message);
+    }
+}
+
+/// Log a debug message for CTCP operations
+pub fn debug_ctcp(direction: &str, target: &str, command: &str, args: &str) {
+    if NAIS_DEBUG {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        eprintln!("[NAIS DEBUG {}] [CTCP {}] {} -> {}: {} {}", 
+            timestamp, direction, 
+            if direction == "TX" { "us" } else { target }, 
+            if direction == "TX" { target } else { "us" },
+            command, args);
+    }
+}
+
+/// Log peer-related debug information
+pub fn debug_peer(channel_id: &str, operation: &str, peer_nick: &str, details: &str) {
+    if NAIS_DEBUG {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        eprintln!("[NAIS DEBUG {}] [PEER] [{}] {}: {} - {}", 
+            timestamp, &channel_id[..8.min(channel_id.len())], operation, peer_nick, details);
+    }
+}
+
+/// Log state transition debug information
+pub fn debug_state(channel_id: &str, from_state: &str, to_state: &str) {
+    if NAIS_DEBUG {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        eprintln!("[NAIS DEBUG {}] [STATE] [{}] {} -> {}", 
+            timestamp, &channel_id[..8.min(channel_id.len())], from_state, to_state);
+    }
+}
 
 // ============================================================================
 // Types
@@ -406,6 +476,11 @@ impl NaisChannelManager {
         let irc_channel = create_nais_irc_channel(&channel_id);
         let topic = create_nais_topic(&channel_id, &self.our_fingerprint);
         
+        debug_log(&channel_id, "CREATE", &format!(
+            "Creating new NAIS channel: name={:?}, irc_channel={}, fingerprint={}",
+            name, irc_channel, &self.our_fingerprint
+        ));
+        
         let channel = NaisChannel {
             channel_id: channel_id.clone(),
             irc_channel: irc_channel.clone(),
@@ -427,6 +502,11 @@ impl NaisChannelManager {
             command: NaisIrcCommand::Join { channel: irc_channel.clone() },
         }).await;
         
+        debug_log(&channel_id, "CREATE", &format!(
+            "Channel created successfully: irc_channel={}, topic={}",
+            irc_channel, topic
+        ));
+        
         // Set topic with NAIS identifier
         let _ = self.event_tx.send(NaisEvent::SendIrcCommand {
             command: NaisIrcCommand::Topic { 
@@ -445,32 +525,64 @@ impl NaisChannelManager {
         }).await;
         
         self.channels.insert(channel_id.clone(), channel.clone());
-        self.irc_to_nais.insert(irc_channel, channel_id);
+        self.irc_to_nais.insert(irc_channel.clone(), channel_id.clone());
+        
+        debug_state(&channel_id, "None", "Creating");
         
         Ok(channel)
     }
     
     /// Join an existing NAIS channel (detected via topic)
     pub async fn join_channel(&mut self, irc_channel: &str) -> Result<(), String> {
+        debug_log("unknown", "JOIN", &format!(
+            "Attempting to join NAIS channel via IRC channel: {}",
+            irc_channel
+        ));
+        
         // Join the IRC channel first to discover peers
         let _ = self.event_tx.send(NaisEvent::SendIrcCommand {
             command: NaisIrcCommand::Join { channel: irc_channel.to_string() },
         }).await;
+        
+        debug_log("unknown", "JOIN", &format!(
+            "Sent JOIN command for IRC channel: {}",
+            irc_channel
+        ));
         
         Ok(())
     }
     
     /// Process IRC channel topic to potentially initialize NAIS channel
     pub async fn process_topic(&mut self, irc_channel: &str, topic: &str) -> Option<String> {
+        debug_log("topic", "PROCESS", &format!(
+            "Processing topic for {}: '{}'",
+            irc_channel, topic
+        ));
+        
         if let Some((version, channel_id, creator_fingerprint)) = parse_nais_topic(topic) {
+            debug_log(&channel_id, "TOPIC", &format!(
+                "Parsed NAIS topic: version={}, channel_id={}, creator_fp={}",
+                version, channel_id, creator_fingerprint
+            ));
+            
             if version != NAIS_PROTOCOL_VERSION {
+                debug_log(&channel_id, "TOPIC", &format!(
+                    "Version mismatch: expected {}, got {}",
+                    NAIS_PROTOCOL_VERSION, version
+                ));
                 return None;
             }
             
             // Check if we already have this channel
             if self.channels.contains_key(&channel_id) {
+                debug_log(&channel_id, "TOPIC", "Channel already exists locally");
                 return Some(channel_id);
             }
+            
+            debug_log(&channel_id, "TOPIC", &format!(
+                "Creating new local channel entry: is_host={}",
+                creator_fingerprint == self.our_fingerprint
+            ));
             
             // Create a new channel entry for this NAIS channel we're joining
             let channel = NaisChannel {
@@ -492,6 +604,12 @@ impl NaisChannelManager {
             self.channels.insert(channel_id.clone(), channel);
             self.irc_to_nais.insert(irc_channel.to_string(), channel_id.clone());
             
+            debug_state(&channel_id, "None", "Discovering");
+            debug_log(&channel_id, "TOPIC", &format!(
+                "Channel joined: irc_channel={}, emitting ChannelJoined event",
+                irc_channel
+            ));
+            
             let _ = self.event_tx.send(NaisEvent::ChannelJoined {
                 channel_id: channel_id.clone(),
                 irc_channel: irc_channel.to_string(),
@@ -499,17 +617,31 @@ impl NaisChannelManager {
             
             Some(channel_id)
         } else {
+            debug_log("topic", "PROCESS", &format!(
+                "Topic '{}' is not a NAIS topic",
+                topic
+            ));
             None
         }
     }
     
     /// Process users in IRC channel and probe for NAIS clients
     pub async fn probe_users(&mut self, irc_channel: &str, users: &[String]) {
+        debug_log("probe", "USERS", &format!(
+            "Processing {} users in {}: {:?}",
+            users.len(), irc_channel, users
+        ));
+        
         let Some(channel_id) = self.irc_to_nais.get(irc_channel).cloned() else {
+            debug_log("probe", "USERS", &format!(
+                "No NAIS channel mapping for IRC channel: {}",
+                irc_channel
+            ));
             return;
         };
         
         let Some(channel) = self.channels.get_mut(&channel_id) else {
+            debug_log(&channel_id, "USERS", "Channel not found in local channels");
             return;
         };
         
@@ -536,6 +668,7 @@ impl NaisChannelManager {
             
             // Send probe CTCP
             let probe_msg = create_probe_ctcp(irc_channel);
+            debug_ctcp("TX", clean_user, CTCP_NAIS_PROBE, irc_channel);
             let _ = self.event_tx.send(NaisEvent::SendIrcCommand {
                 command: NaisIrcCommand::Ctcp {
                     target: clean_user.to_string(),
@@ -543,12 +676,27 @@ impl NaisChannelManager {
                 },
             }).await;
         }
+        
+        debug_log(&channel_id, "PROBE", &format!(
+            "Pending probes: {:?}",
+            channel.pending_probes
+        ));
     }
     
     /// Handle incoming NAIS CTCP command
     pub async fn handle_ctcp(&mut self, from: &str, command: &str, args: &[String]) {
+        debug_ctcp("RX", from, command, &args.join(" "));
+        
         match command {
             CTCP_NAIS_PROBE => {
+                debug_log("ctcp", "PROBE_RX", &format!(
+                    "Received probe from {} for channel args: {:?}",
+                    from, args
+                ));
+                debug_log("ctcp", "PROBE_RX", &format!(
+                    "Received probe from {} for channel args: {:?}",
+                    from, args
+                ));
                 // Someone is probing us - respond with our info if we're in that channel
                 if let Some(irc_channel) = args.first() {
                     if let Some(channel_id) = self.irc_to_nais.get(irc_channel).cloned() {
@@ -560,23 +708,49 @@ impl NaisChannelManager {
                                 &self.our_ip,
                                 self.our_port,
                             );
+                            debug_ctcp("TX", from, CTCP_NAIS_INFO, &format!(
+                                "{} {} {} {}",
+                                channel_id, self.our_fingerprint, self.our_ip, self.our_port
+                            ));
+                            debug_log(&channel_id, "PROBE_RESP", &format!(
+                                "Responding to probe from {} with our info: fp={}, ip={}, port={}",
+                                from, self.our_fingerprint, self.our_ip, self.our_port
+                            ));
                             let _ = self.event_tx.send(NaisEvent::SendIrcCommand {
                                 command: NaisIrcCommand::CtcpResponse {
                                     target: from.to_string(),
                                     message: info_msg,
                                 },
                             }).await;
+                        } else {
+                            debug_log(&channel_id, "PROBE_RX", "Channel exists in mapping but not in channels HashMap");
                         }
+                    } else {
+                        debug_log("ctcp", "PROBE_RX", &format!(
+                            "No NAIS channel mapping for IRC channel: {}",
+                            irc_channel
+                        ));
                     }
+                } else {
+                    debug_log("ctcp", "PROBE_RX", "Probe received with no channel argument");
                 }
             }
             CTCP_NAIS_INFO => {
+                debug_log("ctcp", "INFO_RX", &format!(
+                    "Received INFO from {}: args={:?}",
+                    from, args
+                ));
                 // Received info response - add peer
                 if args.len() >= 4 {
                     let channel_id = &args[0];
                     let fingerprint = &args[1];
                     let ip = &args[2];
                     let port: u16 = args[3].parse().unwrap_or(0);
+                    
+                    debug_peer(channel_id, "INFO", from, &format!(
+                        "fp={}, ip={}, port={}",
+                        fingerprint, ip, port
+                    ));
                     
                     if let Some(channel) = self.channels.get_mut(channel_id) {
                         // Remove from pending probes
@@ -595,6 +769,11 @@ impl NaisChannelManager {
                         
                         channel.peers.insert(from.to_string(), peer.clone());
                         
+                        debug_peer(channel_id, "ADDED", from, &format!(
+                            "Total peers now: {}",
+                            channel.peers.len()
+                        ));
+                        
                         let _ = self.event_tx.send(NaisEvent::PeerJoined {
                             channel_id: channel_id.clone(),
                             peer,
@@ -602,22 +781,39 @@ impl NaisChannelManager {
                         
                         // If we have at least one peer, channel is now active
                         if channel.state == NaisChannelState::Discovering && !channel.peers.is_empty() {
+                            debug_state(channel_id, "Discovering", "Active");
                             channel.state = NaisChannelState::Active;
                             let _ = self.event_tx.send(NaisEvent::StateChanged {
                                 channel_id: channel_id.clone(),
                                 state: NaisChannelState::Active,
                             }).await;
                         }
+                    } else {
+                        debug_log(channel_id, "INFO_RX", "Channel not found locally");
                     }
+                } else {
+                    debug_log("ctcp", "INFO_RX", &format!(
+                        "Invalid INFO args count: {} (expected >= 4)",
+                        args.len()
+                    ));
                 }
             }
             CTCP_NAIS_JOIN => {
+                debug_log("ctcp", "JOIN_RX", &format!(
+                    "Received JOIN request from {}: args={:?}",
+                    from, args
+                ));
                 // Someone wants to join our channel
                 if args.len() >= 4 {
                     let channel_id = &args[0];
                     let fingerprint = &args[1];
                     let ip = &args[2];
                     let port: u16 = args[3].parse().unwrap_or(0);
+                    
+                    debug_peer(channel_id, "JOIN_REQ", from, &format!(
+                        "fp={}, ip={}, port={}",
+                        fingerprint, ip, port
+                    ));
                     
                     if let Some(channel) = self.channels.get_mut(channel_id) {
                         // Add as peer
@@ -640,6 +836,14 @@ impl NaisChannelManager {
                             &self.our_ip,
                             self.our_port,
                         );
+                        debug_ctcp("TX", from, CTCP_NAIS_ACCEPT, &format!(
+                            "{} {} {} {}",
+                            channel_id, self.our_fingerprint, self.our_ip, self.our_port
+                        ));
+                        debug_peer(channel_id, "ACCEPT", from, &format!(
+                            "Accepting join request, sending our info: fp={}, ip={}, port={}",
+                            self.our_fingerprint, self.our_ip, self.our_port
+                        ));
                         let _ = self.event_tx.send(NaisEvent::SendIrcCommand {
                             command: NaisIrcCommand::CtcpResponse {
                                 target: from.to_string(),
@@ -651,16 +855,32 @@ impl NaisChannelManager {
                             channel_id: channel_id.clone(),
                             peer,
                         }).await;
+                    } else {
+                        debug_log(channel_id, "JOIN_RX", "Channel not found locally");
                     }
+                } else {
+                    debug_log("ctcp", "JOIN_RX", &format!(
+                        "Invalid JOIN args count: {} (expected >= 4)",
+                        args.len()
+                    ));
                 }
             }
             CTCP_NAIS_ACCEPT => {
+                debug_log("ctcp", "ACCEPT_RX", &format!(
+                    "Received ACCEPT from {}: args={:?}",
+                    from, args
+                ));
                 // Our join request was accepted
                 if args.len() >= 4 {
                     let channel_id = &args[0];
                     let fingerprint = &args[1];
                     let ip = &args[2];
                     let port: u16 = args[3].parse().unwrap_or(0);
+                    
+                    debug_peer(channel_id, "ACCEPT", from, &format!(
+                        "Join accepted: fp={}, ip={}, port={}",
+                        fingerprint, ip, port
+                    ));
                     
                     if let Some(channel) = self.channels.get_mut(channel_id) {
                         let peer = NaisPeer {
@@ -674,7 +894,13 @@ impl NaisChannelManager {
                         };
                         
                         channel.peers.insert(from.to_string(), peer.clone());
+                        debug_state(channel_id, state_to_string(&channel.state), "Active");
                         channel.state = NaisChannelState::Active;
+                        
+                        debug_peer(channel_id, "ADDED", from, &format!(
+                            "Peer added after accept. Total peers: {}",
+                            channel.peers.len()
+                        ));
                         
                         let _ = self.event_tx.send(NaisEvent::PeerJoined {
                             channel_id: channel_id.clone(),
@@ -685,31 +911,68 @@ impl NaisChannelManager {
                             channel_id: channel_id.clone(),
                             state: NaisChannelState::Active,
                         }).await;
+                    } else {
+                        debug_log(channel_id, "ACCEPT_RX", "Channel not found locally");
                     }
+                } else {
+                    debug_log("ctcp", "ACCEPT_RX", &format!(
+                        "Invalid ACCEPT args count: {} (expected >= 4)",
+                        args.len()
+                    ));
                 }
             }
             CTCP_NAIS_LEAVE => {
+                debug_log("ctcp", "LEAVE_RX", &format!(
+                    "Received LEAVE from {}: args={:?}",
+                    from, args
+                ));
                 // Peer is leaving
                 if let Some(channel_id) = args.first() {
                     if let Some(channel) = self.channels.get_mut(channel_id) {
+                        debug_peer(channel_id, "LEAVE", from, &format!(
+                            "Peer leaving. Peers before: {}",
+                            channel.peers.len()
+                        ));
                         channel.peers.remove(from);
+                        debug_peer(channel_id, "REMOVED", from, &format!(
+                            "Peers after: {}",
+                            channel.peers.len()
+                        ));
                         let _ = self.event_tx.send(NaisEvent::PeerLeft {
                             channel_id: channel_id.clone(),
                             nickname: from.to_string(),
                         }).await;
+                    } else {
+                        debug_log(channel_id, "LEAVE_RX", "Channel not found locally");
                     }
                 }
             }
-            _ => {}
+            _ => {
+                debug_log("ctcp", "UNKNOWN", &format!(
+                    "Unhandled NAIS CTCP command from {}: {} {:?}",
+                    from, command, args
+                ));
+            }
         }
     }
     
     /// Leave a NAIS channel
     pub async fn leave_channel(&mut self, channel_id: &str) {
+        debug_log(channel_id, "LEAVE", &format!(
+            "Leaving NAIS channel: {}",
+            channel_id
+        ));
+        
         if let Some(channel) = self.channels.remove(channel_id) {
+            debug_log(channel_id, "LEAVE", &format!(
+                "Notifying {} peers of departure",
+                channel.peers.len()
+            ));
+            
             // Notify peers we're leaving
             for (nickname, _peer) in &channel.peers {
                 let leave_msg = create_leave_ctcp(channel_id);
+                debug_ctcp("TX", nickname, CTCP_NAIS_LEAVE, channel_id);
                 let _ = self.event_tx.send(NaisEvent::SendIrcCommand {
                     command: NaisIrcCommand::Ctcp {
                         target: nickname.clone(),
@@ -728,15 +991,30 @@ impl NaisChannelManager {
             
             self.irc_to_nais.remove(&channel.irc_channel);
             
+            debug_log(channel_id, "LEAVE", &format!(
+                "Left channel successfully. IRC channel: {}",
+                channel.irc_channel
+            ));
+            debug_state(channel_id, state_to_string(&channel.state), "Closed");
+            
             let _ = self.event_tx.send(NaisEvent::ChannelLeft {
                 channel_id: channel_id.to_string(),
             }).await;
+        } else {
+            debug_log(channel_id, "LEAVE", "Channel not found - may have already been removed");
         }
     }
     
     /// Send a message to a NAIS channel
     pub async fn send_message(&mut self, channel_id: &str, content: &str) -> Result<String, String> {
+        debug_log(channel_id, "MSG_TX", &format!(
+            "Sending message: {} bytes, content preview: '{}...'",
+            content.len(),
+            &content[..content.len().min(50)]
+        ));
+        
         let Some(channel) = self.channels.get_mut(channel_id) else {
+            debug_log(channel_id, "MSG_TX", "Failed: Channel not found");
             return Err("Channel not found".to_string());
         };
         
@@ -762,6 +1040,11 @@ impl NaisChannelManager {
             channel_id: channel_id.to_string(),
             message_id: message.id.clone(),
         }).await;
+        
+        debug_log(channel_id, "MSG_TX", &format!(
+            "Message sent successfully: id={}, peers_to_receive={}",
+            message.id, channel.peers.len()
+        ));
         
         Ok(message.id)
     }
