@@ -1193,6 +1193,31 @@ fn app() -> Element {
                             // Update profile_status signal based on the event
                             if matches!(event, IrcEvent::Connected { .. }) {
                                 status_handle.write().insert(profile_name.clone(), ConnectionStatus::Connected);
+                                
+                                // Auto-rejoin NSC discovery channels when IRC connects
+                                let profile_for_nsc = profile_name.clone();
+                                spawn(async move {
+                                    // Small delay to let the connection stabilize
+                                    Delay::new(Duration::from_millis(500)).await;
+                                    
+                                    let manager = crate::nsc_manager::get_nsc_manager();
+                                    let mgr = manager.read().await;
+                                    let channels = mgr.list_channels().await;
+                                    drop(mgr);
+                                    
+                                    // Join each NSC channel's IRC discovery channel
+                                    for channel in channels {
+                                        if !channel.irc_channel.is_empty() {
+                                            if let Some(core) = cores.read().get(&profile_for_nsc) {
+                                                log::info!("Auto-rejoining NSC discovery channel: {} for '{}'", 
+                                                    channel.irc_channel, channel.name);
+                                                let _ = core.cmd_tx.try_send(irc_client::IrcCommandEvent::Join {
+                                                    channel: channel.irc_channel.clone(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                });
                             } else if matches!(event, IrcEvent::Disconnected) {
                                 status_handle.write().insert(profile_name.clone(), ConnectionStatus::Disconnected);
                             }
@@ -2566,6 +2591,7 @@ fn app() -> Element {
                                                                                             // Clone for async block
                                                                                             let nick_for_async = nick.clone();
                                                                                             let profile_for_async = profile_for_nsc.clone();
+                                                                                            let cores_clone = cores.clone();
                                                                                             
                                                                                             // First, send an NSC probe to check capability
                                                                                             spawn(async move {
@@ -2575,7 +2601,7 @@ fn app() -> Element {
                                                                                                 // Send probe first
                                                                                                 let probe = mgr.create_probe_ctcp();
                                                                                                 if !probe.is_empty() {
-                                                                                                    if let Some(core) = cores.read().get(&profile_for_async) {
+                                                                                                    if let Some(core) = cores_clone.read().get(&profile_for_async) {
                                                                                                         let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Ctcp {
                                                                                                             target: nick_for_async.clone(),
                                                                                                             message: probe,
@@ -2586,7 +2612,7 @@ fn app() -> Element {
                                                                                                 // Create and send invite
                                                                                                 match mgr.create_invite_ctcp(&nick_for_async, &ch.channel_id).await {
                                                                                                     Ok(invite_ctcp) => {
-                                                                                                        if let Some(core) = cores.read().get(&profile_for_async) {
+                                                                                                        if let Some(core) = cores_clone.read().get(&profile_for_async) {
                                                                                                             let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Ctcp {
                                                                                                                 target: nick_for_async.clone(),
                                                                                                                 message: invite_ctcp,
@@ -5431,12 +5457,24 @@ fn app() -> Element {
                                     let name = nsc_channel_name_input.read().clone();
                                     if !name.is_empty() {
                                         nsc_loading.set(true);
+                                        let active_profile = state.read().active_profile.clone();
                                         spawn(async move {
                                             let manager = crate::nsc_manager::get_nsc_manager();
                                             let mgr = manager.read().await;
                                             match mgr.create_channel(name.clone()).await {
                                                 Ok(info) => {
-                                                    log::info!("Created NSC channel: {} ({})", info.name, &info.channel_id[..8]);
+                                                    log::info!("Created NSC channel: {} ({}) with IRC discovery: {}", 
+                                                        info.name, &info.channel_id[..8], &info.irc_channel);
+                                                    
+                                                    // Join the IRC channel for peer discovery
+                                                    let irc_channel = info.irc_channel.clone();
+                                                    if let Some(core) = cores.read().get(&active_profile) {
+                                                        let _ = core.cmd_tx.try_send(irc_client::IrcCommandEvent::Join {
+                                                            channel: irc_channel.clone(),
+                                                        });
+                                                        log::info!("Joined IRC discovery channel: {}", irc_channel);
+                                                    }
+                                                    
                                                     // Refresh channel list
                                                     let channels = mgr.list_channels().await;
                                                     drop(mgr);
@@ -5466,31 +5504,23 @@ fn app() -> Element {
                                 for channel in nsc_channels.read().iter().cloned() {
                                     {
                                         let channel_id = channel.channel_id.clone();
-                                        let channel_id_display = if channel.channel_id.len() >= 8 { 
-                                            format!("{}...", &channel.channel_id[..8]) 
-                                        } else { 
-                                            channel.channel_id.clone() 
-                                        };
+                                        let irc_channel_display = channel.irc_channel.clone();
                                         rsx! {
                                             div {
                                                 key: "{channel_id}",
-                                                style: "display: flex; align-items: center; justify-content: space-between; padding: 8px; background: rgba(99, 102, 241, 0.1); border-radius: 6px; margin-bottom: 4px;",
+                                                style: "display: flex; flex-direction: column; padding: 8px; background: rgba(99, 102, 241, 0.1); border-radius: 6px; margin-bottom: 4px;",
                                                 div {
-                                                    style: "display: flex; align-items: center; gap: 8px;",
-                                                    span { "🔒" }
-                                                    span { "{channel.name}" }
-                                                    if channel.member_count > 1 {
-                                                        span {
-                                                            style: "color: var(--muted); font-size: 11px;",
-                                                            "({channel.member_count} members)"
+                                                    style: "display: flex; align-items: center; justify-content: space-between;",
+                                                    div {
+                                                        style: "display: flex; align-items: center; gap: 8px;",
+                                                        span { "🔒" }
+                                                        span { "{channel.name}" }
+                                                        if channel.member_count > 1 {
+                                                            span {
+                                                                style: "color: var(--muted); font-size: 11px;",
+                                                                "({channel.member_count} members)"
+                                                            }
                                                         }
-                                                    }
-                                                }
-                                                div {
-                                                    style: "display: flex; align-items: center; gap: 8px;",
-                                                    span {
-                                                        style: "color: var(--muted); font-size: 11px;",
-                                                        "{channel_id_display}"
                                                     }
                                                     button {
                                                         style: "background: rgba(239, 68, 68, 0.2); color: #ef4444; border: none; padding: 4px 8px; border-radius: 4px; font-size: 11px; cursor: pointer;",
@@ -5509,6 +5539,21 @@ fn app() -> Element {
                                                             });
                                                         },
                                                         "Leave"
+                                                    }
+                                                }
+                                                div {
+                                                    style: "display: flex; align-items: center; gap: 6px; margin-top: 4px; padding-left: 24px;",
+                                                    span {
+                                                        style: "color: var(--muted); font-size: 11px;",
+                                                        "Discovery:"
+                                                    }
+                                                    span {
+                                                        style: "color: var(--accent); font-size: 11px; font-family: monospace;",
+                                                        "{irc_channel_display}"
+                                                    }
+                                                    span {
+                                                        style: "color: var(--muted); font-size: 10px;",
+                                                        "(share with others to connect)"
                                                     }
                                                 }
                                             }

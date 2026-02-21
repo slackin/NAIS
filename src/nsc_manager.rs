@@ -102,6 +102,9 @@ pub struct StoredChannel {
     pub member_count: u32,
     /// Are we the owner?
     pub is_owner: bool,
+    /// IRC channel name for peer discovery
+    #[serde(default)]
+    pub irc_channel: String,
 }
 
 /// Stored message data
@@ -142,6 +145,64 @@ pub struct NscStorage {
     /// PreKeyBundles from peers (fingerprint -> base64 encoded bundle)
     #[serde(default)]
     pub peer_prekey_bundles: HashMap<String, String>,
+    /// IRC channel mapping for peer discovery
+    #[serde(default)]
+    pub irc_channel_mapping: IrcChannelMapping,
+}
+
+// =============================================================================
+// IRC Channel Mapping
+// =============================================================================
+
+/// Mapping between NAIS channel IDs and IRC discovery channels
+/// This mapping allows peers to discover each other via IRC channels
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct IrcChannelMapping {
+    /// NAIS channel ID (hex) -> IRC channel name
+    nais_to_irc: HashMap<String, String>,
+    /// IRC channel name -> NAIS channel ID (hex)
+    irc_to_nais: HashMap<String, String>,
+}
+
+impl IrcChannelMapping {
+    /// Generate opaque IRC channel name for a NAIS channel ID
+    /// Format: #nais-<first 8 chars of channel_id>
+    pub fn generate_irc_channel(channel_id: &str) -> String {
+        let short_id = if channel_id.len() >= 8 {
+            &channel_id[..8]
+        } else {
+            channel_id
+        };
+        format!("#nais-{}", short_id.to_lowercase())
+    }
+    
+    /// Register a mapping between NAIS channel and IRC channel
+    pub fn register(&mut self, nais_channel_id: String, irc_channel: String) {
+        self.irc_to_nais.insert(irc_channel.clone(), nais_channel_id.clone());
+        self.nais_to_irc.insert(nais_channel_id, irc_channel);
+    }
+    
+    /// Get IRC channel for a NAIS channel ID
+    pub fn get_irc_channel(&self, nais_channel_id: &str) -> Option<&String> {
+        self.nais_to_irc.get(nais_channel_id)
+    }
+    
+    /// Get NAIS channel ID for an IRC channel
+    pub fn get_nais_channel(&self, irc_channel: &str) -> Option<&String> {
+        self.irc_to_nais.get(irc_channel)
+    }
+    
+    /// Remove a mapping by NAIS channel ID
+    pub fn remove_by_nais(&mut self, nais_channel_id: &str) {
+        if let Some(irc_channel) = self.nais_to_irc.remove(nais_channel_id) {
+            self.irc_to_nais.remove(&irc_channel);
+        }
+    }
+    
+    /// Get all mappings
+    pub fn all_mappings(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.nais_to_irc.iter()
+    }
 }
 
 // =============================================================================
@@ -157,6 +218,8 @@ pub struct ChannelInfo {
     pub member_count: u32,
     pub is_owner: bool,
     pub created_at: u64,
+    /// IRC channel name for peer discovery (e.g., #nais-a1b2c3d4)
+    pub irc_channel: String,
 }
 
 // =============================================================================
@@ -357,6 +420,8 @@ pub struct NscManager {
     trust_manager: Arc<RwLock<TrustManager>>,
     /// Pending messages awaiting delivery acknowledgment (channel_id+seq -> pending)
     retry_queue: Arc<RwLock<HashMap<String, PendingMessage>>>,
+    /// IRC channel mapping for peer discovery
+    irc_channel_mapping: Arc<RwLock<IrcChannelMapping>>,
 }
 
 /// Pending ICE session info
@@ -415,9 +480,21 @@ impl NscManager {
         // Create channel manager
         let channel_manager = ChannelManager::new(identity.clone(), peer_id);
         
-        // Load channel info
+        // Load channel info and IRC channel mappings
         let mut channel_info = HashMap::new();
+        let mut irc_channel_mapping = storage.irc_channel_mapping.clone();
+        
         for ch in &storage.channels {
+            // Generate IRC channel if not stored (migration for older storage)
+            let irc_channel = if ch.irc_channel.is_empty() {
+                let generated = IrcChannelMapping::generate_irc_channel(&ch.channel_id);
+                // Register the generated mapping
+                irc_channel_mapping.register(ch.channel_id.clone(), generated.clone());
+                generated
+            } else {
+                ch.irc_channel.clone()
+            };
+            
             channel_info.insert(ch.channel_id.clone(), ChannelInfo {
                 channel_id: ch.channel_id.clone(),
                 name: ch.name.clone(),
@@ -425,6 +502,7 @@ impl NscManager {
                 member_count: ch.member_count,
                 is_owner: ch.is_owner,
                 created_at: ch.created_at,
+                irc_channel,
             });
         }
         
@@ -529,6 +607,7 @@ impl NscManager {
             peer_prekey_bundles: Arc::new(RwLock::new(peer_prekey_bundles)),
             trust_manager: Arc::new(RwLock::new(trust_manager)),
             retry_queue: Arc::new(RwLock::new(HashMap::new())),
+            irc_channel_mapping: Arc::new(RwLock::new(irc_channel_mapping)),
         };
         
         // Save identity if newly generated
@@ -594,13 +673,25 @@ impl NscManager {
             .unwrap_or_default()
             .as_secs();
         
+        let channel_id_hex = channel_id.to_hex();
+        
+        // Generate IRC channel name for peer discovery
+        let irc_channel = IrcChannelMapping::generate_irc_channel(&channel_id_hex);
+        
+        // Register the mapping
+        self.irc_channel_mapping.write().await.register(
+            channel_id_hex.clone(),
+            irc_channel.clone(),
+        );
+        
         let info = ChannelInfo {
-            channel_id: channel_id.to_hex(),
+            channel_id: channel_id_hex,
             name,
             topic: String::new(),
             member_count: 1,
             is_owner: true,
             created_at: now,
+            irc_channel,
         };
         
         // Cache the info
@@ -608,6 +699,9 @@ impl NscManager {
         
         // Save to storage
         self.save_storage_async().await;
+        
+        log::info!("Created secure channel '{}' with IRC discovery channel: {}", 
+            info.name, info.irc_channel);
         
         Ok(info)
     }
@@ -624,12 +718,17 @@ impl NscManager {
         arr.copy_from_slice(&bytes);
         let cid = ChannelId(arr);
         
-        self.channel_manager.leave_channel(&cid)
-            .await
-            .map_err(|e| format!("Failed to leave channel: {:?}", e))?;
+        // Try to leave from ChannelManager, but don't fail if not found
+        // (channel may only exist in storage/cache from a previous session)
+        if let Err(e) = self.channel_manager.leave_channel(&cid).await {
+            log::debug!("Channel not in ChannelManager (this is OK for stored channels): {:?}", e);
+        }
         
         // Remove from cache
         self.channel_info.write().await.remove(channel_id);
+        
+        // Remove IRC channel mapping
+        self.irc_channel_mapping.write().await.remove_by_nais(channel_id);
         
         // Save to storage
         self.save_storage_async().await;
@@ -647,6 +746,21 @@ impl NscManager {
         self.channel_info.read().await.get(channel_id).cloned()
     }
     
+    /// Get channel by IRC channel name
+    pub async fn get_channel_by_irc(&self, irc_channel: &str) -> Option<ChannelInfo> {
+        let mapping = self.irc_channel_mapping.read().await;
+        if let Some(channel_id) = mapping.get_nais_channel(irc_channel) {
+            self.channel_info.read().await.get(channel_id).cloned()
+        } else {
+            None
+        }
+    }
+    
+    /// Get the IRC channel mapping
+    pub async fn get_irc_channel_mapping(&self) -> IrcChannelMapping {
+        self.irc_channel_mapping.read().await.clone()
+    }
+    
     /// Save storage to disk (async version)
     async fn save_storage_async(&self) {
         let channels: Vec<StoredChannel> = self.channel_info.read().await.values().map(|info| StoredChannel {
@@ -656,10 +770,12 @@ impl NscManager {
             created_at: info.created_at,
             member_count: info.member_count,
             is_owner: info.is_owner,
+            irc_channel: info.irc_channel.clone(),
         }).collect();
         
         let this_device = self.this_device.read().await;
         let linked_devices = self.linked_devices.read().await;
+        let irc_channel_mapping = self.irc_channel_mapping.read().await.clone();
         
         // Encrypt sessions and trust records
         let storage_password = hex::encode(&self.identity.to_bytes()[..16]);
@@ -716,6 +832,7 @@ impl NscManager {
             encrypted_sessions,
             encrypted_trust,
             peer_prekey_bundles,
+            irc_channel_mapping,
         };
         
         if let Err(e) = save_nsc_storage(&storage) {
@@ -744,6 +861,7 @@ impl NscManager {
             encrypted_sessions: None,
             encrypted_trust: None,
             peer_prekey_bundles: HashMap::new(),
+            irc_channel_mapping: IrcChannelMapping::default(),
         };
         
         let _ = save_nsc_storage(&storage);
@@ -1855,7 +1973,8 @@ impl NscManager {
                             info.member_count = metadata.member_count;
                             log::info!("Updated channel {} metadata from {}", metadata.channel_id, from_nick);
                         } else {
-                            // New channel we didn't know about
+                            // New channel we didn't know about - generate IRC channel
+                            let irc_channel = IrcChannelMapping::generate_irc_channel(&metadata.channel_id);
                             channel_info.insert(metadata.channel_id.clone(), ChannelInfo {
                                 channel_id: metadata.channel_id,
                                 name: metadata.name,
@@ -1863,6 +1982,7 @@ impl NscManager {
                                 member_count: metadata.member_count,
                                 is_owner: false,
                                 created_at: metadata.timestamp / 1000,
+                                irc_channel,
                             });
                         }
                     }
@@ -2218,6 +2338,7 @@ impl NscManager {
             member_count: invite.member_count + 1,
             is_owner: false,
             created_at: now,
+            irc_channel: IrcChannelMapping::generate_irc_channel(&invite.channel_id),
         };
         
         self.channel_info.write().await.insert(invite.channel_id.clone(), info);
@@ -3139,6 +3260,7 @@ impl NscManager {
                     member_count: 1,
                     is_owner: false,
                     created_at: now,
+                    irc_channel: IrcChannelMapping::generate_irc_channel(&ch_secrets.channel_id),
                 });
             }
         }
