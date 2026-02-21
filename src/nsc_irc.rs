@@ -70,7 +70,7 @@ pub const PRESENCE_HEARTBEAT: Duration = Duration::from_secs(60);
 pub const PRESENCE_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Maximum CTCP message length (IRC limit is typically ~400-500 chars)
-pub const MAX_CTCP_LENGTH: usize = 400;
+pub const MAX_CTCP_LENGTH: usize = 512;
 
 // =============================================================================
 // CTCP Message Types
@@ -486,7 +486,8 @@ pub fn encode_ctcp(command: NscCtcpCommand, payload: &impl Serialize) -> IrcResu
     let ctcp = format!("\x01{} {}\x01", command.as_str(), encoded);
 
     if ctcp.len() > MAX_CTCP_LENGTH {
-        return Err(IrcIntegrationError::InvalidCtcp("Message too long".into()));
+        log::warn!("CTCP message too long: {} bytes (max {}), command: {}", ctcp.len(), MAX_CTCP_LENGTH, command.as_str());
+        return Err(IrcIntegrationError::InvalidCtcp(format!("Message too long: {} bytes (max {})", ctcp.len(), MAX_CTCP_LENGTH)));
     }
 
     Ok(ctcp)

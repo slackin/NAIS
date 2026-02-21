@@ -2570,67 +2570,71 @@ fn app() -> Element {
                                                                         "📨 Invite to Channel"
                                                                     }
                                                                     // Invite to Secure Channel option
-                                                                    {
-                                                                        let has_nsc_channels = !nsc_channels.read().is_empty();
-                                                                        rsx! {
-                                                                            button {
-                                                                                class: if has_nsc_channels { "menu-item" } else { "menu-item disabled" },
-                                                                                disabled: !has_nsc_channels,
-                                                                                title: if has_nsc_channels { "Invite user to a secure encrypted channel" } else { "Create a secure channel first" },
-                                                                                onclick: {
-                                                                                    let nick = user_nick.clone();
-                                                                                    let profile_for_nsc = user_profile.clone();
-                                                                                    move |_| {
-                                                                                        user_menu_open.set(None);
-                                                                                        ctcp_submenu_open.set(false);
-                                                                                        if !has_nsc_channels { return; }
+                                                                    button {
+                                                                        class: if !nsc_channels.read().is_empty() { "menu-item" } else { "menu-item disabled" },
+                                                                        disabled: nsc_channels.read().is_empty(),
+                                                                        title: if !nsc_channels.read().is_empty() { "Invite user to a secure encrypted channel" } else { "Create a secure channel first" },
+                                                                        onclick: {
+                                                                            let nick = user_nick.clone();
+                                                                            let profile_for_nsc = user_profile.clone();
+                                                                            let nsc_channels_clone = nsc_channels;
+                                                                            move |_| {
+                                                                                log::info!("Invite to Secure Channel clicked for user: {}", nick);
+                                                                                user_menu_open.set(None);
+                                                                                ctcp_submenu_open.set(false);
+                                                                                
+                                                                                // Get the first NSC channel to invite to
+                                                                                let channels = nsc_channels_clone.read();
+                                                                                let channel = channels.first().cloned();
+                                                                                drop(channels);
+                                                                                
+                                                                                if let Some(ch) = channel {
+                                                                                    log::info!("Found NSC channel '{}' ({}), sending invite to {}", ch.name, &ch.channel_id[..8], nick);
+                                                                                    // Clone for async block
+                                                                                    let nick_for_async = nick.clone();
+                                                                                    let profile_for_async = profile_for_nsc.clone();
+                                                                                    let cores_clone = cores.clone();
+                                                                                    
+                                                                                    // First, send an NSC probe to check capability
+                                                                                    spawn(async move {
+                                                                                        let manager = crate::nsc_manager::get_nsc_manager();
+                                                                                        let mgr = manager.read().await;
                                                                                         
-                                                                                        // Get the first NSC channel to invite to
-                                                                                        let channel = nsc_channels.read().first().cloned();
-                                                                                        if let Some(ch) = channel {
-                                                                                            // Clone for async block
-                                                                                            let nick_for_async = nick.clone();
-                                                                                            let profile_for_async = profile_for_nsc.clone();
-                                                                                            let cores_clone = cores.clone();
-                                                                                            
-                                                                                            // First, send an NSC probe to check capability
-                                                                                            spawn(async move {
-                                                                                                let manager = crate::nsc_manager::get_nsc_manager();
-                                                                                                let mgr = manager.read().await;
-                                                                                                
-                                                                                                // Send probe first
-                                                                                                let probe = mgr.create_probe_ctcp();
-                                                                                                if !probe.is_empty() {
-                                                                                                    if let Some(core) = cores_clone.read().get(&profile_for_async) {
-                                                                                                        let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Ctcp {
-                                                                                                            target: nick_for_async.clone(),
-                                                                                                            message: probe,
-                                                                                                        });
-                                                                                                    }
-                                                                                                }
-                                                                                                
-                                                                                                // Create and send invite
-                                                                                                match mgr.create_invite_ctcp(&nick_for_async, &ch.channel_id).await {
-                                                                                                    Ok(invite_ctcp) => {
-                                                                                                        if let Some(core) = cores_clone.read().get(&profile_for_async) {
-                                                                                                            let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Ctcp {
-                                                                                                                target: nick_for_async.clone(),
-                                                                                                                message: invite_ctcp,
-                                                                                                            });
-                                                                                                        }
-                                                                                                        log::info!("Sent NSC invite to {} for channel '{}'", nick_for_async, ch.name);
-                                                                                                    }
-                                                                                                    Err(e) => {
-                                                                                                        log::error!("Failed to create NSC invite: {}", e);
-                                                                                                    }
-                                                                                                }
-                                                                                            });
+                                                                                        // Send probe first
+                                                                                        let probe = mgr.create_probe_ctcp();
+                                                                                        if !probe.is_empty() {
+                                                                                            log::info!("Sending NSC probe to {}", nick_for_async);
+                                                                                            if let Some(core) = cores_clone.read().get(&profile_for_async) {
+                                                                                                let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Ctcp {
+                                                                                                    target: nick_for_async.clone(),
+                                                                                                    message: probe,
+                                                                                                });
+                                                                                            }
                                                                                         }
-                                                                                    }
-                                                                                },
-                                                                                "🔒 Invite to Secure Channel"
+                                                                                        
+                                                                                        // Create and send invite
+                                                                                        match mgr.create_invite_ctcp(&nick_for_async, &ch.channel_id).await {
+                                                                                            Ok(invite_ctcp) => {
+                                                                                                log::info!("Sending NSC invite CTCP to {}: {} chars", nick_for_async, invite_ctcp.len());
+                                                                                                if let Some(core) = cores_clone.read().get(&profile_for_async) {
+                                                                                                    let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Ctcp {
+                                                                                                        target: nick_for_async.clone(),
+                                                                                                        message: invite_ctcp,
+                                                                                                    });
+                                                                                                }
+                                                                                                log::info!("Sent NSC invite to {} for channel '{}'", nick_for_async, ch.name);
+                                                                                            }
+                                                                                            Err(e) => {
+                                                                                                log::error!("Failed to create NSC invite: {}", e);
+                                                                                            }
+                                                                                        }
+                                                                                    });
+                                                                                } else {
+                                                                                    log::warn!("No NSC channels available for invite");
+                                                                                }
                                                                             }
-                                                                        }
+                                                                        },
+                                                                        "🔒 Invite to Secure Channel"
                                                                     }
                                                                     // Advanced options (hidden unless advanced mode is enabled)
                                                                     if *settings_show_advanced.read() {
