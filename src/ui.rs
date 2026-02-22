@@ -402,6 +402,8 @@ fn app() -> Element {
     let mut nsc_peers_in_channel: Signal<Vec<String>> = use_signal(Vec::new);
     // NSC invite modal state: (nick, profile) when showing channel selection
     let mut nsc_invite_modal: Signal<Option<(String, String)>> = use_signal(|| None);
+    // NSC channel members for the sidebar
+    let mut nsc_channel_members: Signal<Vec<crate::nsc_manager::NscChannelMember>> = use_signal(Vec::new);
     
     // Load existing NSC channels on startup
     use_effect(move || {
@@ -470,6 +472,21 @@ fn app() -> Element {
                 channel_msgs.push((msg.timestamp, msg.sender, msg.text));
             }
         });
+    });
+    
+    // Fetch NSC channel members when NSC channel changes
+    use_effect(move || {
+        let channel_id = nsc_current_channel.read().clone();
+        if let Some(ch_id) = channel_id {
+            spawn(async move {
+                let manager = crate::nsc_manager::get_nsc_manager();
+                let mgr = manager.read().await;
+                let members = mgr.get_channel_members(&ch_id).await;
+                nsc_channel_members.set(members);
+            });
+        } else {
+            nsc_channel_members.set(Vec::new());
+        }
     });
 
     // Update channel_users context when channel or user list changes
@@ -2216,16 +2233,16 @@ fn app() -> Element {
                         // Check if we're viewing an NSC channel first
                         let nsc_ch = nsc_current_channel.read().clone();
                         
-                        if let Some(ref nsc_channel_id) = nsc_ch {
+                        if let Some(ref _nsc_channel_id) = nsc_ch {
                             // Show NSC channel members
-                            let nsc_channel_id_clone = nsc_channel_id.clone();
+                            let members = nsc_channel_members.read();
                             
                             rsx! {
                                 div {
                                     class: "section-title",
                                     style: "display:flex; justify-content:space-between; align-items:center; color: var(--accent);",
                                     if !userlist_collapsed() {
-                                        "🔒 Secure Members"
+                                        "🔒 Secure Members — {members.len()}"
                                     }
                                     button {
                                         class: "collapse-btn",
@@ -2236,66 +2253,32 @@ fn app() -> Element {
                                     }
                                 }
                                 if !userlist_collapsed() {
-                                    {
-                                        // Fetch members from NscManager
-                                        let channel_id_for_fetch = nsc_channel_id_clone.clone();
-                                        
-                                        // Create a resource to fetch members
-                                        use_resource(move || {
-                                            let channel_id = channel_id_for_fetch.clone();
-                                            async move {
-                                                let manager = crate::nsc_manager::get_nsc_manager();
-                                                let mgr = manager.read().await;
-                                                mgr.get_channel_members(&channel_id).await
+                                    ul {
+                                        if members.is_empty() {
+                                            li {
+                                                div {
+                                                    class: "row user-row",
+                                                    style: "opacity: 0.5; font-style: italic;",
+                                                    "Loading members..."
+                                                }
                                             }
-                                        });
-                                        
-                                        // For now, use a synchronous approach with spawn
-                                        let mut members_signal: Signal<Vec<crate::nsc_manager::NscChannelMember>> = use_signal(Vec::new);
-                                        let channel_id_for_spawn = nsc_channel_id_clone.clone();
-                                        
-                                        // Spawn to fetch members
-                                        use_effect(move || {
-                                            let channel_id = channel_id_for_spawn.clone();
-                                            spawn(async move {
-                                                let manager = crate::nsc_manager::get_nsc_manager();
-                                                let mgr = manager.read().await;
-                                                let members = mgr.get_channel_members(&channel_id).await;
-                                                members_signal.set(members);
-                                            });
-                                        });
-                                        
-                                        let members = members_signal.read();
-                                        
-                                        rsx! {
-                                            ul {
-                                                if members.is_empty() {
-                                                    li {
-                                                        div {
-                                                            class: "row user-row",
-                                                            style: "opacity: 0.5; font-style: italic;",
-                                                            "Loading members..."
+                                        } else {
+                                            for member in members.iter() {
+                                                li {
+                                                    div {
+                                                        class: "row user-row",
+                                                        style: "display: flex; align-items: center;",
+                                                        if member.is_owner {
+                                                            span {
+                                                                style: "color: #FFD700; margin-right: 6px; font-weight: bold;",
+                                                                "★"
+                                                            }
                                                         }
-                                                    }
-                                                } else {
-                                                    for member in members.iter() {
-                                                        li {
-                                                            div {
-                                                                class: "row user-row",
-                                                                style: "display: flex; align-items: center;",
-                                                                if member.is_owner {
-                                                                    span {
-                                                                        style: "color: #FFD700; margin-right: 6px; font-weight: bold;",
-                                                                        "★"
-                                                                    }
-                                                                }
-                                                                span {
-                                                                    style: if member.is_self { "color: var(--accent); opacity: 0.7;" } else { "color: var(--fg);" },
-                                                                    "{member.display_name}"
-                                                                    if member.is_self {
-                                                                        " (you)"
-                                                                    }
-                                                                }
+                                                        span {
+                                                            style: if member.is_self { "color: var(--accent); opacity: 0.7;" } else { "color: var(--fg);" },
+                                                            "{member.display_name}"
+                                                            if member.is_self {
+                                                                " (you)"
                                                             }
                                                         }
                                                     }
