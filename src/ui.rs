@@ -389,6 +389,8 @@ fn app() -> Element {
     // Nais Secure Channel state
     let mut show_new_nsc_modal = use_signal(|| false);
     let mut nsc_channel_name_input = use_signal(|| String::new());
+    // Selected network for new NSC channel creation (defaults to active profile)
+    let mut nsc_selected_network = use_signal(|| String::new());
     let mut nsc_channels: Signal<Vec<crate::nsc_manager::ChannelInfo>> = use_signal(Vec::new);
     let mut nsc_loading = use_signal(|| false);
     let mut nsc_fingerprint = use_signal(|| String::new());
@@ -5593,24 +5595,30 @@ fn app() -> Element {
                             onkeypress: move |evt| {
                                 if evt.key() == Key::Enter && !*nsc_loading.read() {
                                     let name = nsc_channel_name_input.read().clone();
-                                    if !name.is_empty() {
+                                    let selected_network = nsc_selected_network.read().clone();
+                                    // Use selected network or fall back to active profile
+                                    let network = if selected_network.is_empty() {
+                                        state.read().active_profile.clone()
+                                    } else {
+                                        selected_network
+                                    };
+                                    if !name.is_empty() && !network.is_empty() {
                                         nsc_loading.set(true);
-                                        let active_profile = state.read().active_profile.clone();
                                         spawn(async move {
                                             let manager = crate::nsc_manager::get_nsc_manager();
                                             let mgr = manager.read().await;
-                                            match mgr.create_channel(name.clone()).await {
+                                            match mgr.create_channel(name.clone(), network.clone()).await {
                                                 Ok(info) => {
-                                                    log::info!("Created NSC channel: {} ({}) with IRC discovery: {}", 
-                                                        info.name, &info.channel_id[..8], &info.irc_channel);
+                                                    log::info!("Created NSC channel: {} ({}) on network '{}' with IRC discovery: {}", 
+                                                        info.name, &info.channel_id[..8], info.network, &info.irc_channel);
                                                     
-                                                    // Join the IRC channel for peer discovery
+                                                    // Join the IRC channel for peer discovery on the selected network
                                                     let irc_channel = info.irc_channel.clone();
-                                                    if let Some(core) = cores.read().get(&active_profile) {
+                                                    if let Some(core) = cores.read().get(&network) {
                                                         let _ = core.cmd_tx.try_send(irc_client::IrcCommandEvent::Join {
                                                             channel: irc_channel.clone(),
                                                         });
-                                                        log::info!("Joined IRC discovery channel: {}", irc_channel);
+                                                        log::info!("Joined IRC discovery channel {} on network {}", irc_channel, network);
                                                     }
                                                     
                                                     // Refresh channel list
@@ -5631,6 +5639,40 @@ fn app() -> Element {
                             },
                         }
                         
+                        // Network selection dropdown
+                        div {
+                            style: "margin-top: 12px;",
+                            div {
+                                style: "color: var(--muted); font-size: 12px; margin-bottom: 4px;",
+                                "IRC Network for Discovery:"
+                            }
+                            div {
+                                style: "display: flex; flex-wrap: wrap; gap: 8px;",
+                                for profile in profiles.read().iter().cloned() {
+                                    {
+                                        let profile_name = profile.name.clone();
+                                        let is_selected = nsc_selected_network.read().clone() == profile_name || 
+                                            (nsc_selected_network.read().is_empty() && state.read().active_profile == profile_name);
+                                        rsx! {
+                                            button {
+                                                key: "{profile_name}",
+                                                style: if is_selected {
+                                                    "padding: 6px 12px; border-radius: 6px; background: var(--accent); color: white; border: none; cursor: pointer; font-size: 12px;"
+                                                } else {
+                                                    "padding: 6px 12px; border-radius: 6px; background: rgba(99, 102, 241, 0.1); color: var(--text); border: 1px solid rgba(99, 102, 241, 0.3); cursor: pointer; font-size: 12px;"
+                                                },
+                                                disabled: *nsc_loading.read(),
+                                                onclick: move |_| {
+                                                    nsc_selected_network.set(profile_name.clone());
+                                                },
+                                                "{profile.name}"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
                         // Show existing secure channels
                         if !nsc_channels.read().is_empty() {
                             div {
@@ -5643,6 +5685,7 @@ fn app() -> Element {
                                     {
                                         let channel_id = channel.channel_id.clone();
                                         let irc_channel_display = channel.irc_channel.clone();
+                                        let network_display = channel.network.clone();
                                         rsx! {
                                             div {
                                                 key: "{channel_id}",
@@ -5689,9 +5732,15 @@ fn app() -> Element {
                                                         style: "color: var(--accent); font-size: 11px; font-family: monospace;",
                                                         "{irc_channel_display}"
                                                     }
-                                                    span {
-                                                        style: "color: var(--muted); font-size: 10px;",
-                                                        "(share with others to connect)"
+                                                    if !network_display.is_empty() {
+                                                        span {
+                                                            style: "color: var(--muted); font-size: 10px;",
+                                                            "on"
+                                                        }
+                                                        span {
+                                                            style: "color: var(--accent); font-size: 10px;",
+                                                            "{network_display}"
+                                                        }
                                                     }
                                                 }
                                             }
@@ -5738,6 +5787,13 @@ fn app() -> Element {
                                                         }
                                                     }
                                                 }
+                                                if !invite.network.is_empty() {
+                                                    div {
+                                                        style: "margin-bottom: 8px; font-size: 11px; color: var(--muted);",
+                                                        "Network: "
+                                                        span { style: "color: var(--accent);", "{invite.network}" }
+                                                    }
+                                                }
                                                 div {
                                                     style: "display: flex; gap: 8px;",
                                                     button {
@@ -5777,23 +5833,29 @@ fn app() -> Element {
                                                                 let manager = crate::nsc_manager::get_nsc_manager();
                                                                 let mgr = manager.read().await;
                                                                 match mgr.accept_invite(&iid).await {
-                                                                    Ok((target_nick, ctcp_response, irc_channel)) => {
-                                                                        log::info!("Accepted invite, sending response to {}", target_nick);
-                                                                        // Send CTCP response to inviter via active IRC connection
-                                                                        let active = state.read().active_profile.clone();
-                                                                        if let Some(core) = cores.read().get(&active) {
+                                                                    Ok((target_nick, ctcp_response, irc_channel, network)) => {
+                                                                        log::info!("Accepted invite, sending response to {} on network {}", target_nick, network);
+                                                                        // Send CTCP response to inviter via the correct IRC network from the invite
+                                                                        let profile_to_use = if !network.is_empty() {
+                                                                            network.clone()
+                                                                        } else {
+                                                                            state.read().active_profile.clone()
+                                                                        };
+                                                                        if let Some(core) = cores.read().get(&profile_to_use) {
                                                                             // Send the accept response
                                                                             let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Notice {
                                                                                 target: target_nick,
                                                                                 text: ctcp_response,
                                                                             });
-                                                                            // Join the IRC discovery channel for peer discovery
+                                                                            // Join the IRC discovery channel for peer discovery on the correct network
                                                                             if !irc_channel.is_empty() {
-                                                                                log::info!("Joining IRC discovery channel: {}", irc_channel);
+                                                                                log::info!("Joining IRC discovery channel {} on network {}", irc_channel, profile_to_use);
                                                                                 let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Join {
                                                                                     channel: irc_channel,
                                                                                 });
                                                                             }
+                                                                        } else {
+                                                                            log::warn!("Network '{}' not connected, cannot send accept response", profile_to_use);
                                                                         }
                                                                     }
                                                                     Err(e) => {
@@ -5839,21 +5901,27 @@ fn app() -> Element {
                             disabled: *nsc_loading.read() || nsc_channel_name_input.read().is_empty(),
                             onclick: move |_| {
                                 let name = nsc_channel_name_input.read().clone();
-                                if !name.is_empty() && !*nsc_loading.read() {
+                                let selected_network = nsc_selected_network.read().clone();
+                                // Use selected network or fall back to active profile
+                                let network = if selected_network.is_empty() {
+                                    state.read().active_profile.clone()
+                                } else {
+                                    selected_network
+                                };
+                                if !name.is_empty() && !network.is_empty() && !*nsc_loading.read() {
                                     nsc_loading.set(true);
                                     spawn(async move {
                                         let manager = crate::nsc_manager::get_nsc_manager();
                                         let mgr = manager.read().await;
-                                        match mgr.create_channel(name.clone()).await {
+                                        match mgr.create_channel(name.clone(), network.clone()).await {
                                             Ok(info) => {
-                                                log::info!("Created NSC channel: {} ({})", info.name, &info.channel_id[..8]);
+                                                log::info!("Created NSC channel: {} ({}) on network '{}'", info.name, &info.channel_id[..8], info.network);
                                                 
-                                                // Join the IRC discovery channel for peer discovery
+                                                // Join the IRC discovery channel for peer discovery on the selected network
                                                 let irc_channel = info.irc_channel.clone();
                                                 if !irc_channel.is_empty() {
-                                                    let active = state.read().active_profile.clone();
-                                                    if let Some(core) = cores.read().get(&active) {
-                                                        log::info!("Joining IRC discovery channel: {}", irc_channel);
+                                                    if let Some(core) = cores.read().get(&network) {
+                                                        log::info!("Joining IRC discovery channel {} on network {}", irc_channel, network);
                                                         let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Join {
                                                             channel: irc_channel,
                                                         });

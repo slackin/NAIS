@@ -387,6 +387,9 @@ pub struct InviteMessage {
     /// Signature over invite
     #[serde(rename = "s")]
     pub signature: String,
+    /// IRC network this channel belongs to (profile name)
+    #[serde(rename = "w", default)]
+    pub network: String,
 }
 
 impl InviteMessage {
@@ -396,6 +399,7 @@ impl InviteMessage {
         inviter: &PeerId,
         invitee: &PeerId,
         member_count: u32,
+        network: &str,
     ) -> Self {
         let invite_id: String = {
             use rand::distributions::Alphanumeric;
@@ -428,6 +432,7 @@ impl InviteMessage {
             member_count,
             expires_at,
             signature: String::new(), // Signed after creation
+            network: network.to_string(),
         }
     }
 
@@ -1112,8 +1117,9 @@ impl InviteManager {
         inviter: &PeerId,
         invitee: &PeerId,
         member_count: u32,
+        network: &str,
     ) -> InviteMessage {
-        let invite = InviteMessage::new(channel_id, channel_name, inviter, invitee, member_count);
+        let invite = InviteMessage::new(channel_id, channel_name, inviter, invitee, member_count, network);
         self.sent_invites.insert(invite.invite_id.clone(), invite.clone());
         invite
     }

@@ -105,6 +105,9 @@ pub struct StoredChannel {
     /// IRC channel name for peer discovery
     #[serde(default)]
     pub irc_channel: String,
+    /// IRC network this channel belongs to (profile name)
+    #[serde(default)]
+    pub network: String,
 }
 
 /// Stored message data
@@ -220,6 +223,8 @@ pub struct ChannelInfo {
     pub created_at: u64,
     /// IRC channel name for peer discovery (e.g., #nais-a1b2c3d4)
     pub irc_channel: String,
+    /// IRC network this channel belongs to (profile name)
+    pub network: String,
 }
 
 // =============================================================================
@@ -323,6 +328,8 @@ pub struct PendingInvite {
     pub member_count: u32,
     pub received_at: u64,
     pub expires_at: u64,
+    /// IRC network this channel belongs to (profile name)
+    pub network: String,
 }
 
 /// A known NSC-capable peer from IRC
@@ -465,6 +472,8 @@ pub struct SentInvite {
     pub target_nick: String,
     pub channel_id: String,
     pub created_at: u64,
+    /// IRC network this channel belongs to (profile name)
+    pub network: String,
 }
 
 impl NscManager {
@@ -521,6 +530,7 @@ impl NscManager {
                 is_owner: ch.is_owner,
                 created_at: ch.created_at,
                 irc_channel,
+                network: ch.network.clone(),
             });
         }
         
@@ -708,7 +718,8 @@ impl NscManager {
     }
     
     /// Create a new secure channel
-    pub async fn create_channel(&self, name: String) -> Result<ChannelInfo, String> {
+    /// network: The IRC network/profile name this channel should be tied to
+    pub async fn create_channel(&self, name: String, network: String) -> Result<ChannelInfo, String> {
         let channel_id = self.channel_manager.create_channel(name.clone())
             .await
             .map_err(|e| format!("Failed to create channel: {:?}", e))?;
@@ -737,6 +748,7 @@ impl NscManager {
             is_owner: true,
             created_at: now,
             irc_channel,
+            network,
         };
         
         // Add ourselves as a member
@@ -897,6 +909,7 @@ impl NscManager {
             member_count: info.member_count,
             is_owner: info.is_owner,
             irc_channel: info.irc_channel.clone(),
+            network: info.network.clone(),
         }).collect();
         
         let this_device = self.this_device.read().await;
@@ -1921,7 +1934,7 @@ impl NscManager {
                         log::info!("[NSC_MANAGER] Base64 decoded {} bytes", decoded.len());
                         match serde_json::from_slice::<InviteMessage>(&decoded) {
                             Ok(invite) => {
-                                log::info!("[NSC_MANAGER] Parsed invite: channel={}, from={}", invite.channel_name, from_nick);
+                                log::info!("[NSC_MANAGER] Parsed invite: channel={}, from={}, network={}", invite.channel_name, from_nick, invite.network);
                                 let pending = PendingInvite {
                                     invite_id: invite.invite_id.clone(),
                                     from_nick: from_nick.to_string(),
@@ -1934,6 +1947,7 @@ impl NscManager {
                                         .unwrap_or_default()
                                         .as_secs(),
                                     expires_at: invite.expires_at,
+                                    network: invite.network.clone(),
                                 };
                                 
                                 // Add to pending invites
@@ -2158,6 +2172,7 @@ impl NscManager {
                                 is_owner: false,
                                 created_at: metadata.timestamp / 1000,
                                 irc_channel,
+                                network: String::new(), // Unknown network from metadata sync
                             });
                         }
                     }
@@ -2458,6 +2473,7 @@ impl NscManager {
             &self.peer_id,
             &target_peer_id,
             info.member_count,
+            &info.network,
         );
         
         // Track this sent invite so we know which channel it was for when accepted
@@ -2469,9 +2485,10 @@ impl NscManager {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            network: info.network.clone(),
         };
         self.sent_invites.write().await.insert(invite.invite_id.clone(), sent_invite);
-        log::info!("Stored sent invite {} for channel {} to {}", invite.invite_id, channel_id, target_nick);
+        log::info!("Stored sent invite {} for channel {} on network {} to {}", invite.invite_id, channel_id, info.network, target_nick);
         
         encode_ctcp(NscCtcpCommand::Invite, &invite)
             .map_err(|e| format!("Failed to encode invite: {}", e))
@@ -2492,8 +2509,8 @@ impl NscManager {
     }
     
     /// Accept a pending invite
-    /// Returns: (target_nick, ctcp_response, irc_channel)
-    pub async fn accept_invite(&self, invite_id: &str) -> Result<(String, String, String), String> {
+    /// Returns: (target_nick, ctcp_response, irc_channel, network)
+    pub async fn accept_invite(&self, invite_id: &str) -> Result<(String, String, String, String), String> {
         let invite = self.pending_invites.write().await.remove(invite_id)
             .ok_or("Invite not found or expired")?;
         
@@ -2517,6 +2534,7 @@ impl NscManager {
             is_owner: false,
             created_at: now,
             irc_channel: irc_channel.clone(),
+            network: invite.network.clone(),
         };
         
         // Initialize members list with ourselves and the inviter (channel owner)
@@ -2551,10 +2569,10 @@ impl NscManager {
         self.channel_info.write().await.insert(invite.channel_id.clone(), info);
         self.save_storage_async().await;
         
-        log::info!("Accepted invite for channel '{}', IRC discovery channel: {}", 
-            invite.channel_name, irc_channel);
+        log::info!("Accepted invite for channel '{}' on network '{}', IRC discovery channel: {}", 
+            invite.channel_name, invite.network, irc_channel);
         
-        Ok((invite.from_nick, accept_msg, irc_channel))
+        Ok((invite.from_nick, accept_msg, irc_channel, invite.network))
     }
     
     /// Decline a pending invite
@@ -3491,6 +3509,7 @@ impl NscManager {
                     is_owner: false,
                     created_at: now,
                     irc_channel: IrcChannelMapping::generate_irc_channel(&ch_secrets.channel_id),
+                    network: String::new(), // Unknown network from device link
                 });
             }
         }
@@ -3683,6 +3702,8 @@ mod tests {
                     created_at: 1234567890,
                     member_count: 5,
                     is_owner: true,
+                    irc_channel: "#nais-aaaaaaaa".to_string(),
+                    network: "TestNetwork".to_string(),
                 },
             ],
             messages: HashMap::new(),
@@ -3691,6 +3712,7 @@ mod tests {
             encrypted_sessions: None,
             encrypted_trust: None,
             peer_prekey_bundles: HashMap::new(),
+            irc_channel_mapping: IrcChannelMapping::default(),
         };
         
         let json = serde_json::to_string(&storage).unwrap();
@@ -3718,12 +3740,13 @@ mod tests {
     async fn test_create_channel() {
         let manager = NscManager::new();
         
-        let info = manager.create_channel("Test Channel".to_string()).await.unwrap();
+        let info = manager.create_channel("Test Channel".to_string(), "TestNetwork".to_string()).await.unwrap();
         
         assert_eq!(info.name, "Test Channel");
         assert!(info.is_owner);
         assert_eq!(info.member_count, 1);
         assert_eq!(info.channel_id.len(), 64);
+        assert_eq!(info.network, "TestNetwork");
         
         // Should be in list
         let channels = manager.list_channels().await;
