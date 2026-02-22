@@ -297,6 +297,16 @@ pub enum NscEvent {
     MetadataUpdated {
         channel_id: String,
     },
+    /// Request peer discovery for a channel
+    /// The UI should probe all users in the specified IRC channel
+    RequestPeerDiscovery {
+        /// The NSC channel ID (hex)
+        nsc_channel_id: String,
+        /// The IRC channel where peers should be probed
+        irc_channel: String,
+        /// The IRC network/profile to use
+        network: String,
+    },
 }
 
 // =============================================================================
@@ -774,6 +784,15 @@ impl NscManager {
         
         // Save to storage
         self.save_storage_async().await;
+        
+        // Request peer discovery for this new channel
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(NscEvent::RequestPeerDiscovery {
+                nsc_channel_id: info.channel_id.clone(),
+                irc_channel: info.irc_channel.clone(),
+                network: info.network.clone(),
+            }).await;
+        }
         
         log::info!("Created secure channel '{}' with IRC discovery channel: {}", 
             info.name, info.irc_channel);
@@ -2246,6 +2265,89 @@ impl NscManager {
         }
     }
     
+    /// Request peer discovery for a specific NSC channel
+    /// This triggers the UI to probe all users in the associated IRC channel(s)
+    /// Returns (irc_channel, network) if the channel exists
+    pub async fn request_peer_discovery(&self, channel_id: &str) -> Option<(String, String)> {
+        let info = self.channel_info.read().await;
+        if let Some(channel) = info.get(channel_id) {
+            let irc_channel = channel.irc_channel.clone();
+            let network = channel.network.clone();
+            drop(info);
+            
+            // Emit an event for the UI to handle discovery
+            if let Some(ref tx) = self.event_tx {
+                let _ = tx.send(NscEvent::RequestPeerDiscovery {
+                    nsc_channel_id: channel_id.to_string(),
+                    irc_channel: irc_channel.clone(),
+                    network: network.clone(),
+                }).await;
+            }
+            
+            log::info!("Requested peer discovery for channel {} via IRC channel {} on network {}", 
+                channel_id, irc_channel, network);
+            
+            Some((irc_channel, network))
+        } else {
+            None
+        }
+    }
+    
+    /// Get all IRC channels (both discovery and regular) for a secure channel
+    /// Returns list of (irc_channel, network) pairs to probe for peers
+    pub async fn get_discovery_channels(&self, nsc_channel_id: &str) -> Vec<(String, String)> {
+        let mut channels = Vec::new();
+        
+        // Get the primary discovery channel (#nais-xxx)
+        if let Some(channel) = self.channel_info.read().await.get(nsc_channel_id) {
+            if !channel.irc_channel.is_empty() {
+                channels.push((channel.irc_channel.clone(), channel.network.clone()));
+            }
+        }
+        
+        // Also check if there's a mapping from a regular IRC channel to this secure channel
+        let mapping = self.irc_channel_mapping.read().await;
+        for (nais_id, irc_ch) in mapping.all_mappings() {
+            if nais_id == nsc_channel_id && !channels.iter().any(|(ch, _)| ch == irc_ch) {
+                // Get network from channel info
+                if let Some(channel) = self.channel_info.read().await.get(nsc_channel_id) {
+                    channels.push((irc_ch.clone(), channel.network.clone()));
+                }
+            }
+        }
+        
+        channels
+    }
+    
+    /// Request peer discovery for all secure channels
+    /// Returns a list of (nsc_channel_id, irc_channel, network) tuples that should be probed
+    pub async fn request_all_channel_discovery(&self) -> Vec<(String, String, String)> {
+        let mut discovery_targets = Vec::new();
+        
+        let channels = self.channel_info.read().await;
+        for (channel_id, info) in channels.iter() {
+            if !info.irc_channel.is_empty() {
+                discovery_targets.push((
+                    channel_id.clone(),
+                    info.irc_channel.clone(),
+                    info.network.clone(),
+                ));
+                
+                // Send RequestPeerDiscovery event for each channel
+                if let Some(ref tx) = self.event_tx {
+                    let _ = tx.send(NscEvent::RequestPeerDiscovery {
+                        nsc_channel_id: channel_id.clone(),
+                        irc_channel: info.irc_channel.clone(),
+                        network: info.network.clone(),
+                    }).await;
+                }
+            }
+        }
+        
+        log::info!("Requested peer discovery for {} channels", discovery_targets.len());
+        discovery_targets
+    }
+
     /// Create a KeyPackage CTCP message to share our PreKeyBundle
     pub async fn create_keypackage_ctcp(&self) -> Result<String, String> {
         let sessions = self.peer_sessions.read().await;
@@ -2635,6 +2737,15 @@ impl NscManager {
             .map_err(|e| format!("Failed to initialize channel crypto: {:?}", e))?;
         
         self.save_storage_async().await;
+        
+        // Request peer discovery for this channel - the UI will probe all users in the IRC channel
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(NscEvent::RequestPeerDiscovery {
+                nsc_channel_id: invite.channel_id.clone(),
+                irc_channel: irc_channel.clone(),
+                network: invite.network.clone(),
+            }).await;
+        }
         
         log::info!("Accepted invite for channel '{}' on network '{}', IRC discovery channel: {}", 
             invite.channel_name, invite.network, irc_channel);

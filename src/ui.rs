@@ -1236,58 +1236,70 @@ fn app() -> Element {
                                     log::info!("Received IRC INVITE from {} to channel {}", from, channel);
                                 }
                                 IrcEvent::UserJoined { channel, user } => {
-                                    // When a user joins an NSC discovery channel, probe them
-                                    // to discover if they're an NSC peer
-                                    if channel.starts_with("#nais-") {
-                                        let cores_clone = cores.clone();
-                                        let pname = profile_name.clone();
-                                        let irc_channel = channel.clone();
-                                        
-                                        // Get our nick to avoid probing ourselves
-                                        let our_nick = state_handle.read()
-                                            .servers.get(&profile_name)
-                                            .map(|s| s.nickname.clone())
-                                            .unwrap_or_default();
-                                        let clean_user = user.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~').to_string();
-                                        
-                                        if clean_user != our_nick {
-                                            spawn(async move {
-                                                let manager = crate::nsc_manager::get_nsc_manager();
-                                                let mgr = manager.read().await;
+                                    // When a user joins an NSC discovery channel or a channel mapped to NSC,
+                                    // probe them to discover if they're an NSC peer
+                                    let should_probe = channel.starts_with("#nais-");
+                                    
+                                    // Also check if this channel is mapped to an NSC secure channel
+                                    let cores_clone = cores.clone();
+                                    let pname = profile_name.clone();
+                                    let irc_channel = channel.clone();
+                                    
+                                    // Get our nick to avoid probing ourselves
+                                    let our_nick = state_handle.read()
+                                        .servers.get(&profile_name)
+                                        .map(|s| s.nickname.clone())
+                                        .unwrap_or_default();
+                                    let clean_user = user.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~').to_string();
+                                    
+                                    if clean_user != our_nick {
+                                        spawn(async move {
+                                            let manager = crate::nsc_manager::get_nsc_manager();
+                                            let mgr = manager.read().await;
+                                            
+                                            // Check if this channel maps to an NSC channel
+                                            let is_nsc_channel = should_probe || mgr.get_channel_by_irc(&irc_channel).await.is_some();
+                                            
+                                            if is_nsc_channel {
                                                 let nsc_probe = mgr.create_probe_ctcp();
                                                 drop(mgr);
                                                 
                                                 if !nsc_probe.is_empty() {
                                                     if let Some(core) = cores_clone.read().get(&pname) {
-                                                        log::info!("User {} joined NSC discovery channel {}, sending probe", clean_user, irc_channel);
+                                                        log::info!("User {} joined channel {} (NSC-related), sending probe", clean_user, irc_channel);
                                                         let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
                                                             target: clean_user.to_string(),
                                                             message: nsc_probe,
                                                         });
                                                     }
                                                 }
-                                            });
-                                        }
+                                            }
+                                        });
                                     }
                                 }
                                 IrcEvent::Users { channel, users } => {
-                                    // When we receive the user list for an NSC discovery channel,
+                                    // When we receive the user list for an NSC discovery channel or mapped channel,
                                     // probe all users to discover NSC peers
-                                    if channel.starts_with("#nais-") {
-                                        let cores_clone = cores.clone();
-                                        let pname = profile_name.clone();
-                                        let irc_channel = channel.clone();
-                                        let users_to_probe = users.clone();
+                                    let should_probe = channel.starts_with("#nais-");
+                                    let cores_clone = cores.clone();
+                                    let pname = profile_name.clone();
+                                    let irc_channel = channel.clone();
+                                    let users_to_probe = users.clone();
+                                    
+                                    // Get our nick to avoid probing ourselves
+                                    let our_nick = state_handle.read()
+                                        .servers.get(&profile_name)
+                                        .map(|s| s.nickname.clone())
+                                        .unwrap_or_default();
+                                    
+                                    spawn(async move {
+                                        let manager = crate::nsc_manager::get_nsc_manager();
+                                        let mgr = manager.read().await;
                                         
-                                        // Get our nick to avoid probing ourselves
-                                        let our_nick = state_handle.read()
-                                            .servers.get(&profile_name)
-                                            .map(|s| s.nickname.clone())
-                                            .unwrap_or_default();
+                                        // Check if this channel maps to an NSC channel
+                                        let is_nsc_channel = should_probe || mgr.get_channel_by_irc(&irc_channel).await.is_some();
                                         
-                                        spawn(async move {
-                                            let manager = crate::nsc_manager::get_nsc_manager();
-                                            let mgr = manager.read().await;
+                                        if is_nsc_channel {
                                             let nsc_probe = mgr.create_probe_ctcp();
                                             drop(mgr);
                                             
@@ -1296,7 +1308,7 @@ fn app() -> Element {
                                                     for user in users_to_probe {
                                                         let clean_user = user.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~');
                                                         if clean_user != our_nick {
-                                                            log::info!("Probing user {} in NSC discovery channel {}", clean_user, irc_channel);
+                                                            log::info!("Probing user {} in channel {} (NSC-related)", clean_user, irc_channel);
                                                             let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
                                                                 target: clean_user.to_string(),
                                                                 message: nsc_probe.clone(),
@@ -1305,8 +1317,8 @@ fn app() -> Element {
                                                     }
                                                 }
                                             }
-                                        });
-                                    }
+                                        }
+                                    });
                                 }
                                 _ => {}
                             }
@@ -5856,16 +5868,69 @@ fn app() -> Element {
                                                                         if let Some(core) = cores.read().get(&profile_to_use) {
                                                                             // Send the accept response
                                                                             let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Notice {
-                                                                                target: target_nick,
+                                                                                target: target_nick.clone(),
                                                                                 text: ctcp_response,
                                                                             });
                                                                             // Join the IRC discovery channel for peer discovery on the correct network
                                                                             if !irc_channel.is_empty() {
                                                                                 log::info!("Joining IRC discovery channel {} on network {}", irc_channel, profile_to_use);
                                                                                 let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Join {
-                                                                                    channel: irc_channel,
+                                                                                    channel: irc_channel.clone(),
                                                                                 });
                                                                             }
+                                                                            
+                                                                            // Probe the inviter directly to discover their peer info
+                                                                            let nsc_probe = mgr.create_probe_ctcp();
+                                                                            if !nsc_probe.is_empty() {
+                                                                                log::info!("Probing inviter {} for peer info", target_nick);
+                                                                                let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Ctcp {
+                                                                                    target: target_nick.clone(),
+                                                                                    message: nsc_probe.clone(),
+                                                                                });
+                                                                            }
+                                                                            
+                                                                            // Schedule discovery of all users in the IRC channel
+                                                                            let irc_ch = irc_channel.clone();
+                                                                            let profile_clone = profile_to_use.clone();
+                                                                            let state_clone = state.clone();
+                                                                            let cores_clone = cores.clone();
+                                                                            spawn(async move {
+                                                                                // Wait for NAMES to be received after joining
+                                                                                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                                                                                
+                                                                                // Get all users in the IRC channel and probe them
+                                                                                let state_read = state_clone.read();
+                                                                                let our_nick = state_read.servers.get(&profile_clone)
+                                                                                    .map(|s| s.nickname.clone())
+                                                                                    .unwrap_or_default();
+                                                                                let users: Vec<String> = state_read.servers.get(&profile_clone)
+                                                                                    .and_then(|s| s.users_by_channel.get(&irc_ch))
+                                                                                    .map(|u| u.clone())
+                                                                                    .unwrap_or_default();
+                                                                                drop(state_read);
+                                                                                
+                                                                                if !users.is_empty() {
+                                                                                    let manager = crate::nsc_manager::get_nsc_manager();
+                                                                                    let mgr = manager.read().await;
+                                                                                    let nsc_probe = mgr.create_probe_ctcp();
+                                                                                    drop(mgr);
+                                                                                    
+                                                                                    if !nsc_probe.is_empty() {
+                                                                                        if let Some(core) = cores_clone.read().get(&profile_clone) {
+                                                                                            for user in users {
+                                                                                                let clean_user = user.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~');
+                                                                                                if clean_user != our_nick {
+                                                                                                    log::info!("Probing user {} in channel {} for peer discovery", clean_user, irc_ch);
+                                                                                                    let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Ctcp {
+                                                                                                        target: clean_user.to_string(),
+                                                                                                        message: nsc_probe.clone(),
+                                                                                                    });
+                                                                                                }
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            });
                                                                         } else {
                                                                             log::warn!("Network '{}' not connected, cannot send accept response", profile_to_use);
                                                                         }
@@ -5935,7 +6000,50 @@ fn app() -> Element {
                                                     if let Some(core) = cores.read().get(&network) {
                                                         log::info!("Joining IRC discovery channel {} on network {}", irc_channel, network);
                                                         let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Join {
-                                                            channel: irc_channel,
+                                                            channel: irc_channel.clone(),
+                                                        });
+                                                        
+                                                        // Schedule discovery of all users in the IRC channel
+                                                        let irc_ch = irc_channel.clone();
+                                                        let profile_clone = network.clone();
+                                                        let state_clone = state.clone();
+                                                        let cores_clone = cores.clone();
+                                                        spawn(async move {
+                                                            // Wait for NAMES to be received after joining
+                                                            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                                                            
+                                                            // Get all users in the IRC channel and probe them
+                                                            let state_read = state_clone.read();
+                                                            let our_nick = state_read.servers.get(&profile_clone)
+                                                                .map(|s| s.nickname.clone())
+                                                                .unwrap_or_default();
+                                                            let users: Vec<String> = state_read.servers.get(&profile_clone)
+                                                                .and_then(|s| s.users_by_channel.get(&irc_ch))
+                                                                .map(|u| u.clone())
+                                                                .unwrap_or_default();
+                                                            drop(state_read);
+                                                            
+                                                            if !users.is_empty() {
+                                                                let manager = crate::nsc_manager::get_nsc_manager();
+                                                                let mgr = manager.read().await;
+                                                                let nsc_probe = mgr.create_probe_ctcp();
+                                                                drop(mgr);
+                                                                
+                                                                if !nsc_probe.is_empty() {
+                                                                    if let Some(core) = cores_clone.read().get(&profile_clone) {
+                                                                        for user in users {
+                                                                            let clean_user = user.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~');
+                                                                            if clean_user != our_nick {
+                                                                                log::info!("Probing user {} in channel {} for peer discovery (new channel)", clean_user, irc_ch);
+                                                                                let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Ctcp {
+                                                                                    target: clean_user.to_string(),
+                                                                                    message: nsc_probe.clone(),
+                                                                                });
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
                                                         });
                                                     }
                                                 }
