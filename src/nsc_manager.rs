@@ -1838,6 +1838,7 @@ impl NscManager {
                 // Parse probe response and track the peer
                 if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, args) {
                     if let Ok(probe) = serde_json::from_slice::<ProbeMessage>(&decoded) {
+                        let peer_id_hex = probe.peer_id.clone();
                         let peer = NscPeer {
                             nick: from_nick.to_string(),
                             fingerprint: probe.peer_id.clone(),
@@ -1858,8 +1859,32 @@ impl NscManager {
                         if !peers.contains(&from_nick.to_string()) {
                             peers.push(from_nick.to_string());
                         }
+                        drop(by_channel);
                         
-                        log::info!("Discovered NSC peer: {} in {}", from_nick, irc_channel);
+                        log::info!("Discovered NSC peer: {} (peer_id: {}...) in IRC channel {}", 
+                            from_nick, &peer_id_hex[..8.min(peer_id_hex.len())], irc_channel);
+                        
+                        // Check if this IRC channel maps to an NSC secure channel
+                        // If so, add this peer to the channel members list
+                        let mapping = self.irc_channel_mapping.read().await;
+                        if let Some(nais_channel_id) = mapping.get_nais_channel(irc_channel) {
+                            let channel_id = nais_channel_id.clone();
+                            drop(mapping);
+                            
+                            log::info!("IRC channel {} maps to NSC channel {}, adding peer {} as member", 
+                                irc_channel, channel_id, from_nick);
+                            
+                            // Add peer to NSC channel members (not owner since they're joining)
+                            self.add_channel_member(&channel_id, &peer_id_hex, false).await;
+                            
+                            // Send MemberJoined event to UI
+                            if let Some(ref tx) = self.event_tx {
+                                let _ = tx.send(NscEvent::MemberJoined {
+                                    channel_id: channel_id.clone(),
+                                    peer_id: peer_id_hex.clone(),
+                                }).await;
+                            }
+                        }
                     }
                 }
                 None

@@ -1210,6 +1210,79 @@ fn app() -> Element {
                                     
                                     log::info!("Received IRC INVITE from {} to channel {}", from, channel);
                                 }
+                                IrcEvent::UserJoined { channel, user } => {
+                                    // When a user joins an NSC discovery channel, probe them
+                                    // to discover if they're an NSC peer
+                                    if channel.starts_with("#nais-") {
+                                        let cores_clone = cores.clone();
+                                        let pname = profile_name.clone();
+                                        let irc_channel = channel.clone();
+                                        
+                                        // Get our nick to avoid probing ourselves
+                                        let our_nick = state_handle.read()
+                                            .servers.get(&profile_name)
+                                            .map(|s| s.nickname.clone())
+                                            .unwrap_or_default();
+                                        let clean_user = user.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~').to_string();
+                                        
+                                        if clean_user != our_nick {
+                                            spawn(async move {
+                                                let manager = crate::nsc_manager::get_nsc_manager();
+                                                let mgr = manager.read().await;
+                                                let nsc_probe = mgr.create_probe_ctcp();
+                                                drop(mgr);
+                                                
+                                                if !nsc_probe.is_empty() {
+                                                    if let Some(core) = cores_clone.read().get(&pname) {
+                                                        log::info!("User {} joined NSC discovery channel {}, sending probe", clean_user, irc_channel);
+                                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                            target: clean_user.to_string(),
+                                                            message: nsc_probe,
+                                                        });
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+                                IrcEvent::Users { channel, users } => {
+                                    // When we receive the user list for an NSC discovery channel,
+                                    // probe all users to discover NSC peers
+                                    if channel.starts_with("#nais-") {
+                                        let cores_clone = cores.clone();
+                                        let pname = profile_name.clone();
+                                        let irc_channel = channel.clone();
+                                        let users_to_probe = users.clone();
+                                        
+                                        // Get our nick to avoid probing ourselves
+                                        let our_nick = state_handle.read()
+                                            .servers.get(&profile_name)
+                                            .map(|s| s.nickname.clone())
+                                            .unwrap_or_default();
+                                        
+                                        spawn(async move {
+                                            let manager = crate::nsc_manager::get_nsc_manager();
+                                            let mgr = manager.read().await;
+                                            let nsc_probe = mgr.create_probe_ctcp();
+                                            drop(mgr);
+                                            
+                                            if !nsc_probe.is_empty() {
+                                                if let Some(core) = cores_clone.read().get(&pname) {
+                                                    for user in users_to_probe {
+                                                        let clean_user = user.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~');
+                                                        if clean_user != our_nick {
+                                                            log::info!("Probing user {} in NSC discovery channel {}", clean_user, irc_channel);
+                                                            let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                                target: clean_user.to_string(),
+                                                                message: nsc_probe.clone(),
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
                                 _ => {}
                             }
                             
