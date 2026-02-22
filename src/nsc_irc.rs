@@ -250,10 +250,11 @@ impl IceMessage {
     }
     
     /// Convert candidate to compact format: "t:ip:port" or "t:ip:port/rip:rport"
-    /// t = h (host), s (srflx), p (prflx), r (relay)
+    /// t = h (host), u (upnp/port-mapped), s (srflx), p (prflx), r (relay)
     fn candidate_to_compact(candidate: &IceCandidate) -> String {
         let typ = match candidate.candidate_type {
             CandidateType::Host => 'h',
+            CandidateType::PortMapped => 'u', // UPnP port-mapped
             CandidateType::ServerReflexive => 's',
             CandidateType::PeerReflexive => 'p',
             CandidateType::Relay => 'r',
@@ -286,6 +287,7 @@ impl IceMessage {
         
         let candidate_type = match parts[0] {
             "h" => CandidateType::Host,
+            "u" => CandidateType::PortMapped, // UPnP port-mapped
             "s" => CandidateType::ServerReflexive,
             "p" => CandidateType::PeerReflexive,
             "r" => CandidateType::Relay,
@@ -328,6 +330,7 @@ impl IceMessage {
         
         // Calculate priority like the original implementation
         let type_pref: u32 = match candidate_type {
+            CandidateType::PortMapped => 126, // Same as host - direct connectivity
             CandidateType::Host => 126,
             CandidateType::PeerReflexive => 110,
             CandidateType::ServerReflexive => 100,

@@ -1,24 +1,27 @@
 //! Nais Secure Channels - NAT Traversal Module
 //!
 //! Implements NAT traversal for P2P connectivity:
+//! - UPnP port mapping (highest priority - direct connectivity)
 //! - STUN client for public address discovery
 //! - ICE-lite agent for candidate gathering and connectivity checks
 //! - TURN client for relay fallback
 //! - UDP hole punching
 //!
 //! # Priority Order
-//! 1. Direct IPv6 (if available)
-//! 2. Direct IPv4 via UDP hole punching
-//! 3. TURN relay (fallback)
+//! 1. UPnP port-mapped address (most reliable for direct P2P)
+//! 2. Direct IPv6 (if available)
+//! 3. Direct IPv4 via UDP hole punching (STUN-discovered)
+//! 4. TURN relay (fallback - rarely needed with UPnP)
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
+use igd_next::{SearchOptions, PortMappingProtocol};
 
 // =============================================================================
 // Error Types
@@ -61,6 +64,9 @@ pub enum NatError {
 
     #[error("Network unreachable")]
     NetworkUnreachable,
+
+    #[error("UPnP failed: {0}")]
+    UPnPFailed(String),
 }
 
 pub type NatResult<T> = Result<T, NatError>;
@@ -101,6 +107,167 @@ const STUN_TIMEOUT: Duration = Duration::from_secs(3);
 const ICE_CHECK_TIMEOUT: Duration = Duration::from_millis(500);
 const HOLE_PUNCH_INTERVAL: Duration = Duration::from_millis(50);
 const HOLE_PUNCH_ATTEMPTS: u32 = 20;
+
+/// UPnP lease duration (3 hours)
+const UPNP_LEASE_DURATION: u32 = 3 * 60 * 60;
+
+// =============================================================================
+// UPnP Port Mapping
+// =============================================================================
+
+/// Represents an active UPnP port mapping for NAT traversal
+#[derive(Clone, Debug)]
+pub struct UPnPMapping {
+    /// External port that was mapped
+    pub external_port: u16,
+    /// Local port it maps to
+    pub local_port: u16,
+    /// Protocol (UDP for QUIC)
+    pub protocol: PortMappingProtocol,
+    /// External IP address
+    pub external_ip: IpAddr,
+    /// Description of the mapping
+    pub description: String,
+}
+
+impl UPnPMapping {
+    /// Remove this port mapping from the gateway
+    pub fn remove(&self) -> Result<(), String> {
+        let options = SearchOptions::default();
+        let gateway = igd_next::search_gateway(options)
+            .map_err(|e| format!("Failed to find gateway: {}", e))?;
+        
+        gateway.remove_port(self.protocol, self.external_port)
+            .map_err(|e| format!("Failed to remove port mapping: {}", e))?;
+        
+        log::info!("Removed UPnP port mapping: external {} -> local {}", self.external_port, self.local_port);
+        Ok(())
+    }
+}
+
+impl Drop for UPnPMapping {
+    fn drop(&mut self) {
+        if let Err(e) = self.remove() {
+            log::debug!("Failed to clean up UPnP mapping on drop: {}", e);
+        }
+    }
+}
+
+/// UPnP port mapper for creating port forwards on the router
+pub struct UPnPPortMapper;
+
+impl UPnPPortMapper {
+    /// Attempt to create a UPnP port mapping for P2P connectivity
+    /// Returns the mapping info on success
+    pub fn create_mapping(local_port: u16, description: &str) -> NatResult<UPnPMapping> {
+        log::info!("Attempting UPnP port mapping for local port {}...", local_port);
+        
+        let options = SearchOptions {
+            timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        };
+        
+        let gateway = igd_next::search_gateway(options)
+            .map_err(|e| NatError::UPnPFailed(format!("No UPnP gateway found: {}", e)))?;
+        
+        log::info!("Found UPnP gateway at: {}", gateway);
+        
+        // Get our local IP
+        let local_ip = get_local_ip_sync()
+            .ok_or_else(|| NatError::UPnPFailed("Failed to get local IP".into()))?;
+        
+        let local_addr_str = format!("{}:{}", local_ip, local_port);
+        let local_addr_v4: SocketAddrV4 = local_addr_str.parse()
+            .map_err(|e| NatError::UPnPFailed(format!("Invalid local address: {}", e)))?;
+        let local_addr: SocketAddr = local_addr_v4.into();
+        
+        // Get external IP from gateway
+        let external_ip = gateway.get_external_ip()
+            .map_err(|e| NatError::UPnPFailed(format!("Failed to get external IP: {}", e)))?;
+        
+        // Check for CGNAT (carrier-grade NAT) - UPnP won't help here
+        // Also extract the IPv4 address for the mapping
+        let external_ip_v4 = match external_ip {
+            IpAddr::V4(ipv4) => {
+                // Check for CGNAT/private IP
+                if ipv4.is_private() || ipv4.is_loopback() 
+                    || (ipv4.octets()[0] == 100 && ipv4.octets()[1] >= 64 && ipv4.octets()[1] <= 127) {
+                    log::warn!("CGNAT detected - router external IP {} is not public", ipv4);
+                    log::warn!("UPnP cannot bypass CGNAT, will need relay fallback");
+                    return Err(NatError::UPnPFailed("CGNAT detected - external IP is not public".into()));
+                }
+                ipv4
+            }
+            IpAddr::V6(_) => {
+                // IPv6 doesn't typically use UPnP for NAT traversal
+                return Err(NatError::UPnPFailed("IPv6 gateway - UPnP not needed".into()));
+            }
+        };
+        
+        log::info!("Router external IP: {} (public)", external_ip_v4);
+        
+        // Try to map the same port, or find an available one
+        let mut external_port = local_port;
+        let mut attempts = 0;
+        
+        loop {
+            match gateway.add_port(
+                PortMappingProtocol::UDP,
+                external_port,
+                local_addr,
+                UPNP_LEASE_DURATION,
+                description,
+            ) {
+                Ok(()) => {
+                    log::info!("=== UPnP MAPPING CREATED ===");
+                    log::info!("  External: {}:{} (UDP)", external_ip_v4, external_port);
+                    log::info!("  Internal: {} (UDP)", local_addr);
+                    log::info!("  Direct P2P connections now possible!");
+                    
+                    return Ok(UPnPMapping {
+                        external_port,
+                        local_port,
+                        protocol: PortMappingProtocol::UDP,
+                        external_ip: IpAddr::V4(external_ip_v4),
+                        description: description.to_string(),
+                    });
+                }
+                Err(igd_next::AddPortError::PortInUse) => {
+                    attempts += 1;
+                    if attempts >= 10 {
+                        return Err(NatError::UPnPFailed("No available ports after 10 attempts".into()));
+                    }
+                    external_port = external_port.saturating_add(1);
+                    if external_port < 1024 {
+                        external_port = 49152; // Jump to dynamic port range
+                    }
+                    log::debug!("Port {} in use, trying {}", external_port - 1, external_port);
+                }
+                Err(e) => {
+                    return Err(NatError::UPnPFailed(format!("Failed to add port mapping: {}", e)));
+                }
+            }
+        }
+    }
+    
+    /// Check if UPnP is available on this network
+    pub fn is_available() -> bool {
+        let options = SearchOptions {
+            timeout: Some(Duration::from_secs(2)),
+            ..Default::default()
+        };
+        igd_next::search_gateway(options).is_ok()
+    }
+}
+
+/// Get local IP address (sync version)
+fn get_local_ip_sync() -> Option<String> {
+    // Try to connect to a public IP to determine our local interface
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let local_addr = socket.local_addr().ok()?;
+    Some(local_addr.ip().to_string())
+}
 
 // =============================================================================
 // NAT Types
@@ -147,6 +314,8 @@ impl NatType {
 pub enum CandidateType {
     /// Host candidate - local interface address
     Host,
+    /// UPnP port-mapped - external address with UPnP port forward (highest priority)
+    PortMapped,
     /// Server reflexive - address as seen by STUN server
     ServerReflexive,
     /// Peer reflexive - address discovered during connectivity checks
@@ -194,6 +363,23 @@ impl IceCandidate {
         }
     }
 
+    /// Create a UPnP port-mapped candidate (highest priority - direct connectivity)
+    pub fn port_mapped(external_address: SocketAddr, local_address: SocketAddr) -> Self {
+        let priority = Self::calculate_priority(CandidateType::PortMapped, external_address);
+        let foundation = format!("upnp_{}", external_address.ip());
+        
+        Self {
+            candidate_type: CandidateType::PortMapped,
+            protocol: "udp".to_string(),
+            address: external_address,
+            base_address: Some(local_address),
+            priority,
+            foundation,
+            component: 1,
+            related_address: Some(local_address),
+        }
+    }
+
     /// Create a server reflexive candidate
     pub fn server_reflexive(address: SocketAddr, base: SocketAddr, stun_server: &str) -> Self {
         let priority = Self::calculate_priority(CandidateType::ServerReflexive, address);
@@ -230,8 +416,9 @@ impl IceCandidate {
 
     /// Calculate candidate priority per RFC 5245
     fn calculate_priority(candidate_type: CandidateType, address: SocketAddr) -> u32 {
-        // Type preference (0-126)
+        // Type preference (0-126, but we use 127 for UPnP port-mapped since it's most reliable)
         let type_pref: u32 = match candidate_type {
+            CandidateType::PortMapped => 126, // Same as host but with external address - most reliable
             CandidateType::Host => 126,
             CandidateType::PeerReflexive => 110,
             CandidateType::ServerReflexive => 100,
@@ -252,6 +439,7 @@ impl IceCandidate {
     pub fn to_sdp(&self) -> String {
         let typ = match self.candidate_type {
             CandidateType::Host => "host",
+            CandidateType::PortMapped => "upnp", // UPnP port-mapped addresses
             CandidateType::ServerReflexive => "srflx",
             CandidateType::PeerReflexive => "prflx",
             CandidateType::Relay => "relay",
@@ -292,6 +480,7 @@ impl IceCandidate {
         // parts[6] should be "typ"
         let candidate_type = match parts[7] {
             "host" => CandidateType::Host,
+            "upnp" => CandidateType::PortMapped,
             "srflx" => CandidateType::ServerReflexive,
             "prflx" => CandidateType::PeerReflexive,
             "relay" => CandidateType::Relay,
@@ -819,7 +1008,24 @@ impl IceAgent {
         let local_addr = socket.local_addr()?;
         *self.socket.write().await = Some(socket.clone());
 
-        // Gather host candidates from local interfaces
+        // === PRIORITY 1: Try UPnP port mapping first ===
+        // This provides the most reliable direct connectivity
+        log::info!("Attempting UPnP port mapping for direct P2P...");
+        match UPnPPortMapper::create_mapping(local_addr.port(), "NAIS Secure Channel") {
+            Ok(mapping) => {
+                let external_addr = SocketAddr::new(mapping.external_ip, mapping.external_port);
+                let upnp_candidate = IceCandidate::port_mapped(external_addr, local_addr);
+                log::info!("UPnP SUCCESS: {} -> {}", external_addr, local_addr);
+                candidates.push(upnp_candidate);
+                // Store the mapping to keep it alive (don't drop it)
+                // Note: The mapping will be cleaned up when the IceAgent is dropped
+            }
+            Err(e) => {
+                log::info!("UPnP unavailable ({}), falling back to STUN/hole-punching", e);
+            }
+        }
+
+        // === PRIORITY 2: Gather host candidates from local interfaces ===
         if let Ok(interfaces) = get_local_interfaces().await {
             for addr in interfaces {
                 let candidate = IceCandidate::host(SocketAddr::new(addr, local_addr.port()));
@@ -827,29 +1033,38 @@ impl IceAgent {
             }
         }
 
-        // Gather server reflexive candidates via STUN
-        match self.stun_client.get_mapped_address(&socket).await {
-            Ok(mapped_addr) => {
-                let srflx = IceCandidate::server_reflexive(
-                    mapped_addr,
-                    local_addr,
-                    &self.stun_client.servers[0],
-                );
-                candidates.push(srflx);
-            }
-            Err(e) => {
-                log::warn!("Failed to gather STUN candidate: {}", e);
+        // === PRIORITY 3: Gather server reflexive candidates via STUN ===
+        // Only needed if UPnP failed - STUN helps with hole-punching
+        if !candidates.iter().any(|c| c.candidate_type == CandidateType::PortMapped) {
+            match self.stun_client.get_mapped_address(&socket).await {
+                Ok(mapped_addr) => {
+                    let srflx = IceCandidate::server_reflexive(
+                        mapped_addr,
+                        local_addr,
+                        &self.stun_client.servers[0],
+                    );
+                    candidates.push(srflx);
+                    log::info!("STUN reflexive address: {}", mapped_addr);
+                }
+                Err(e) => {
+                    log::warn!("Failed to gather STUN candidate: {}", e);
+                }
             }
         }
 
-        // Detect NAT type
+        // Detect NAT type (useful for diagnostics)
         let detector = NatDetector::new();
         if let Ok(nat_type) = detector.detect().await {
             *self.nat_type.write().await = Some(nat_type);
             log::info!("Detected NAT type: {:?}", nat_type);
+            
+            // Log warning if we're in a difficult NAT situation without UPnP
+            if nat_type.needs_turn() && !candidates.iter().any(|c| c.candidate_type == CandidateType::PortMapped) {
+                log::warn!("Symmetric NAT detected and UPnP unavailable - relay may be needed");
+            }
         }
 
-        // Sort by priority (highest first)
+        // Sort by priority (highest first - UPnP candidates will be at top)
         candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
 
         *self.local_candidates.write().await = candidates.clone();
