@@ -417,15 +417,16 @@ impl InviteMessage {
             .as_secs()
             + 3600; // 1 hour expiry
 
-        // Use truncated hex strings (16 chars = 8 bytes) to fit in IRC CTCP limit
+        // Use truncated hex strings (16 chars = 8 bytes) for peer IDs to fit in IRC CTCP limit
         // Still unique enough for correlation within IRC context
+        // BUT: channel_id must be full 64 chars for proper channel identification and leave operations
         let channel_hex = channel_id.to_hex();
         let inviter_hex = inviter.to_hex();
         let invitee_hex = invitee.to_hex();
         
         Self {
             invite_id,
-            channel_id: channel_hex.chars().take(16).collect(),
+            channel_id: channel_hex, // Full channel ID - essential for channel operations
             channel_name: channel_name.chars().take(32).collect(), // Limit name length
             inviter: inviter_hex.chars().take(16).collect(),
             invitee: invitee_hex.chars().take(16).collect(),

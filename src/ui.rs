@@ -5684,6 +5684,7 @@ fn app() -> Element {
                                 for channel in nsc_channels.read().iter().cloned() {
                                     {
                                         let channel_id = channel.channel_id.clone();
+                                        let channel_id_for_button = channel.channel_id.clone();
                                         let irc_channel_display = channel.irc_channel.clone();
                                         let network_display = channel.network.clone();
                                         rsx! {
@@ -5705,18 +5706,29 @@ fn app() -> Element {
                                                     }
                                                     button {
                                                         style: "background: rgba(239, 68, 68, 0.2); color: #ef4444; border: none; padding: 4px 8px; border-radius: 4px; font-size: 11px; cursor: pointer;",
-                                                        onclick: move |_| {
-                                                            let cid = channel_id.clone();
+                                                        onclick: move |evt| {
+                                                            evt.stop_propagation();
+                                                            let cid = channel_id_for_button.clone();
+                                                            log::info!("Leave button clicked for channel: {}", cid);
                                                             spawn(async move {
+                                                                log::info!("Attempting to leave channel: {}", cid);
                                                                 let manager = crate::nsc_manager::get_nsc_manager();
                                                                 let mgr = manager.read().await;
-                                                                if let Err(e) = mgr.leave_channel(&cid).await {
-                                                                    log::error!("Failed to leave channel: {}", e);
-                                                                } else {
-                                                                    let channels = mgr.list_channels().await;
-                                                                    drop(mgr);
-                                                                    nsc_channels.set(channels);
+                                                                match mgr.leave_channel(&cid).await {
+                                                                    Ok(()) => {
+                                                                        log::info!("Successfully left channel: {}", cid);
+                                                                    }
+                                                                    Err(e) => {
+                                                                        log::error!("Failed to leave channel {}: {}", cid, e);
+                                                                    }
                                                                 }
+                                                                // Always refresh channel list after leave attempt
+                                                                let channels = mgr.list_channels().await;
+                                                                log::info!("Refreshed channel list, {} channels remaining", channels.len());
+                                                                drop(mgr);
+                                                                nsc_channels.set(channels);
+                                                                // Close the modal to give visual feedback
+                                                                show_new_nsc_modal.set(false);
                                                             });
                                                         },
                                                         "Leave"

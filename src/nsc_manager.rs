@@ -783,24 +783,35 @@ impl NscManager {
     
     /// Leave a channel
     pub async fn leave_channel(&self, channel_id: &str) -> Result<(), String> {
-        // Parse channel ID
-        let bytes = hex::decode(channel_id)
-            .map_err(|_| "Invalid channel ID")?;
-        if bytes.len() != 32 {
-            return Err("Invalid channel ID length".to_string());
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        let cid = ChannelId(arr);
+        log::info!("leave_channel called for: {} (len: {})", channel_id, channel_id.len());
         
-        // Try to leave from ChannelManager, but don't fail if not found
-        // (channel may only exist in storage/cache from a previous session)
-        if let Err(e) = self.channel_manager.leave_channel(&cid).await {
-            log::debug!("Channel not in ChannelManager (this is OK for stored channels): {:?}", e);
+        // Handle both full (64 char) and truncated (16 char) channel IDs for backward compatibility
+        // Truncated IDs existed due to a bug where InviteMessage truncated the channel_id
+        
+        // Try to leave from ChannelManager if we have a full channel ID
+        if channel_id.len() == 64 {
+            let bytes = hex::decode(channel_id)
+                .map_err(|_| "Invalid channel ID")?;
+            if bytes.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                let cid = ChannelId(arr);
+                
+                // Try to leave from ChannelManager, but don't fail if not found
+                if let Err(e) = self.channel_manager.leave_channel(&cid).await {
+                    log::debug!("Channel not in ChannelManager (this is OK for stored channels): {:?}", e);
+                }
+            }
+        } else {
+            log::debug!("Truncated channel ID ({}), skipping ChannelManager leave", channel_id.len());
         }
         
-        // Remove from cache
-        self.channel_info.write().await.remove(channel_id);
+        // Remove from cache - works for both full and truncated IDs
+        {
+            let mut info = self.channel_info.write().await;
+            let existed = info.remove(channel_id).is_some();
+            log::info!("Removed channel from channel_info, existed: {}, remaining: {}", existed, info.len());
+        }
         
         // Remove from channel members
         self.channel_members.write().await.remove(channel_id);
@@ -814,14 +825,16 @@ impl NscManager {
         // Save to storage
         self.save_storage_async().await;
         
-        log::info!("Left channel {}", channel_id);
+        log::info!("Left channel {} successfully", channel_id);
         
         Ok(())
     }
     
     /// Get all channels
     pub async fn list_channels(&self) -> Vec<ChannelInfo> {
-        self.channel_info.read().await.values().cloned().collect()
+        let channels: Vec<ChannelInfo> = self.channel_info.read().await.values().cloned().collect();
+        log::debug!("list_channels returning {} channels", channels.len());
+        channels
     }
     
     /// Get channel by ID
