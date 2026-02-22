@@ -1065,6 +1065,8 @@ fn app() -> Element {
                                         }
                                         cmd if cmd.starts_with("NSC_") => {
                                             // Handle NSC (Nais Secure Channels) CTCP commands
+                                            log::info!("[UI NSC] Handling {} from {}", cmd, from);
+                                            
                                             let from_nick = from.clone();
                                             let cmd_str = command.clone();
                                             let args_str = args.join(" ");
@@ -1076,12 +1078,17 @@ fn app() -> Element {
                                                 .map(|s| s.current_channel.clone())
                                                 .unwrap_or_default();
                                             
+                                            log::info!("[UI NSC] Processing {} from {} in IRC channel '{}'", cmd_str, from_nick, irc_channel);
+                                            
                                             // Spawn async handler
                                             spawn(async move {
                                                 let manager = crate::nsc_manager::get_nsc_manager();
                                                 let mgr = manager.read().await;
                                                 
+                                                log::info!("[UI NSC] Calling handle_nsc_ctcp for {} from {}", cmd_str, from_nick);
+                                                
                                                 if let Some(response) = mgr.handle_nsc_ctcp(&from_nick, &irc_channel, &cmd_str, &args_str).await {
+                                                    log::info!("[UI NSC] Sending response to {}", from_nick);
                                                     // Send CTCP response via NOTICE
                                                     // Note: response already includes CTCP delimiters from encode_ctcp
                                                     if let Some(core) = cores_clone.read().get(&pname) {
@@ -1094,6 +1101,7 @@ fn app() -> Element {
                                                 
                                                 // Refresh pending invites signal
                                                 let invites = mgr.get_pending_invites().await;
+                                                log::info!("[UI NSC] Refreshed pending invites: {} invites", invites.len());
                                                 drop(mgr);
                                                 nsc_pending_invites.set(invites);
                                             });

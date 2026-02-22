@@ -1711,7 +1711,10 @@ impl NscManager {
     pub async fn handle_nsc_ctcp(&self, from_nick: &str, irc_channel: &str, command: &str, args: &str) -> Option<String> {
         use crate::nsc_irc::{NscCtcpCommand, ProbeMessage, encode_ctcp, InviteMessage};
         
+        log::info!("[NSC_MANAGER] handle_nsc_ctcp: cmd={}, from={}, args_len={}", command, from_nick, args.len());
+        
         let cmd = NscCtcpCommand::from_str(command)?;
+        log::info!("[NSC_MANAGER] Parsed command: {:?}", cmd);
         
         match cmd {
             NscCtcpCommand::Probe => {
@@ -1756,36 +1759,53 @@ impl NscManager {
                 None
             }
             NscCtcpCommand::Invite => {
+                log::info!("[NSC_MANAGER] Processing INVITE from {}, args: {}", from_nick, &args[..args.len().min(50)]);
                 // Parse invite
-                if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, args) {
-                    if let Ok(invite) = serde_json::from_slice::<InviteMessage>(&decoded) {
-                        let pending = PendingInvite {
-                            invite_id: invite.invite_id.clone(),
-                            from_nick: from_nick.to_string(),
-                            from_fingerprint: invite.inviter.clone(),
-                            channel_name: invite.channel_name.clone(),
-                            channel_id: invite.channel_id.clone(),
-                            member_count: invite.member_count,
-                            received_at: SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs(),
-                            expires_at: invite.expires_at,
-                        };
-                        
-                        // Add to pending invites
-                        self.pending_invites.write().await.insert(invite.invite_id.clone(), pending);
-                        
-                        log::info!("Received invite to '{}' from {}", invite.channel_name, from_nick);
-                        
-                        // Notify UI of new invite
-                        if let Some(ref tx) = self.event_tx {
-                            let _ = tx.send(NscEvent::InviteReceived {
-                                from_nick: from_nick.to_string(),
-                                channel_name: invite.channel_name,
-                                invite_id: invite.invite_id,
-                            }).await;
+                match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, args) {
+                    Ok(decoded) => {
+                        log::info!("[NSC_MANAGER] Base64 decoded {} bytes", decoded.len());
+                        match serde_json::from_slice::<InviteMessage>(&decoded) {
+                            Ok(invite) => {
+                                log::info!("[NSC_MANAGER] Parsed invite: channel={}, from={}", invite.channel_name, from_nick);
+                                let pending = PendingInvite {
+                                    invite_id: invite.invite_id.clone(),
+                                    from_nick: from_nick.to_string(),
+                                    from_fingerprint: invite.inviter.clone(),
+                                    channel_name: invite.channel_name.clone(),
+                                    channel_id: invite.channel_id.clone(),
+                                    member_count: invite.member_count,
+                                    received_at: SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs(),
+                                    expires_at: invite.expires_at,
+                                };
+                                
+                                // Add to pending invites
+                                self.pending_invites.write().await.insert(invite.invite_id.clone(), pending);
+                                log::info!("[NSC_MANAGER] Added to pending_invites, id={}", invite.invite_id);
+                                
+                                log::info!("Received invite to '{}' from {}", invite.channel_name, from_nick);
+                                
+                                // Notify UI of new invite
+                                if let Some(ref tx) = self.event_tx {
+                                    log::info!("[NSC_MANAGER] Sending InviteReceived event to UI");
+                                    let _ = tx.send(NscEvent::InviteReceived {
+                                        from_nick: from_nick.to_string(),
+                                        channel_name: invite.channel_name,
+                                        invite_id: invite.invite_id,
+                                    }).await;
+                                } else {
+                                    log::warn!("[NSC_MANAGER] No event_tx to send InviteReceived!");
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("[NSC_MANAGER] Failed to parse invite JSON: {}", e);
+                            }
                         }
+                    }
+                    Err(e) => {
+                        log::error!("[NSC_MANAGER] Failed to base64 decode args: {}", e);
                     }
                 }
                 None

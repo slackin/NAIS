@@ -1028,8 +1028,12 @@ async fn handle_connection(
                     IrcCommand::PRIVMSG(ref target, ref body) => {
                         let user = message.source_nickname().unwrap_or("unknown").to_string();
                         
+                        // Log raw PRIVMSG for debugging
+                        log::debug!("[IRC PRIVMSG] From {} to {}: {} chars", user, target, body.len());
+                        
                         // Check if this is a CTCP message
                         if let Some((command, args)) = parse_ctcp(body) {
+                            log::info!("[IRC CTCP] Parsed CTCP: cmd={}, args_len={}, from={}", command, args.len(), user);
                             if command == "ACTION" {
                                 // This is a /me action
                                 // For private messages, use sender's nick as channel
@@ -1071,6 +1075,8 @@ async fn handle_connection(
                                     .map(|s| s.to_string())
                                     .collect();
                                 
+                                log::info!("[IRC NAIS CTCP] Received {} from {} with {} args", command, user, args_vec.len());
+                                
                                 let _ = evt_tx
                                     .send(IrcEvent::System {
                                         channel: default_channel.clone(),
@@ -1107,7 +1113,13 @@ async fn handle_connection(
                                 }
                             }
                         } else {
-                            // Regular message
+                            // Regular message - not CTCP
+                            // Log if it starts with \x01 but wasn't parsed (malformed CTCP?)
+                            if body.starts_with('\x01') {
+                                log::warn!("[IRC] Message starts with CTCP marker but wasn't parsed: len={}, starts={}, ends={}", 
+                                    body.len(), body.starts_with('\x01'), body.ends_with('\x01'));
+                            }
+                            
                             // For private messages (target is our nick), use sender's nick as channel
                             let channel = if !target.starts_with('#') && !target.starts_with('&') && !target.starts_with('+') && !target.starts_with('!') {
                                 // This is a private message to us, use sender's nick as channel
