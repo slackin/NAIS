@@ -1127,9 +1127,9 @@ fn app() -> Element {
                                                 let manager = crate::nsc_manager::get_nsc_manager();
                                                 let mgr = manager.read().await;
                                                 
-                                                log::info!("[UI NSC] Calling handle_nsc_ctcp for {} from {}", cmd_str, from_nick);
+                                                log::info!("[UI NSC] Calling handle_nsc_ctcp for {} from {} on profile {}", cmd_str, from_nick, pname);
                                                 
-                                                if let Some(response) = mgr.handle_nsc_ctcp(&from_nick, &irc_channel, &cmd_str, &args_str).await {
+                                                if let Some(response) = mgr.handle_nsc_ctcp(&from_nick, &irc_channel, &cmd_str, &args_str, &pname).await {
                                                     log::info!("[UI NSC] Sending response to {}", from_nick);
                                                     // Send CTCP response via NOTICE
                                                     // Note: response already includes CTCP delimiters from encode_ctcp

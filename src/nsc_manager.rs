@@ -1881,7 +1881,8 @@ impl NscManager {
     
     /// Handle an incoming NSC CTCP command from IRC
     /// Returns an optional CTCP response to send back
-    pub async fn handle_nsc_ctcp(&self, from_nick: &str, irc_channel: &str, command: &str, args: &str) -> Option<String> {
+    /// local_profile: The profile name where this CTCP was received (used for network lookups)
+    pub async fn handle_nsc_ctcp(&self, from_nick: &str, irc_channel: &str, command: &str, args: &str, local_profile: &str) -> Option<String> {
         use crate::nsc_irc::{NscCtcpCommand, ProbeMessage, encode_ctcp, InviteMessage};
         
         log::info!("[NSC_MANAGER] handle_nsc_ctcp: cmd={}, from={}, args_len={}", command, from_nick, args.len());
@@ -1964,7 +1965,7 @@ impl NscManager {
                         log::info!("[NSC_MANAGER] Base64 decoded {} bytes", decoded.len());
                         match serde_json::from_slice::<InviteMessage>(&decoded) {
                             Ok(invite) => {
-                                log::info!("[NSC_MANAGER] Parsed invite: channel={}, from={}, network={}", invite.channel_name, from_nick, invite.network);
+                                log::info!("[NSC_MANAGER] Parsed invite: channel={}, from={}, sender_network={}, local_profile={}", invite.channel_name, from_nick, invite.network, local_profile);
                                 let pending = PendingInvite {
                                     invite_id: invite.invite_id.clone(),
                                     from_nick: from_nick.to_string(),
@@ -1977,7 +1978,8 @@ impl NscManager {
                                         .unwrap_or_default()
                                         .as_secs(),
                                     expires_at: invite.expires_at,
-                                    network: invite.network.clone(),
+                                    // Use local_profile (where we received the invite) not invite.network (sender's profile name)
+                                    network: local_profile.to_string(),
                                 };
                                 
                                 // Add to pending invites
@@ -2608,6 +2610,30 @@ impl NscManager {
         self.left_channels.write().await.remove(&invite.channel_id);
         
         self.channel_info.write().await.insert(invite.channel_id.clone(), info);
+        
+        // Initialize crypto state for the channel so send/receive works immediately
+        // This creates temporary epoch secrets that will be updated when the Welcome message arrives
+        let channel_bytes = hex::decode(&invite.channel_id)
+            .map_err(|_| "Invalid channel ID")?;
+        if channel_bytes.len() != 32 {
+            return Err("Invalid channel ID length".to_string());
+        }
+        let mut channel_arr = [0u8; 32];
+        channel_arr.copy_from_slice(&channel_bytes);
+        let channel_id_typed = ChannelId::from_bytes(channel_arr);
+        
+        // Generate temporary epoch secrets (will be replaced when Welcome message arrives with real secrets)
+        let mut secret_bytes = [0u8; 32];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut secret_bytes);
+        let epoch_secrets = crate::nsc_channel::EpochSecrets::initial(&secret_bytes);
+        
+        // Initialize the channel in channel_manager
+        self.channel_manager
+            .join_channel_with_secrets(&channel_id_typed, invite.channel_name.clone(), epoch_secrets)
+            .await
+            .map_err(|e| format!("Failed to initialize channel crypto: {:?}", e))?;
+        
         self.save_storage_async().await;
         
         log::info!("Accepted invite for channel '{}' on network '{}', IRC discovery channel: {}", 
