@@ -4,7 +4,7 @@
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -151,6 +151,9 @@ pub struct NscStorage {
     /// IRC channel mapping for peer discovery
     #[serde(default)]
     pub irc_channel_mapping: IrcChannelMapping,
+    /// Channel IDs that the user has explicitly left (to prevent re-adding via metadata sync)
+    #[serde(default)]
+    pub left_channels: HashSet<String>,
 }
 
 // =============================================================================
@@ -446,6 +449,8 @@ pub struct NscManager {
     irc_channel_mapping: Arc<RwLock<IrcChannelMapping>>,
     /// Channel members for UI display (channel_id -> members)
     channel_members: Arc<RwLock<HashMap<String, Vec<NscChannelMember>>>>,
+    /// Channel IDs that the user has explicitly left (to prevent re-adding via metadata sync)
+    left_channels: Arc<RwLock<HashSet<String>>>,
 }
 
 /// Pending ICE session info
@@ -656,6 +661,7 @@ impl NscManager {
             retry_queue: Arc::new(RwLock::new(HashMap::new())),
             irc_channel_mapping: Arc::new(RwLock::new(irc_channel_mapping)),
             channel_members: Arc::new(RwLock::new(channel_members)),
+            left_channels: Arc::new(RwLock::new(storage.left_channels.clone())),
         };
         
         // Save identity if newly generated
@@ -796,11 +802,19 @@ impl NscManager {
         // Remove from cache
         self.channel_info.write().await.remove(channel_id);
         
+        // Remove from channel members
+        self.channel_members.write().await.remove(channel_id);
+        
         // Remove IRC channel mapping
         self.irc_channel_mapping.write().await.remove_by_nais(channel_id);
         
+        // Track that we've left this channel so it won't be re-added via metadata sync
+        self.left_channels.write().await.insert(channel_id.to_string());
+        
         // Save to storage
         self.save_storage_async().await;
+        
+        log::info!("Left channel {}", channel_id);
         
         Ok(())
     }
@@ -915,6 +929,7 @@ impl NscManager {
         let this_device = self.this_device.read().await;
         let linked_devices = self.linked_devices.read().await;
         let irc_channel_mapping = self.irc_channel_mapping.read().await.clone();
+        let left_channels = self.left_channels.read().await.clone();
         
         // Encrypt sessions and trust records
         let storage_password = hex::encode(&self.identity.to_bytes()[..16]);
@@ -972,6 +987,7 @@ impl NscManager {
             encrypted_trust,
             peer_prekey_bundles,
             irc_channel_mapping,
+            left_channels,
         };
         
         if let Err(e) = save_nsc_storage(&storage) {
@@ -1001,6 +1017,7 @@ impl NscManager {
             encrypted_trust: None,
             peer_prekey_bundles: HashMap::new(),
             irc_channel_mapping: IrcChannelMapping::default(),
+            left_channels: HashSet::new(),
         };
         
         let _ = save_nsc_storage(&storage);
@@ -2152,6 +2169,14 @@ impl NscManager {
                 
                 if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, args) {
                     if let Ok(metadata) = serde_json::from_slice::<MetadataResponse>(&decoded) {
+                        // Check if we've explicitly left this channel - don't re-add it
+                        let left_channels = self.left_channels.read().await;
+                        if left_channels.contains(&metadata.channel_id) {
+                            log::debug!("Ignoring metadata for left channel {}", metadata.channel_id);
+                            return None;
+                        }
+                        drop(left_channels);
+                        
                         // Update our channel info if this is newer
                         let mut channel_info = self.channel_info.write().await;
                         
@@ -2565,6 +2590,9 @@ impl NscManager {
             invite.channel_id.clone(),
             irc_channel.clone(),
         );
+        
+        // Remove from left_channels if it was previously left (re-joining)
+        self.left_channels.write().await.remove(&invite.channel_id);
         
         self.channel_info.write().await.insert(invite.channel_id.clone(), info);
         self.save_storage_async().await;
