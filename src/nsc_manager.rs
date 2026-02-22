@@ -505,12 +505,13 @@ impl NscManager {
             // Generate IRC channel if not stored (migration for older storage)
             let irc_channel = if ch.irc_channel.is_empty() {
                 let generated = IrcChannelMapping::generate_irc_channel(&ch.channel_id);
-                // Register the generated mapping
-                irc_channel_mapping.register(ch.channel_id.clone(), generated.clone());
                 generated
             } else {
                 ch.irc_channel.clone()
             };
+            
+            // Always ensure the mapping is registered (handles case where mapping was lost)
+            irc_channel_mapping.register(ch.channel_id.clone(), irc_channel.clone());
             
             channel_info.insert(ch.channel_id.clone(), ChannelInfo {
                 channel_id: ch.channel_id.clone(),
@@ -2495,7 +2496,7 @@ impl NscManager {
             irc_channel: irc_channel.clone(),
         };
         
-        // Initialize members list with ourselves  
+        // Initialize members list with ourselves and the inviter (channel owner)
         let our_peer_id = hex::encode(self.peer_id.0);
         let our_display_name = format!("{}...", &our_peer_id[..8]);
         let self_member = NscChannelMember {
@@ -2505,7 +2506,24 @@ impl NscManager {
             is_owner: false,
             joined_at: now,
         };
-        self.channel_members.write().await.insert(invite.channel_id.clone(), vec![self_member]);
+        
+        // Add the inviter (channel owner) as a member
+        let inviter_display_name = format!("{}...", &invite.from_fingerprint[..8.min(invite.from_fingerprint.len())]);
+        let inviter_member = NscChannelMember {
+            peer_id: invite.from_fingerprint.clone(),
+            display_name: inviter_display_name,
+            is_self: false,
+            is_owner: true,
+            joined_at: invite.received_at, // They were already in the channel
+        };
+        
+        self.channel_members.write().await.insert(invite.channel_id.clone(), vec![self_member, inviter_member]);
+        
+        // Register the IRC channel mapping so probe responses can find the NSC channel
+        self.irc_channel_mapping.write().await.register(
+            invite.channel_id.clone(),
+            irc_channel.clone(),
+        );
         
         self.channel_info.write().await.insert(invite.channel_id.clone(), info);
         self.save_storage_async().await;
