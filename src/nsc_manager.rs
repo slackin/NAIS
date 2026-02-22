@@ -2625,11 +2625,9 @@ impl NscManager {
         };
         ice_agent.set_remote_credentials(remote_creds).await;
         
-        // Add remote candidates from offer
-        for candidate_sdp in &offer.candidates {
-            if let Some(candidate) = IceCandidate::from_sdp(candidate_sdp) {
-                ice_agent.add_remote_candidate(candidate).await;
-            }
+        // Add remote candidates from offer (compact format)
+        for candidate in offer.expand_candidates() {
+            ice_agent.add_remote_candidate(candidate).await;
         }
         
         // Gather our candidates
@@ -2740,11 +2738,9 @@ impl NscManager {
         let _our_candidates = ice_agent.gather_candidates().await
             .map_err(|e| format!("Failed to gather ICE candidates: {}", e))?;
         
-        // Add remote candidates from answer
-        for candidate_sdp in &answer.candidates {
-            if let Some(candidate) = IceCandidate::from_sdp(candidate_sdp) {
-                ice_agent.add_remote_candidate(candidate).await;
-            }
+        // Add remote candidates from answer (compact format)
+        for candidate in answer.expand_candidates() {
+            ice_agent.add_remote_candidate(candidate).await;
         }
         
         // Try connectivity check

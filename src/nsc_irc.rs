@@ -20,7 +20,7 @@ use thiserror::Error;
 use tokio::sync::{mpsc, RwLock};
 
 use crate::nsc_channel::{ChannelId, ChannelInvite, ChannelMetadata};
-use crate::nsc_nat::{IceCandidate, IceCredentials, NatType};
+use crate::nsc_nat::{CandidateType, IceCandidate, IceCredentials, NatType};
 use crate::nsc_transport::PeerId;
 
 // =============================================================================
@@ -182,23 +182,31 @@ impl ProbeMessage {
     }
 }
 
-/// ICE offer/answer message
+/// ICE offer/answer message - uses short field names to fit in IRC CTCP limit
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IceMessage {
-    /// Session ID for this exchange
+    /// Session ID for this exchange (8 chars for compactness)
+    #[serde(rename = "s")]
     pub session_id: String,
-    /// Our peer ID
+    /// Our peer ID (truncated to 16 hex chars - enough for uniqueness)
+    #[serde(rename = "p")]
     pub peer_id: String,
-    /// Target channel ID (hex)
+    /// Target channel ID (truncated to 16 hex chars)
+    #[serde(rename = "c", skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<String>,
     /// ICE credentials
+    #[serde(rename = "u")]
     pub ufrag: String,
+    #[serde(rename = "w")]
     pub pwd: String,
-    /// ICE candidates (SDP format)
+    /// ICE candidates (compact format: "t:ip:port" or "t:ip:port/rip:rport")
+    #[serde(rename = "i")]
     pub candidates: Vec<String>,
     /// NAT type
+    #[serde(rename = "n", skip_serializing_if = "Option::is_none")]
     pub nat_type: Option<String>,
-    /// Timestamp
+    /// Timestamp (seconds, not millis to save space)
+    #[serde(rename = "t")]
     pub timestamp: u64,
 }
 
@@ -211,28 +219,143 @@ impl IceMessage {
         candidates: &[IceCandidate],
     ) -> Self {
         Self {
-            session_id,
-            peer_id: peer_id.to_hex(),
-            channel_id: channel_id.map(|c| c.to_hex()),
+            // Truncate session_id to 8 chars for compactness
+            session_id: session_id.chars().take(8).collect(),
+            // Truncate peer_id to first 16 hex chars (64 bits - enough for uniqueness)
+            peer_id: peer_id.to_hex().chars().take(16).collect(),
+            // Truncate channel_id to first 16 hex chars
+            channel_id: channel_id.map(|c| c.to_hex().chars().take(16).collect()),
             ufrag: credentials.ufrag.clone(),
             pwd: credentials.pwd.clone(),
-            candidates: candidates.iter().map(|c| c.to_sdp()).collect(),
+            // Use compact candidate format
+            candidates: candidates.iter().map(|c| Self::candidate_to_compact(c)).collect(),
             nat_type: None,
+            // Use seconds instead of millis
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_millis() as u64,
+                .as_secs(),
         }
     }
 
-    /// Generate unique session ID
+    /// Generate unique session ID (8 chars for compactness)
     pub fn generate_session_id() -> String {
         use rand::distributions::Alphanumeric;
         use rand::Rng;
         rand::thread_rng()
             .sample_iter(&Alphanumeric)
-            .take(16)
+            .take(8)
             .map(char::from)
+            .collect()
+    }
+    
+    /// Convert candidate to compact format: "t:ip:port" or "t:ip:port/rip:rport"
+    /// t = h (host), s (srflx), p (prflx), r (relay)
+    fn candidate_to_compact(candidate: &IceCandidate) -> String {
+        let typ = match candidate.candidate_type {
+            CandidateType::Host => 'h',
+            CandidateType::ServerReflexive => 's',
+            CandidateType::PeerReflexive => 'p',
+            CandidateType::Relay => 'r',
+        };
+        
+        let base = format!("{}:{}:{}", typ, candidate.address.ip(), candidate.address.port());
+        
+        if let Some(ref raddr) = candidate.related_address {
+            format!("{}/{}:{}", base, raddr.ip(), raddr.port())
+        } else {
+            base
+        }
+    }
+    
+    /// Parse compact candidate format back to full candidate
+    pub fn compact_to_candidate(compact: &str) -> Option<IceCandidate> {
+        use std::net::SocketAddr;
+        
+        // Format: "t:ip:port" or "t:ip:port/rip:rport"
+        let (main, related) = if let Some(pos) = compact.find('/') {
+            (&compact[..pos], Some(&compact[pos+1..]))
+        } else {
+            (compact, None)
+        };
+        
+        let parts: Vec<&str> = main.split(':').collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        
+        let candidate_type = match parts[0] {
+            "h" => CandidateType::Host,
+            "s" => CandidateType::ServerReflexive,
+            "p" => CandidateType::PeerReflexive,
+            "r" => CandidateType::Relay,
+            _ => return None,
+        };
+        
+        // Handle IPv6 addresses which contain colons
+        let (ip_str, port_str) = if parts.len() > 3 {
+            // IPv6: t:ip:ip:ip:ip:ip:ip:port -> join all but first and last
+            let port = parts.last()?;
+            let ip = parts[1..parts.len()-1].join(":");
+            (ip, port.to_string())
+        } else {
+            (parts[1].to_string(), parts[2].to_string())
+        };
+        
+        let ip: std::net::IpAddr = ip_str.parse().ok()?;
+        let port: u16 = port_str.parse().ok()?;
+        let address = SocketAddr::new(ip, port);
+        
+        let related_address = if let Some(r) = related {
+            let rparts: Vec<&str> = r.split(':').collect();
+            if rparts.len() >= 2 {
+                let (rip_str, rport_str) = if rparts.len() > 2 {
+                    let rport = rparts.last()?;
+                    let rip = rparts[..rparts.len()-1].join(":");
+                    (rip, rport.to_string())
+                } else {
+                    (rparts[0].to_string(), rparts[1].to_string())
+                };
+                let rip: std::net::IpAddr = rip_str.parse().ok()?;
+                let rport: u16 = rport_str.parse().ok()?;
+                Some(SocketAddr::new(rip, rport))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        
+        // Calculate priority like the original implementation
+        let type_pref: u32 = match candidate_type {
+            CandidateType::Host => 126,
+            CandidateType::PeerReflexive => 110,
+            CandidateType::ServerReflexive => 100,
+            CandidateType::Relay => 0,
+        };
+        let local_pref: u32 = if address.is_ipv6() { 65535 } else { 65534 };
+        let priority = (type_pref << 24) + (local_pref << 8) + 255;
+        
+        // Build foundation string before moving candidate_type
+        let foundation = format!("{:?}_{}", candidate_type, address.ip());
+        
+        Some(IceCandidate {
+            candidate_type,
+            protocol: "udp".to_string(),
+            address,
+            base_address: related_address.or(Some(address)),
+            priority,
+            foundation,
+            component: 1,
+            related_address,
+        })
+    }
+    
+    /// Expand compact candidates to full IceCandidate objects
+    pub fn expand_candidates(&self) -> Vec<IceCandidate> {
+        self.candidates
+            .iter()
+            .filter_map(|c| Self::compact_to_candidate(c))
             .collect()
     }
 }
