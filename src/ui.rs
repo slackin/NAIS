@@ -2213,6 +2213,99 @@ fn app() -> Element {
                 div {
                     class: if userlist_collapsed() { "who collapsed" } else { "who" },
                     {
+                        // Check if we're viewing an NSC channel first
+                        let nsc_ch = nsc_current_channel.read().clone();
+                        
+                        if let Some(ref nsc_channel_id) = nsc_ch {
+                            // Show NSC channel members
+                            let nsc_channel_id_clone = nsc_channel_id.clone();
+                            
+                            rsx! {
+                                div {
+                                    class: "section-title",
+                                    style: "display:flex; justify-content:space-between; align-items:center; color: var(--accent);",
+                                    if !userlist_collapsed() {
+                                        "🔒 Secure Members"
+                                    }
+                                    button {
+                                        class: "collapse-btn",
+                                        onclick: move |_| {
+                                            userlist_collapsed.set(!userlist_collapsed());
+                                        },
+                                        if userlist_collapsed() { "‹" } else { "›" }
+                                    }
+                                }
+                                if !userlist_collapsed() {
+                                    {
+                                        // Fetch members from NscManager
+                                        let channel_id_for_fetch = nsc_channel_id_clone.clone();
+                                        
+                                        // Create a resource to fetch members
+                                        use_resource(move || {
+                                            let channel_id = channel_id_for_fetch.clone();
+                                            async move {
+                                                let manager = crate::nsc_manager::get_nsc_manager();
+                                                let mgr = manager.read().await;
+                                                mgr.get_channel_members(&channel_id).await
+                                            }
+                                        });
+                                        
+                                        // For now, use a synchronous approach with spawn
+                                        let mut members_signal: Signal<Vec<crate::nsc_manager::NscChannelMember>> = use_signal(Vec::new);
+                                        let channel_id_for_spawn = nsc_channel_id_clone.clone();
+                                        
+                                        // Spawn to fetch members
+                                        use_effect(move || {
+                                            let channel_id = channel_id_for_spawn.clone();
+                                            spawn(async move {
+                                                let manager = crate::nsc_manager::get_nsc_manager();
+                                                let mgr = manager.read().await;
+                                                let members = mgr.get_channel_members(&channel_id).await;
+                                                members_signal.set(members);
+                                            });
+                                        });
+                                        
+                                        let members = members_signal.read();
+                                        
+                                        rsx! {
+                                            ul {
+                                                if members.is_empty() {
+                                                    li {
+                                                        div {
+                                                            class: "row user-row",
+                                                            style: "opacity: 0.5; font-style: italic;",
+                                                            "Loading members..."
+                                                        }
+                                                    }
+                                                } else {
+                                                    for member in members.iter() {
+                                                        li {
+                                                            div {
+                                                                class: "row user-row",
+                                                                style: "display: flex; align-items: center;",
+                                                                if member.is_owner {
+                                                                    span {
+                                                                        style: "color: #FFD700; margin-right: 6px; font-weight: bold;",
+                                                                        "★"
+                                                                    }
+                                                                }
+                                                                span {
+                                                                    style: if member.is_self { "color: var(--accent); opacity: 0.7;" } else { "color: var(--fg);" },
+                                                                    "{member.display_name}"
+                                                                    if member.is_self {
+                                                                        " (you)"
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
                         let current_channel = state.read().servers
                             .get(&state.read().active_profile)
                             .map(|s| s.current_channel.clone())
@@ -2943,6 +3036,7 @@ fn app() -> Element {
                                 }
                             }
                         }
+                        }  // Close the else block for NSC channel check
                     }
                 }
             }
@@ -5604,15 +5698,23 @@ fn app() -> Element {
                                                                 let manager = crate::nsc_manager::get_nsc_manager();
                                                                 let mgr = manager.read().await;
                                                                 match mgr.accept_invite(&iid).await {
-                                                                    Ok((target_nick, ctcp_response)) => {
+                                                                    Ok((target_nick, ctcp_response, irc_channel)) => {
                                                                         log::info!("Accepted invite, sending response to {}", target_nick);
                                                                         // Send CTCP response to inviter via active IRC connection
                                                                         let active = state.read().active_profile.clone();
                                                                         if let Some(core) = cores.read().get(&active) {
+                                                                            // Send the accept response
                                                                             let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Notice {
                                                                                 target: target_nick,
                                                                                 text: ctcp_response,
                                                                             });
+                                                                            // Join the IRC discovery channel for peer discovery
+                                                                            if !irc_channel.is_empty() {
+                                                                                log::info!("Joining IRC discovery channel: {}", irc_channel);
+                                                                                let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Join {
+                                                                                    channel: irc_channel,
+                                                                                });
+                                                                            }
                                                                         }
                                                                     }
                                                                     Err(e) => {
@@ -5666,6 +5768,19 @@ fn app() -> Element {
                                         match mgr.create_channel(name.clone()).await {
                                             Ok(info) => {
                                                 log::info!("Created NSC channel: {} ({})", info.name, &info.channel_id[..8]);
+                                                
+                                                // Join the IRC discovery channel for peer discovery
+                                                let irc_channel = info.irc_channel.clone();
+                                                if !irc_channel.is_empty() {
+                                                    let active = state.read().active_profile.clone();
+                                                    if let Some(core) = cores.read().get(&active) {
+                                                        log::info!("Joining IRC discovery channel: {}", irc_channel);
+                                                        let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Join {
+                                                            channel: irc_channel,
+                                                        });
+                                                    }
+                                                }
+                                                
                                                 // Refresh channel list
                                                 let channels = mgr.list_channels().await;
                                                 drop(mgr);

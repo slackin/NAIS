@@ -372,6 +372,21 @@ impl PendingMessage {
     }
 }
 
+/// A member of an NSC channel (for UI display)
+#[derive(Clone, Debug)]
+pub struct NscChannelMember {
+    /// Peer ID (hex encoded)
+    pub peer_id: String,
+    /// Display name (short fingerprint if unknown)
+    pub display_name: String,
+    /// Is this us (the local user)?
+    pub is_self: bool,
+    /// Is this the channel owner?
+    pub is_owner: bool,
+    /// When they joined (unix timestamp)
+    pub joined_at: u64,
+}
+
 // =============================================================================
 // NSC Manager
 // =============================================================================
@@ -422,6 +437,8 @@ pub struct NscManager {
     retry_queue: Arc<RwLock<HashMap<String, PendingMessage>>>,
     /// IRC channel mapping for peer discovery
     irc_channel_mapping: Arc<RwLock<IrcChannelMapping>>,
+    /// Channel members for UI display (channel_id -> members)
+    channel_members: Arc<RwLock<HashMap<String, Vec<NscChannelMember>>>>,
 }
 
 /// Pending ICE session info
@@ -585,6 +602,25 @@ impl NscManager {
         }
         log::info!("Loaded {} peer PreKeyBundles from storage", peer_prekey_bundles.len());
         
+        // Initialize channel members - add ourselves to each channel we own
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let our_peer_id_hex = hex::encode(peer_id.0);
+        let our_display_name = format!("{}...", &our_peer_id_hex[..8]);
+        let mut channel_members = HashMap::new();
+        for ch in &storage.channels {
+            let self_member = NscChannelMember {
+                peer_id: our_peer_id_hex.clone(),
+                display_name: our_display_name.clone(),
+                is_self: true,
+                is_owner: ch.is_owner,
+                joined_at: ch.created_at,
+            };
+            channel_members.insert(ch.channel_id.clone(), vec![self_member]);
+        }
+        
         let manager = Self {
             identity: identity.clone(),
             peer_id,
@@ -608,6 +644,7 @@ impl NscManager {
             trust_manager: Arc::new(RwLock::new(trust_manager)),
             retry_queue: Arc::new(RwLock::new(HashMap::new())),
             irc_channel_mapping: Arc::new(RwLock::new(irc_channel_mapping)),
+            channel_members: Arc::new(RwLock::new(channel_members)),
         };
         
         // Save identity if newly generated
@@ -685,7 +722,7 @@ impl NscManager {
         );
         
         let info = ChannelInfo {
-            channel_id: channel_id_hex,
+            channel_id: channel_id_hex.clone(),
             name,
             topic: String::new(),
             member_count: 1,
@@ -693,6 +730,18 @@ impl NscManager {
             created_at: now,
             irc_channel,
         };
+        
+        // Add ourselves as a member
+        let our_peer_id = hex::encode(self.peer_id.0);
+        let our_display_name = format!("{}...", &our_peer_id[..8]);
+        let self_member = NscChannelMember {
+            peer_id: our_peer_id,
+            display_name: our_display_name,
+            is_self: true,
+            is_owner: true,
+            joined_at: now,
+        };
+        self.channel_members.write().await.insert(channel_id_hex.clone(), vec![self_member]);
         
         // Cache the info
         self.channel_info.write().await.insert(info.channel_id.clone(), info.clone());
@@ -753,6 +802,63 @@ impl NscManager {
             self.channel_info.read().await.get(channel_id).cloned()
         } else {
             None
+        }
+    }
+    
+    /// Get members of a channel for UI display
+    pub async fn get_channel_members(&self, channel_id: &str) -> Vec<NscChannelMember> {
+        self.channel_members.read().await
+            .get(channel_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+    
+    /// Add a member to a channel (internal use)
+    pub async fn add_channel_member(&self, channel_id: &str, peer_id_hex: &str, is_owner: bool) {
+        let mut members = self.channel_members.write().await;
+        let channel_members = members.entry(channel_id.to_string()).or_insert_with(Vec::new);
+        
+        // Check if already a member
+        if channel_members.iter().any(|m| m.peer_id == peer_id_hex) {
+            return;
+        }
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let our_peer_id = hex::encode(self.peer_id.0);
+        let display_name = format!("{}...", &peer_id_hex[..8.min(peer_id_hex.len())]);
+        
+        let member = NscChannelMember {
+            peer_id: peer_id_hex.to_string(),
+            display_name,
+            is_self: peer_id_hex == our_peer_id,
+            is_owner,
+            joined_at: now,
+        };
+        
+        channel_members.push(member);
+        
+        // Update member count in channel info
+        let mut info = self.channel_info.write().await;
+        if let Some(channel) = info.get_mut(channel_id) {
+            channel.member_count = channel_members.len() as u32;
+        }
+    }
+    
+    /// Remove a member from a channel (internal use)
+    pub async fn remove_channel_member(&self, channel_id: &str, peer_id_hex: &str) {
+        let mut members = self.channel_members.write().await;
+        if let Some(channel_members) = members.get_mut(channel_id) {
+            channel_members.retain(|m| m.peer_id != peer_id_hex);
+            
+            // Update member count in channel info
+            let mut info = self.channel_info.write().await;
+            if let Some(channel) = info.get_mut(channel_id) {
+                channel.member_count = channel_members.len() as u32;
+            }
         }
     }
     
@@ -2337,7 +2443,8 @@ impl NscManager {
     }
     
     /// Accept a pending invite
-    pub async fn accept_invite(&self, invite_id: &str) -> Result<(String, String), String> {
+    /// Returns: (target_nick, ctcp_response, irc_channel)
+    pub async fn accept_invite(&self, invite_id: &str) -> Result<(String, String, String), String> {
         let invite = self.pending_invites.write().await.remove(invite_id)
             .ok_or("Invite not found or expired")?;
         
@@ -2351,6 +2458,8 @@ impl NscManager {
             .unwrap_or_default()
             .as_secs();
         
+        let irc_channel = IrcChannelMapping::generate_irc_channel(&invite.channel_id);
+        
         let info = ChannelInfo {
             channel_id: invite.channel_id.clone(),
             name: invite.channel_name.clone(),
@@ -2358,13 +2467,28 @@ impl NscManager {
             member_count: invite.member_count + 1,
             is_owner: false,
             created_at: now,
-            irc_channel: IrcChannelMapping::generate_irc_channel(&invite.channel_id),
+            irc_channel: irc_channel.clone(),
         };
+        
+        // Initialize members list with ourselves  
+        let our_peer_id = hex::encode(self.peer_id.0);
+        let our_display_name = format!("{}...", &our_peer_id[..8]);
+        let self_member = NscChannelMember {
+            peer_id: our_peer_id,
+            display_name: our_display_name,
+            is_self: true,
+            is_owner: false,
+            joined_at: now,
+        };
+        self.channel_members.write().await.insert(invite.channel_id.clone(), vec![self_member]);
         
         self.channel_info.write().await.insert(invite.channel_id.clone(), info);
         self.save_storage_async().await;
         
-        Ok((invite.from_nick, accept_msg))
+        log::info!("Accepted invite for channel '{}', IRC discovery channel: {}", 
+            invite.channel_name, irc_channel);
+        
+        Ok((invite.from_nick, accept_msg, irc_channel))
     }
     
     /// Decline a pending invite
@@ -2635,6 +2759,9 @@ impl NscManager {
                                 log::error!("Failed to send epoch secrets to {}: {}", target_nick, e);
                             } else {
                                 log::info!("Sent epoch secrets to {} for channel {}", target_nick, ch_id);
+                                
+                                // Add the invitee as a member to our channel members list
+                                mgr.add_channel_member(ch_id, &peer_id, false).await;
                             }
                         }
                     }
@@ -2791,6 +2918,13 @@ impl NscManager {
                                                                 {
                                                                     Ok(_) => {
                                                                         log::info!("Successfully stored epoch secrets for channel {}", channel_hex);
+                                                                        
+                                                                        // Add the sender (inviter) as a member - they're the channel owner
+                                                                        mgr.add_channel_member(&channel_hex, &sender_hex, true).await;
+                                                                        
+                                                                        // Also add ourselves as a member
+                                                                        let our_peer_id = hex::encode(mgr.peer_id.0);
+                                                                        mgr.add_channel_member(&channel_hex, &our_peer_id, false).await;
                                                                     }
                                                                     Err(e) => {
                                                                         log::error!("Failed to store epoch secrets: {:?}", e);
@@ -2875,6 +3009,13 @@ impl NscManager {
                                                         let channel_hex = hex::encode(&envelope.channel_id);
                                                         log::info!("Received MemberJoin from {} for channel {}", sender_hex, channel_hex);
                                                         
+                                                        // Add member to channel_members map
+                                                        {
+                                                            let manager = get_nsc_manager();
+                                                            let mgr = manager.read().await;
+                                                            mgr.add_channel_member(&channel_hex, &sender_hex, false).await;
+                                                        }
+                                                        
                                                         if let Some(ref tx) = event_tx {
                                                             let _ = tx.send(NscEvent::MemberJoined { 
                                                                 channel_id: channel_hex,
@@ -2886,6 +3027,13 @@ impl NscManager {
                                                         let sender_hex = hex::encode(envelope.sender_id);
                                                         let channel_hex = hex::encode(&envelope.channel_id);
                                                         log::info!("Received MemberLeave from {} for channel {}", sender_hex, channel_hex);
+                                                        
+                                                        // Remove member from channel_members map
+                                                        {
+                                                            let manager = get_nsc_manager();
+                                                            let mgr = manager.read().await;
+                                                            mgr.remove_channel_member(&channel_hex, &sender_hex).await;
+                                                        }
                                                         
                                                         if let Some(ref tx) = event_tx {
                                                             let _ = tx.send(NscEvent::MemberLeft { 
