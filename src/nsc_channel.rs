@@ -731,7 +731,7 @@ impl Default for MessageQueue {
 // =============================================================================
 
 /// Group epoch secrets (simplified MLS)
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EpochSecrets {
     /// Current epoch number
     pub epoch: u64,
@@ -1652,6 +1652,20 @@ impl ChannelManager {
     pub fn new(identity: Arc<IdentityKeyPair>, local_peer_id: PeerId) -> Self {
         Self {
             channels: Arc::new(RwLock::new(HashMap::new())),
+            identity,
+            local_peer_id,
+            pending_invites: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Create new channel manager with pre-initialized channels
+    pub fn new_with_channels(
+        identity: Arc<IdentityKeyPair>,
+        local_peer_id: PeerId,
+        channels: HashMap<ChannelId, NaisSecureChannel>,
+    ) -> Self {
+        Self {
+            channels: Arc::new(RwLock::new(channels)),
             identity,
             local_peer_id,
             pending_invites: Arc::new(RwLock::new(HashMap::new())),

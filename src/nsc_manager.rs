@@ -108,6 +108,9 @@ pub struct StoredChannel {
     /// IRC network this channel belongs to (profile name)
     #[serde(default)]
     pub network: String,
+    /// Epoch secrets for encryption (serialized)
+    #[serde(default)]
+    pub epoch_secrets: Option<crate::nsc_channel::EpochSecrets>,
 }
 
 /// Stored message data
@@ -521,12 +524,10 @@ impl NscManager {
         // Derive peer ID from identity public key
         let peer_id = PeerId(identity.public_key().to_bytes());
         
-        // Create channel manager
-        let channel_manager = ChannelManager::new(identity.clone(), peer_id);
-        
-        // Load channel info and IRC channel mappings
+        // Load channel info, IRC channel mappings, and pre-initialize channels with epoch secrets
         let mut channel_info = HashMap::new();
         let mut irc_channel_mapping = storage.irc_channel_mapping.clone();
+        let mut pre_initialized_channels = HashMap::new();
         
         for ch in &storage.channels {
             // Generate IRC channel if not stored (migration for older storage)
@@ -550,7 +551,47 @@ impl NscManager {
                 irc_channel,
                 network: ch.network.clone(),
             });
+            
+            // Pre-initialize channel with epoch secrets if available
+            if let Some(ref epoch_secrets) = ch.epoch_secrets {
+                if let Ok(channel_bytes) = hex::decode(&ch.channel_id) {
+                    if channel_bytes.len() == 32 {
+                        let mut channel_arr = [0u8; 32];
+                        channel_arr.copy_from_slice(&channel_bytes);
+                        let channel_id_typed = ChannelId::from_bytes(channel_arr);
+                        
+                        // Create channel metadata
+                        let metadata = crate::nsc_channel::ChannelMetadata {
+                            channel_id: channel_id_typed,
+                            name: ch.name.clone(),
+                            topic: ch.topic.clone(),
+                            avatar: None,
+                            created_at: ch.created_at,
+                            version: 1,
+                            creator: peer_id,
+                            admins: if ch.is_owner { vec![peer_id] } else { vec![] },
+                            settings: crate::nsc_channel::ChannelSettings::default(),
+                            signature: [0u8; 64],
+                            previous_hash: None,
+                        };
+                        
+                        // Create the channel with stored epoch secrets
+                        let channel = crate::nsc_channel::NaisSecureChannel::join(
+                            metadata,
+                            epoch_secrets.clone(),
+                            identity.clone(),
+                            peer_id,
+                        );
+                        
+                        pre_initialized_channels.insert(channel_id_typed, channel);
+                        log::info!("Restored channel {} with epoch secrets (epoch {})", ch.name, epoch_secrets.epoch);
+                    }
+                }
+            }
         }
+        
+        // Create channel manager with pre-initialized channels
+        let channel_manager = ChannelManager::new_with_channels(identity.clone(), peer_id, pre_initialized_channels);
         
         // Create or load device info for this device
         let now = SystemTime::now()
@@ -951,16 +992,39 @@ impl NscManager {
     
     /// Save storage to disk (async version)
     async fn save_storage_async(&self) {
-        let channels: Vec<StoredChannel> = self.channel_info.read().await.values().map(|info| StoredChannel {
-            channel_id: info.channel_id.clone(),
-            name: info.name.clone(),
-            topic: info.topic.clone(),
-            created_at: info.created_at,
-            member_count: info.member_count,
-            is_owner: info.is_owner,
-            irc_channel: info.irc_channel.clone(),
-            network: info.network.clone(),
-        }).collect();
+        // Build stored channels with their epoch secrets
+        let channel_info_read = self.channel_info.read().await;
+        let mut channels: Vec<StoredChannel> = Vec::with_capacity(channel_info_read.len());
+        
+        for info in channel_info_read.values() {
+            // Get epoch secrets from channel_manager
+            let channel_bytes = hex::decode(&info.channel_id).ok();
+            let epoch_secrets = if let Some(bytes) = channel_bytes {
+                if bytes.len() == 32 {
+                    let mut channel_arr = [0u8; 32];
+                    channel_arr.copy_from_slice(&bytes);
+                    let channel_id_typed = ChannelId::from_bytes(channel_arr);
+                    self.channel_manager.get_epoch_secrets(&channel_id_typed).await
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            
+            channels.push(StoredChannel {
+                channel_id: info.channel_id.clone(),
+                name: info.name.clone(),
+                topic: info.topic.clone(),
+                created_at: info.created_at,
+                member_count: info.member_count,
+                is_owner: info.is_owner,
+                irc_channel: info.irc_channel.clone(),
+                network: info.network.clone(),
+                epoch_secrets,
+            });
+        }
+        drop(channel_info_read);
         
         let this_device = self.this_device.read().await;
         let linked_devices = self.linked_devices.read().await;
