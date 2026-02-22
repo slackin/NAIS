@@ -475,14 +475,37 @@ fn app() -> Element {
     });
     
     // Fetch NSC channel members when NSC channel changes
+    // Also subscribe to NSC events to refresh members when they join/leave
     use_effect(move || {
         let channel_id = nsc_current_channel.read().clone();
-        if let Some(ch_id) = channel_id {
+        if let Some(ch_id) = channel_id.clone() {
+            // Initial fetch
+            let ch_id_initial = ch_id.clone();
             spawn(async move {
                 let manager = crate::nsc_manager::get_nsc_manager();
                 let mgr = manager.read().await;
-                let members = mgr.get_channel_members(&ch_id).await;
+                let members = mgr.get_channel_members(&ch_id_initial).await;
                 nsc_channel_members.set(members);
+            });
+            
+            // Periodic refresh to catch member changes (every 3 seconds)
+            let ch_id_poll = ch_id.clone();
+            spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+                loop {
+                    interval.tick().await;
+                    
+                    // Check if channel is still the same
+                    let current = nsc_current_channel.read().clone();
+                    if current.as_ref() != Some(&ch_id_poll) {
+                        break;
+                    }
+                    
+                    let manager = crate::nsc_manager::get_nsc_manager();
+                    let mgr = manager.read().await;
+                    let members = mgr.get_channel_members(&ch_id_poll).await;
+                    nsc_channel_members.set(members);
+                }
             });
         } else {
             nsc_channel_members.set(Vec::new());

@@ -661,6 +661,13 @@ impl NscManager {
         self.event_tx = Some(tx);
     }
     
+    /// Subscribe to NSC events - returns a receiver for the UI to process events
+    pub fn subscribe_events(&mut self) -> mpsc::Receiver<NscEvent> {
+        let (tx, rx) = mpsc::channel(100);
+        self.event_tx = Some(tx);
+        rx
+    }
+    
     /// Initialize the transport layer (must be called before sending/receiving)
     pub async fn init_transport(&self) -> Result<u16, String> {
         let mut transport_lock = self.transport.write().await;
@@ -847,6 +854,18 @@ impl NscManager {
         if let Some(channel) = info.get_mut(channel_id) {
             channel.member_count = channel_members.len() as u32;
         }
+        drop(info);
+        drop(members);
+        
+        // Notify UI that a member joined
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(NscEvent::MemberJoined {
+                channel_id: channel_id.to_string(),
+                peer_id: peer_id_hex.to_string(),
+            }).await;
+        }
+        
+        log::info!("Added member {} to channel {}", peer_id_hex, channel_id);
     }
     
     /// Remove a member from a channel (internal use)
@@ -1056,6 +1075,10 @@ impl NscManager {
         if let Some(ch_id) = channel_id {
             if let Err(e) = self.send_welcome_via_relay(peer_id_hex, ch_id).await {
                 log::error!("Failed to send epoch secrets via relay: {}", e);
+            } else {
+                log::info!("Sent epoch secrets via relay to {} for channel {}", peer_id_hex, ch_id);
+                // Add the invitee as a member to our channel members list
+                self.add_channel_member(ch_id, peer_id_hex, false).await;
             }
         }
         
