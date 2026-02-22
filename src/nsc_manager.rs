@@ -461,6 +461,9 @@ pub struct NscManager {
     channel_members: Arc<RwLock<HashMap<String, Vec<NscChannelMember>>>>,
     /// Channel IDs that the user has explicitly left (to prevent re-adding via metadata sync)
     left_channels: Arc<RwLock<HashSet<String>>>,
+    /// Pending probes: nick (lowercase) -> IRC channels we probed them for
+    /// This allows us to associate probe responses with the correct IRC channel
+    pending_probes: Arc<RwLock<HashMap<String, Vec<String>>>>,
 }
 
 /// Pending ICE session info
@@ -672,6 +675,7 @@ impl NscManager {
             irc_channel_mapping: Arc::new(RwLock::new(irc_channel_mapping)),
             channel_members: Arc::new(RwLock::new(channel_members)),
             left_channels: Arc::new(RwLock::new(storage.left_channels.clone())),
+            pending_probes: Arc::new(RwLock::new(HashMap::new())),
         };
         
         // Save identity if newly generated
@@ -1940,34 +1944,78 @@ impl NscManager {
                         // Add to known peers
                         self.known_peers.write().await.insert(from_nick.to_string(), peer);
                         
-                        // Add to IRC channel list
-                        let mut by_channel = self.peers_by_irc_channel.write().await;
-                        let peers = by_channel.entry(irc_channel.to_string()).or_insert_with(Vec::new);
-                        if !peers.contains(&from_nick.to_string()) {
-                            peers.push(from_nick.to_string());
+                        // Add to IRC channel list (if we know which channel)
+                        if !irc_channel.is_empty() {
+                            let mut by_channel = self.peers_by_irc_channel.write().await;
+                            let peers = by_channel.entry(irc_channel.to_string()).or_insert_with(Vec::new);
+                            if !peers.contains(&from_nick.to_string()) {
+                                peers.push(from_nick.to_string());
+                            }
                         }
-                        drop(by_channel);
                         
-                        log::info!("Discovered NSC peer: {} (peer_id: {}...) in IRC channel {}", 
+                        log::info!("Discovered NSC peer: {} (peer_id: {}...) via IRC channel hint '{}'", 
                             from_nick, &peer_id_hex[..8.min(peer_id_hex.len())], irc_channel);
                         
-                        // Check if this IRC channel maps to an NSC secure channel
-                        // If so, add this peer to the channel members list
-                        let mapping = self.irc_channel_mapping.read().await;
-                        if let Some(nais_channel_id) = mapping.get_nais_channel(irc_channel) {
-                            let channel_id = nais_channel_id.clone();
+                        // Check ALL our IRC channel mappings to find NSC channels this peer should be added to
+                        // This is necessary because CTCP responses don't carry channel context, and the
+                        // irc_channel hint from the UI may be wrong (it's based on current_channel)
+                        
+                        // Check if we have pending probes for this user (most reliable source)
+                        let from_nick_lower = from_nick.to_lowercase();
+                        let pending_probe_channels: Vec<String> = {
+                            let mut pending = self.pending_probes.write().await;
+                            pending.remove(&from_nick_lower).unwrap_or_default()
+                        };
+                        
+                        log::info!("Pending probe channels for {}: {:?}", from_nick, pending_probe_channels);
+                        
+                        // First, collect all channels where this peer should be added
+                        let channels_to_add: Vec<(String, String)> = {
+                            let mapping = self.irc_channel_mapping.read().await;
+                            let all_mappings: Vec<(String, String)> = mapping.all_mappings()
+                                .map(|(nais, irc)| (nais.clone(), irc.clone()))
+                                .collect();
                             drop(mapping);
                             
-                            log::info!("IRC channel {} maps to NSC channel {}, adding peer {} as member", 
-                                irc_channel, channel_id, from_nick);
+                            let by_channel = self.peers_by_irc_channel.read().await;
                             
-                            // Add peer to NSC channel members (not owner since they're joining)
-                            self.add_channel_member(&channel_id, &peer_id_hex, false).await;
+                            all_mappings.into_iter().filter(|(_, mapped_irc_channel)| {
+                                // Check if we probed this user for this specific IRC channel
+                                let probed_for_channel = pending_probe_channels.contains(mapped_irc_channel);
+                                
+                                // Check if this peer is known to be in this IRC channel
+                                let peer_in_channel = by_channel.get(mapped_irc_channel)
+                                    .map(|peers| peers.contains(&from_nick.to_string()))
+                                    .unwrap_or(false);
+                                
+                                // Check if the passed irc_channel hint matches
+                                let channels_match = !irc_channel.is_empty() && irc_channel == *mapped_irc_channel;
+                                
+                                probed_for_channel || peer_in_channel || channels_match
+                            }).collect()
+                        };
+                        
+                        // Now add the peer to each matching channel
+                        for (nais_channel_id, mapped_irc_channel) in channels_to_add {
+                            log::info!("Adding peer {} to NSC channel {} (IRC channel: {})", 
+                                from_nick, &nais_channel_id[..8.min(nais_channel_id.len())], mapped_irc_channel);
+                            
+                            // Also add to peers_by_irc_channel if not already there
+                            {
+                                let mut by_channel_write = self.peers_by_irc_channel.write().await;
+                                let peers = by_channel_write.entry(mapped_irc_channel.clone()).or_insert_with(Vec::new);
+                                if !peers.contains(&from_nick.to_string()) {
+                                    peers.push(from_nick.to_string());
+                                }
+                            }
+                            
+                            // Add peer to NSC channel members
+                            self.add_channel_member(&nais_channel_id, &peer_id_hex, false).await;
                             
                             // Send MemberJoined event to UI
                             if let Some(ref tx) = self.event_tx {
                                 let _ = tx.send(NscEvent::MemberJoined {
-                                    channel_id: channel_id.clone(),
+                                    channel_id: nais_channel_id.clone(),
                                     peer_id: peer_id_hex.clone(),
                                 }).await;
                             }
@@ -2262,6 +2310,29 @@ impl NscManager {
         match encode_ctcp(NscCtcpCommand::Probe, &probe) {
             Ok(ctcp) => ctcp,
             Err(_) => String::new(),
+        }
+    }
+    
+    /// Record that we've sent a probe to a user for a specific IRC channel
+    /// This allows us to associate probe responses with the correct channel
+    pub async fn record_pending_probe(&self, nick: &str, irc_channel: &str) {
+        let nick_lower = nick.to_lowercase();
+        let mut pending = self.pending_probes.write().await;
+        let channels = pending.entry(nick_lower).or_insert_with(Vec::new);
+        if !channels.contains(&irc_channel.to_string()) {
+            channels.push(irc_channel.to_string());
+        }
+    }
+    
+    /// Record probes for multiple users at once
+    pub async fn record_pending_probes(&self, nicks: &[String], irc_channel: &str) {
+        let mut pending = self.pending_probes.write().await;
+        for nick in nicks {
+            let nick_lower = nick.to_lowercase();
+            let channels = pending.entry(nick_lower).or_insert_with(Vec::new);
+            if !channels.contains(&irc_channel.to_string()) {
+                channels.push(irc_channel.to_string());
+            }
         }
     }
     

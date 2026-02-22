@@ -1261,6 +1261,8 @@ fn app() -> Element {
                                             let is_nsc_channel = should_probe || mgr.get_channel_by_irc(&irc_channel).await.is_some();
                                             
                                             if is_nsc_channel {
+                                                // Record pending probe so we can associate the response with this channel
+                                                mgr.record_pending_probe(&clean_user, &irc_channel).await;
                                                 let nsc_probe = mgr.create_probe_ctcp();
                                                 drop(mgr);
                                                 
@@ -1300,20 +1302,25 @@ fn app() -> Element {
                                         let is_nsc_channel = should_probe || mgr.get_channel_by_irc(&irc_channel).await.is_some();
                                         
                                         if is_nsc_channel {
+                                            // Clean the user list and record pending probes
+                                            let clean_users: Vec<String> = users_to_probe.iter()
+                                                .map(|u| u.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~').to_string())
+                                                .filter(|u| *u != our_nick)
+                                                .collect();
+                                            
+                                            // Record pending probes so we can associate responses with this channel
+                                            mgr.record_pending_probes(&clean_users, &irc_channel).await;
                                             let nsc_probe = mgr.create_probe_ctcp();
                                             drop(mgr);
                                             
                                             if !nsc_probe.is_empty() {
                                                 if let Some(core) = cores_clone.read().get(&pname) {
-                                                    for user in users_to_probe {
-                                                        let clean_user = user.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~');
-                                                        if clean_user != our_nick {
-                                                            log::info!("Probing user {} in channel {} (NSC-related)", clean_user, irc_channel);
-                                                            let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
-                                                                target: clean_user.to_string(),
-                                                                message: nsc_probe.clone(),
-                                                            });
-                                                        }
+                                                    for clean_user in clean_users {
+                                                        log::info!("Probing user {} in channel {} (NSC-related)", clean_user, irc_channel);
+                                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                            target: clean_user.to_string(),
+                                                            message: nsc_probe.clone(),
+                                                        });
                                                     }
                                                 }
                                             }
@@ -5880,9 +5887,11 @@ fn app() -> Element {
                                                                             }
                                                                             
                                                                             // Probe the inviter directly to discover their peer info
+                                                                            // Record pending probe so we can associate the response with this channel
+                                                                            mgr.record_pending_probe(&target_nick, &irc_channel).await;
                                                                             let nsc_probe = mgr.create_probe_ctcp();
                                                                             if !nsc_probe.is_empty() {
-                                                                                log::info!("Probing inviter {} for peer info", target_nick);
+                                                                                log::info!("Probing inviter {} for peer info (channel {})", target_nick, irc_channel);
                                                                                 let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Ctcp {
                                                                                     target: target_nick.clone(),
                                                                                     message: nsc_probe.clone(),
@@ -5912,20 +5921,25 @@ fn app() -> Element {
                                                                                 if !users.is_empty() {
                                                                                     let manager = crate::nsc_manager::get_nsc_manager();
                                                                                     let mgr = manager.read().await;
+                                                                                    
+                                                                                    // Clean user list and record pending probes
+                                                                                    let clean_users: Vec<String> = users.iter()
+                                                                                        .map(|u| u.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~').to_string())
+                                                                                        .filter(|u| *u != our_nick)
+                                                                                        .collect();
+                                                                                    
+                                                                                    mgr.record_pending_probes(&clean_users, &irc_ch).await;
                                                                                     let nsc_probe = mgr.create_probe_ctcp();
                                                                                     drop(mgr);
                                                                                     
                                                                                     if !nsc_probe.is_empty() {
                                                                                         if let Some(core) = cores_clone.read().get(&profile_clone) {
-                                                                                            for user in users {
-                                                                                                let clean_user = user.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~');
-                                                                                                if clean_user != our_nick {
-                                                                                                    log::info!("Probing user {} in channel {} for peer discovery", clean_user, irc_ch);
-                                                                                                    let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Ctcp {
-                                                                                                        target: clean_user.to_string(),
-                                                                                                        message: nsc_probe.clone(),
-                                                                                                    });
-                                                                                                }
+                                                                                            for clean_user in clean_users {
+                                                                                                log::info!("Probing user {} in channel {} for peer discovery", clean_user, irc_ch);
+                                                                                                let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Ctcp {
+                                                                                                    target: clean_user.to_string(),
+                                                                                                    message: nsc_probe.clone(),
+                                                                                                });
                                                                                             }
                                                                                         }
                                                                                     }
@@ -6026,20 +6040,25 @@ fn app() -> Element {
                                                             if !users.is_empty() {
                                                                 let manager = crate::nsc_manager::get_nsc_manager();
                                                                 let mgr = manager.read().await;
+                                                                
+                                                                // Clean user list and record pending probes
+                                                                let clean_users: Vec<String> = users.iter()
+                                                                    .map(|u| u.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~').to_string())
+                                                                    .filter(|u| *u != our_nick)
+                                                                    .collect();
+                                                                
+                                                                mgr.record_pending_probes(&clean_users, &irc_ch).await;
                                                                 let nsc_probe = mgr.create_probe_ctcp();
                                                                 drop(mgr);
                                                                 
                                                                 if !nsc_probe.is_empty() {
                                                                     if let Some(core) = cores_clone.read().get(&profile_clone) {
-                                                                        for user in users {
-                                                                            let clean_user = user.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~');
-                                                                            if clean_user != our_nick {
-                                                                                log::info!("Probing user {} in channel {} for peer discovery (new channel)", clean_user, irc_ch);
-                                                                                let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Ctcp {
-                                                                                    target: clean_user.to_string(),
-                                                                                    message: nsc_probe.clone(),
-                                                                                });
-                                                                            }
+                                                                        for clean_user in clean_users {
+                                                                            log::info!("Probing user {} in channel {} for peer discovery (new channel)", clean_user, irc_ch);
+                                                                            let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Ctcp {
+                                                                                target: clean_user.to_string(),
+                                                                                message: nsc_probe.clone(),
+                                                                            });
                                                                         }
                                                                     }
                                                                 }
