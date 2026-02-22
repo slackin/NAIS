@@ -552,40 +552,47 @@ impl NscManager {
                 network: ch.network.clone(),
             });
             
-            // Pre-initialize channel with epoch secrets if available
-            if let Some(ref epoch_secrets) = ch.epoch_secrets {
-                if let Ok(channel_bytes) = hex::decode(&ch.channel_id) {
-                    if channel_bytes.len() == 32 {
-                        let mut channel_arr = [0u8; 32];
-                        channel_arr.copy_from_slice(&channel_bytes);
-                        let channel_id_typed = ChannelId::from_bytes(channel_arr);
-                        
-                        // Create channel metadata
-                        let metadata = crate::nsc_channel::ChannelMetadata {
-                            channel_id: channel_id_typed,
-                            name: ch.name.clone(),
-                            topic: ch.topic.clone(),
-                            avatar: None,
-                            created_at: ch.created_at,
-                            version: 1,
-                            creator: peer_id,
-                            admins: if ch.is_owner { vec![peer_id] } else { vec![] },
-                            settings: crate::nsc_channel::ChannelSettings::default(),
-                            signature: [0u8; 64],
-                            previous_hash: None,
-                        };
-                        
-                        // Create the channel with stored epoch secrets
-                        let channel = crate::nsc_channel::NaisSecureChannel::join(
-                            metadata,
-                            epoch_secrets.clone(),
-                            identity.clone(),
-                            peer_id,
-                        );
-                        
-                        pre_initialized_channels.insert(channel_id_typed, channel);
-                        log::info!("Restored channel {} with epoch secrets (epoch {})", ch.name, epoch_secrets.epoch);
-                    }
+            // Pre-initialize channel with epoch secrets (create new ones if not stored)
+            if let Ok(channel_bytes) = hex::decode(&ch.channel_id) {
+                if channel_bytes.len() == 32 {
+                    let mut channel_arr = [0u8; 32];
+                    channel_arr.copy_from_slice(&channel_bytes);
+                    let channel_id_typed = ChannelId::from_bytes(channel_arr);
+                    
+                    // Use stored epoch secrets or generate new ones (for channels created before epoch secrets were saved)
+                    let epoch_secrets = ch.epoch_secrets.clone().unwrap_or_else(|| {
+                        log::info!("Channel {} has no stored epoch secrets, generating new ones", ch.name);
+                        let mut secret_bytes = [0u8; 32];
+                        use rand::RngCore;
+                        rand::thread_rng().fill_bytes(&mut secret_bytes);
+                        crate::nsc_channel::EpochSecrets::initial(&secret_bytes)
+                    });
+                    
+                    // Create channel metadata
+                    let metadata = crate::nsc_channel::ChannelMetadata {
+                        channel_id: channel_id_typed,
+                        name: ch.name.clone(),
+                        topic: ch.topic.clone(),
+                        avatar: None,
+                        created_at: ch.created_at,
+                        version: 1,
+                        creator: peer_id,
+                        admins: if ch.is_owner { vec![peer_id] } else { vec![] },
+                        settings: crate::nsc_channel::ChannelSettings::default(),
+                        signature: [0u8; 64],
+                        previous_hash: None,
+                    };
+                    
+                    // Create the channel with epoch secrets
+                    let channel = crate::nsc_channel::NaisSecureChannel::join(
+                        metadata,
+                        epoch_secrets.clone(),
+                        identity.clone(),
+                        peer_id,
+                    );
+                    
+                    pre_initialized_channels.insert(channel_id_typed, channel);
+                    log::info!("Restored channel {} with epoch {} in channel_manager", ch.name, epoch_secrets.epoch);
                 }
             }
         }
