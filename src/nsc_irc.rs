@@ -70,7 +70,7 @@ pub const PRESENCE_HEARTBEAT: Duration = Duration::from_secs(60);
 pub const PRESENCE_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Maximum CTCP message length (IRC limit is typically ~400-500 chars)
-pub const MAX_CTCP_LENGTH: usize = 512;
+pub const MAX_CTCP_LENGTH: usize = 380; // Safe limit after nick!user@host PRIVMSG target : prefix
 
 // =============================================================================
 // CTCP Message Types
@@ -237,24 +237,32 @@ impl IceMessage {
     }
 }
 
-/// Channel invite message
+/// Channel invite message - uses short field names to fit in IRC CTCP limit
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InviteMessage {
     /// Invite ID
+    #[serde(rename = "i")]
     pub invite_id: String,
     /// Channel ID (hex)
+    #[serde(rename = "c")]
     pub channel_id: String,
     /// Channel name (plaintext for display)
+    #[serde(rename = "n")]
     pub channel_name: String,
     /// Inviter peer ID
+    #[serde(rename = "r")]
     pub inviter: String,
     /// Invitee peer ID (for verification)
+    #[serde(rename = "e")]
     pub invitee: String,
     /// Channel member count
+    #[serde(rename = "m")]
     pub member_count: u32,
     /// Expiry timestamp
+    #[serde(rename = "x")]
     pub expires_at: u64,
     /// Signature over invite
+    #[serde(rename = "s")]
     pub signature: String,
 }
 
@@ -271,7 +279,7 @@ impl InviteMessage {
             use rand::Rng;
             rand::thread_rng()
                 .sample_iter(&Alphanumeric)
-                .take(16)
+                .take(12) // Shorter invite ID
                 .map(char::from)
                 .collect()
         };
@@ -282,12 +290,18 @@ impl InviteMessage {
             .as_secs()
             + 3600; // 1 hour expiry
 
+        // Use truncated hex strings (16 chars = 8 bytes) to fit in IRC CTCP limit
+        // Still unique enough for correlation within IRC context
+        let channel_hex = channel_id.to_hex();
+        let inviter_hex = inviter.to_hex();
+        let invitee_hex = invitee.to_hex();
+        
         Self {
             invite_id,
-            channel_id: channel_id.to_hex(),
-            channel_name: channel_name.to_string(),
-            inviter: inviter.to_hex(),
-            invitee: invitee.to_hex(),
+            channel_id: channel_hex.chars().take(16).collect(),
+            channel_name: channel_name.chars().take(32).collect(), // Limit name length
+            inviter: inviter_hex.chars().take(16).collect(),
+            invitee: invitee_hex.chars().take(16).collect(),
             member_count,
             expires_at,
             signature: String::new(), // Signed after creation
