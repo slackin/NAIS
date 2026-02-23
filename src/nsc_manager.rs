@@ -469,6 +469,9 @@ pub struct NscManager {
     /// Pending probes: nick (lowercase) -> IRC channels we probed them for
     /// This allows us to associate probe responses with the correct IRC channel
     pending_probes: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    /// Nicks for whom we're currently creating an ICE offer (for glare detection)
+    /// This tracks offers in-progress before candidates are gathered
+    ice_offer_in_progress: Arc<RwLock<HashSet<String>>>,
 }
 
 /// Pending ICE session info
@@ -727,6 +730,7 @@ impl NscManager {
             channel_members: Arc::new(RwLock::new(channel_members)),
             left_channels: Arc::new(RwLock::new(storage.left_channels.clone())),
             pending_probes: Arc::new(RwLock::new(HashMap::new())),
+            ice_offer_in_progress: Arc::new(RwLock::new(HashSet::new())),
         };
         
         // Save identity if newly generated
@@ -1465,6 +1469,44 @@ impl NscManager {
         }
         
         log::debug!("Sent heartbeat to {} peers", peers.len());
+        Ok(())
+    }
+    
+    /// Send a heartbeat to a specific peer (used to trigger registration after connecting)
+    pub async fn send_heartbeat_to_peer(&self, peer_id_hex: &str) -> Result<(), String> {
+        let transport_lock = self.transport.read().await;
+        let transport = transport_lock.as_ref()
+            .ok_or("Transport not initialized")?;
+        
+        let seq = {
+            let mut seqs = self.sequence_numbers.write().await;
+            let seq = seqs.entry("__heartbeat__".to_string()).or_insert(0);
+            *seq += 1;
+            *seq
+        };
+        
+        let mut envelope = NscEnvelope::new(
+            MessageType::Heartbeat,
+            self.peer_id.0,
+            [0u8; 32], // No channel for heartbeat
+            seq,
+            Bytes::new(),
+        );
+        envelope.sign(&self.identity);
+        
+        // Parse peer ID
+        let peer_bytes = hex::decode(peer_id_hex).map_err(|_| "Invalid peer ID")?;
+        if peer_bytes.len() != 32 {
+            return Err("Invalid peer ID length".to_string());
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&peer_bytes);
+        let peer_id = PeerId(arr);
+        
+        transport.send(&peer_id, &envelope).await
+            .map_err(|e| format!("Failed to send heartbeat: {}", e))?;
+        
+        log::info!("[NSC_HEARTBEAT] Sent initial heartbeat to peer {}", &peer_id_hex[..16.min(peer_id_hex.len())]);
         Ok(())
     }
     
@@ -2996,6 +3038,17 @@ impl NscManager {
     /// Create an ICE offer to send to a peer
     /// Returns the CTCP message to send
     pub async fn create_ice_offer(&self, target_nick: &str, channel_id: Option<&str>) -> Result<String, String> {
+        let nick_lower = target_nick.to_lowercase();
+        
+        // Check if we're already creating an offer for this peer
+        {
+            let in_progress = self.ice_offer_in_progress.read().await;
+            if in_progress.contains(&nick_lower) {
+                log::info!("[NSC_ICE] Skipping duplicate ICE offer to {} - offer already in progress", target_nick);
+                return Err(format!("ICE offer already in progress for {}", target_nick));
+            }
+        }
+        
         // Check if we already have a pending ICE session with this peer (prevent duplicate sessions)
         {
             let sessions = self.pending_ice_sessions.read().await;
@@ -3005,11 +3058,20 @@ impl NscManager {
             }
         }
         
+        // Mark offer as in progress BEFORE gathering candidates (which can take time)
+        self.ice_offer_in_progress.write().await.insert(nick_lower.clone());
+        
         // Create ICE agent and gather candidates
         let ice_agent = Arc::new(IceAgent::new(true)); // We're controlling (initiator)
         
-        let candidates = ice_agent.gather_candidates().await
-            .map_err(|e| format!("Failed to gather ICE candidates: {}", e))?;
+        let candidates = match ice_agent.gather_candidates().await {
+            Ok(c) => c,
+            Err(e) => {
+                // Clean up on error
+                self.ice_offer_in_progress.write().await.remove(&nick_lower);
+                return Err(format!("Failed to gather ICE candidates: {}", e));
+            }
+        };
         
         let credentials = ice_agent.local_credentials();
         let session_id = IceMessage::generate_session_id();
@@ -3069,6 +3131,9 @@ impl NscManager {
         self.active_ice_agents.write().await.insert(session_id.clone(), ice_agent);
         log::info!("[NSC_ICE] Stored ICE agent for session {} to preserve UPnP mapping", session_id);
         
+        // Clear the "in progress" flag now that session is stored
+        self.ice_offer_in_progress.write().await.remove(&nick_lower);
+        
         // Encode as CTCP
         encode_ctcp(NscCtcpCommand::IceOffer, &ice_msg)
             .map_err(|e| format!("Failed to encode ICE offer: {}", e))
@@ -3077,9 +3142,38 @@ impl NscManager {
     /// Create an ICE answer in response to an offer
     /// Returns the CTCP message to send
     pub async fn create_ice_answer(&self, from_nick: &str, offer: &IceMessage) -> Result<String, String> {
+        let nick_lower = from_nick.to_lowercase();
+        
+        // Check if we're currently creating an offer for this peer (early glare detection)
+        let offer_in_progress = {
+            self.ice_offer_in_progress.read().await.contains(&nick_lower)
+        };
+        
+        // Early glare check during candidate gathering
+        if offer_in_progress {
+            // Use peer_id comparison for tie-breaking
+            let our_peer_id = self.peer_id.to_hex();
+            let our_peer_id_prefix: String = our_peer_id.chars().take(16).collect();
+            
+            log::info!("[NSC_ICE] Glare detected (offer in progress) with {} - our peer_id prefix: {}, their peer_id: {}", 
+                from_nick, our_peer_id_prefix, offer.peer_id);
+            
+            if our_peer_id_prefix < offer.peer_id {
+                // We win the tie-breaker - keep our offer (still being created), ignore theirs
+                log::info!("[NSC_ICE] Glare resolution: Our peer_id is lower - keeping our offer in progress, ignoring their offer");
+                return Err(format!("ICE glare: keeping our offer to {} (lower peer_id wins)", from_nick));
+            } else {
+                // They win - cancel our in-progress offer  
+                log::info!("[NSC_ICE] Glare resolution: Their peer_id is lower - cancelling our offer in progress, accepting theirs");
+                self.ice_offer_in_progress.write().await.remove(&nick_lower);
+                // Fall through to accept their offer
+            }
+        }
+        
         // Check if we already have a pending ICE session with this peer (detect ICE glare)
         {
             let mut sessions = self.pending_ice_sessions.write().await;
+            
             if let Some(existing) = sessions.values().find(|s| s.target_nick.eq_ignore_ascii_case(from_nick) && s.is_initiator) {
                 let existing_session_id = existing.session_id.clone();
                 // ICE glare detected - both sides sent offers simultaneously
@@ -3353,6 +3447,12 @@ impl NscManager {
                         }
                     } else {
                         log::info!("[NSC_ICE] QUIC connection established with {} at {}", target_nick, connect_addr);
+                        
+                        // Send initial heartbeat to trigger peer registration on the other side
+                        if let Err(e) = mgr.send_heartbeat_to_peer(&peer_id_to_use).await {
+                            log::warn!("[NSC_ICE] Failed to send initial heartbeat to {}: {}", target_nick, e);
+                        }
+                        
                         mgr.debug_dump_peer_state().await;
                         
                         // If this was an invite acceptance, send Welcome with epoch secrets
