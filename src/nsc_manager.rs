@@ -2135,6 +2135,19 @@ impl NscManager {
                                 }).await;
                             }
                         }
+                        
+                        // IMPORTANT: Initiate ICE exchange to establish P2P connection with discovered peer
+                        // Without this, we only have metadata but no actual transport connection
+                        log::info!("[NSC_ICE] Initiating ICE exchange with discovered peer {}", from_nick);
+                        match self.create_ice_offer(from_nick, None).await {
+                            Ok(offer_ctcp) => {
+                                log::info!("[NSC_ICE] Created ICE offer for discovered peer {}", from_nick);
+                                return Some(offer_ctcp);
+                            }
+                            Err(e) => {
+                                log::error!("[NSC_ICE] Failed to create ICE offer for {}: {}", from_nick, e);
+                            }
+                        }
                     }
                 }
                 None
