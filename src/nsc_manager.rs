@@ -1136,6 +1136,8 @@ impl NscManager {
     
     /// Connect to a peer by address
     pub async fn connect_to_peer(&self, peer_id_hex: &str, addr: SocketAddr) -> Result<(), String> {
+        log::info!("[NSC_CONNECT] Attempting to connect to peer {} at {}", &peer_id_hex[..16.min(peer_id_hex.len())], addr);
+        
         // Parse peer ID
         let bytes = hex::decode(peer_id_hex)
             .map_err(|_| "Invalid peer ID")?;
@@ -1149,11 +1151,18 @@ impl NscManager {
         // Ensure transport is initialized
         let transport_lock = self.transport.read().await;
         let transport = transport_lock.as_ref()
-            .ok_or("Transport not initialized - call init_transport() first")?;
+            .ok_or_else(|| {
+                log::error!("[NSC_CONNECT] Transport not initialized!");
+                "Transport not initialized - call init_transport() first"
+            })?;
         
         // Connect
+        log::debug!("[NSC_CONNECT] Calling transport.connect...");
         transport.connect(peer_id, addr).await
-            .map_err(|e| format!("Connection failed: {}", e))?;
+            .map_err(|e| {
+                log::error!("[NSC_CONNECT] Connection failed: {}", e);
+                format!("Connection failed: {}", e)
+            })?;
         
         // Store peer address for future use
         self.peer_addresses.write().await.insert(peer_id_hex.to_string(), addr);
@@ -1301,6 +1310,8 @@ impl NscManager {
     /// Send a message to a channel
     /// Returns the message with timestamp for UI display
     pub async fn send_message(&self, channel_id: &str, text: String) -> Result<NscMessage, String> {
+        log::info!("[NSC_SEND] Starting send_message to channel {}...", &channel_id[..8.min(channel_id.len())]);
+        
         // Create the message
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1357,15 +1368,23 @@ impl NscManager {
         let transport_lock = self.transport.read().await;
         if let Some(ref transport) = *transport_lock {
             let connected_peers = transport.connected_peers().await;
+            log::info!("[NSC_SEND] Transport available, {} connected peers", connected_peers.len());
+            
+            if connected_peers.is_empty() {
+                log::warn!("[NSC_SEND] NO CONNECTED PEERS - message will only be stored locally!");
+            }
             
             for peer_id in &connected_peers {
+                log::info!("[NSC_SEND] Attempting to send to peer {}", hex::encode(peer_id.0));
                 target_peers.push(peer_id.clone());
                 if let Err(e) = transport.send(peer_id, &envelope).await {
-                    log::warn!("Failed to send to peer {}: {}", hex::encode(peer_id.0), e);
+                    log::error!("[NSC_SEND] Failed to send to peer {}: {}", hex::encode(peer_id.0), e);
                 } else {
-                    log::debug!("Sent encrypted message to peer {}", hex::encode(peer_id.0));
+                    log::info!("[NSC_SEND] Successfully sent {} bytes to peer {}", envelope.payload.len(), hex::encode(peer_id.0));
                 }
             }
+        } else {
+            log::error!("[NSC_SEND] Transport is NOT initialized! Cannot send messages.");
         }
         
         // Add to retry queue if we have target peers
@@ -1875,13 +1894,14 @@ impl NscManager {
         
         // Spawn background task to accept connections and read messages
         tokio::spawn(async move {
-            log::info!("NSC listener started, waiting for connections...");
+            log::info!("[NSC_LISTENER] Started, waiting for connections...");
             
             loop {
+                log::debug!("[NSC_LISTENER] Waiting to accept next connection...");
                 // Accept incoming connection
                 match transport.accept().await {
                     Ok((connection, addr)) => {
-                        log::info!("Accepted connection from {}", addr);
+                        log::info!("[NSC_LISTENER] Accepted connection from {}", addr);
                         
                         let tx_clone = tx.clone();
                         let our_peer_id = our_peer_id.clone();
@@ -1891,15 +1911,22 @@ impl NscManager {
                         // Spawn task to handle this connection
                         tokio::spawn(async move {
                             let mut peer_registered = false;
+                            log::info!("[NSC_LISTENER] Handler spawned for connection from {}", addr);
                             
                             // Read messages from this connection
                             loop {
+                                log::debug!("[NSC_LISTENER] Waiting for uni stream from {}...", addr);
                                 match connection.accept_uni().await {
                                     Ok(mut recv_stream) => {
+                                        log::debug!("[NSC_LISTENER] Received uni stream, reading envelope...");
                                         match crate::nsc_transport::QuicTransport::receive_from_stream(&mut recv_stream).await {
                                             Ok(envelope) => {
                                                 let sender_hex = hex::encode(&envelope.sender_id);
                                                 let channel_hex = hex::encode(&envelope.channel_id);
+                                                log::info!("[NSC_LISTENER] Received envelope: sender={}, channel={}, payload_len={}", 
+                                                    &sender_hex[..16.min(sender_hex.len())], 
+                                                    &channel_hex[..8.min(channel_hex.len())],
+                                                    envelope.payload.len());
                                                 
                                                 // Register the peer connection on first message
                                                 // This enables bidirectional communication
@@ -1953,13 +1980,16 @@ impl NscManager {
                                                     log::warn!("Failed to persist message: {}", e);
                                                 }
                                                 
+                                                log::info!("[NSC_LISTENER] Delivering message to UI: channel={}, len={}", 
+                                                    &channel_hex[..8.min(channel_hex.len())], msg.text.len());
                                                 if tx_clone.send((channel_hex, msg)).await.is_err() {
-                                                    log::warn!("Message receiver dropped");
+                                                    log::warn!("[NSC_LISTENER] Message receiver dropped - UI not listening!");
                                                     break;
                                                 }
+                                                log::debug!("[NSC_LISTENER] Message delivered successfully");
                                             }
                                             Err(e) => {
-                                                log::warn!("Failed to receive message: {}", e);
+                                                log::warn!("[NSC_LISTENER] Failed to receive/parse message: {}", e);
                                             }
                                         }
                                     }

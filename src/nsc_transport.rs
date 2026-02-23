@@ -647,8 +647,11 @@ impl QuicTransport {
 
     /// Connect to a peer
     pub async fn connect(&self, peer_id: PeerId, addr: SocketAddr) -> TransportResult<()> {
+        log::info!("[QUIC_CONNECT] Connecting to peer {} at {}", peer_id.to_hex()[..16].to_string(), addr);
+        
         // Check if already connected
         if self.connections.read().await.contains_key(&peer_id) {
+            log::debug!("[QUIC_CONNECT] Already connected to {}", peer_id.to_hex());
             return Ok(());
         }
 
@@ -656,17 +659,29 @@ impl QuicTransport {
         let client_config = Self::create_client_config()?;
 
         // Connect
+        log::debug!("[QUIC_CONNECT] Creating outbound connection...");
         let connecting = self
             .endpoint
             .connect_with(client_config, addr, "localhost")
-            .map_err(|e| TransportError::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| {
+                log::error!("[QUIC_CONNECT] connect_with failed: {}", e);
+                TransportError::ConnectionFailed(e.to_string())
+            })?;
 
+        log::debug!("[QUIC_CONNECT] Waiting for connection handshake...");
         let connection = tokio::time::timeout(CONNECTION_TIMEOUT, connecting)
             .await
-            .map_err(|_| TransportError::Timeout)?
-            .map_err(|e| TransportError::ConnectionFailed(e.to_string()))?;
+            .map_err(|_| {
+                log::error!("[QUIC_CONNECT] Connection timed out");
+                TransportError::Timeout
+            })?
+            .map_err(|e| {
+                log::error!("[QUIC_CONNECT] Handshake failed: {}", e);
+                TransportError::ConnectionFailed(e.to_string())
+            })?;
 
         // Store connection
+        log::debug!("[QUIC_CONNECT] Storing connection in map...");
         self.connections.write().await.insert(peer_id, connection);
 
         // Create peer info
@@ -674,7 +689,7 @@ impl QuicTransport {
         peer_conn.mark_connected();
         self.peers.write().await.insert(peer_id, peer_conn);
 
-        log::info!("Connected to peer {} at {}", peer_id, addr);
+        log::info!("[QUIC_CONNECT] Successfully connected to peer {} at {}", peer_id, addr);
 
         Ok(())
     }
@@ -697,27 +712,46 @@ impl QuicTransport {
 
     /// Send message to peer
     pub async fn send(&self, peer_id: &PeerId, envelope: &NscEnvelope) -> TransportResult<()> {
+        log::debug!("[QUIC_SEND] Looking up connection for peer {}", peer_id.to_hex());
         let connections = self.connections.read().await;
+        log::debug!("[QUIC_SEND] Connection map has {} entries", connections.len());
+        
         let connection = connections
             .get(peer_id)
-            .ok_or_else(|| TransportError::PeerNotFound(peer_id.to_hex()))?;
+            .ok_or_else(|| {
+                log::error!("[QUIC_SEND] Peer {} NOT FOUND in connections map!", peer_id.to_hex());
+                TransportError::PeerNotFound(peer_id.to_hex())
+            })?;
 
+        log::debug!("[QUIC_SEND] Opening uni stream to {}", peer_id.to_hex());
         // Open a uni-directional stream for the message
         let mut send_stream = connection
             .open_uni()
             .await
-            .map_err(|e| TransportError::SendFailed(e.to_string()))?;
+            .map_err(|e| {
+                log::error!("[QUIC_SEND] Failed to open stream: {}", e);
+                TransportError::SendFailed(e.to_string())
+            })?;
 
         // Write message
         let data = envelope.to_bytes();
+        log::debug!("[QUIC_SEND] Writing {} bytes to stream", data.len());
         send_stream
             .write_all(&data)
             .await
-            .map_err(|e| TransportError::SendFailed(e.to_string()))?;
+            .map_err(|e| {
+                log::error!("[QUIC_SEND] Failed to write data: {}", e);
+                TransportError::SendFailed(e.to_string())
+            })?;
 
         send_stream
             .finish()
-            .map_err(|e| TransportError::SendFailed(e.to_string()))?;
+            .map_err(|e| {
+                log::error!("[QUIC_SEND] Failed to finish stream: {}", e);
+                TransportError::SendFailed(e.to_string())
+            })?;
+        
+        log::debug!("[QUIC_SEND] Successfully sent to {}", peer_id.to_hex());
 
         // Update peer stats
         drop(connections);
@@ -731,16 +765,22 @@ impl QuicTransport {
 
     /// Receive message from a stream
     pub async fn receive_from_stream(recv: &mut RecvStream) -> TransportResult<NscEnvelope> {
+        log::debug!("[QUIC_RECV] Reading header...");
         // Read header first to get payload length
         let mut header = vec![0u8; HEADER_SIZE - 64]; // Without signature
         recv.read_exact(&mut header)
             .await
-            .map_err(|e| TransportError::ReceiveFailed(e.to_string()))?;
+            .map_err(|e| {
+                log::error!("[QUIC_RECV] Failed to read header: {}", e);
+                TransportError::ReceiveFailed(e.to_string())
+            })?;
 
         // Get payload length from header
         let payload_len = u32::from_be_bytes([header[76], header[77], header[78], header[79]]) as usize;
+        log::debug!("[QUIC_RECV] Header read, payload_len={}", payload_len);
 
         if payload_len > MAX_MESSAGE_SIZE {
+            log::error!("[QUIC_RECV] Payload too large: {}", payload_len);
             return Err(TransportError::InvalidMessage("Payload too large".into()));
         }
 
@@ -748,14 +788,23 @@ impl QuicTransport {
         let mut payload_and_sig = vec![0u8; payload_len + 64];
         recv.read_exact(&mut payload_and_sig)
             .await
-            .map_err(|e| TransportError::ReceiveFailed(e.to_string()))?;
+            .map_err(|e| {
+                log::error!("[QUIC_RECV] Failed to read payload: {}", e);
+                TransportError::ReceiveFailed(e.to_string())
+            })?;
 
+        log::debug!("[QUIC_RECV] Read {} bytes of payload+sig, parsing envelope...", payload_and_sig.len());
+        
         // Combine into full message
         let mut full_message = BytesMut::with_capacity(header.len() + payload_and_sig.len());
         full_message.extend_from_slice(&header);
         full_message.extend_from_slice(&payload_and_sig);
 
-        NscEnvelope::from_bytes(full_message.freeze())
+        let envelope = NscEnvelope::from_bytes(full_message.freeze())?;
+        log::info!("[QUIC_RECV] Successfully parsed envelope, type={:?}, sender={}", 
+            envelope.message_type, 
+            hex::encode(&envelope.sender_id[..8]));
+        Ok(envelope)
     }
 
     /// Disconnect from peer
@@ -781,32 +830,45 @@ impl QuicTransport {
     /// Register an incoming connection (used when accepting connections)
     /// This allows bidirectional communication with peers who connected to us
     pub async fn register_connection(&self, peer_id: PeerId, connection: Connection, addr: SocketAddr) {
+        log::info!("[QUIC_REGISTER] Registering incoming connection from {} at {}", peer_id.to_hex()[..16].to_string(), addr);
+        
         // Check if already registered
         if self.connections.read().await.contains_key(&peer_id) {
-            log::debug!("Peer {} already registered, skipping", peer_id);
+            log::debug!("[QUIC_REGISTER] Peer {} already in connections, skipping", peer_id.to_hex());
             return;
         }
 
         // Store connection
+        log::debug!("[QUIC_REGISTER] Inserting into connections map...");
         self.connections.write().await.insert(peer_id, connection);
 
         // Create peer info
         let mut peer_conn = PeerConnection::new(peer_id, addr);
         peer_conn.mark_connected();
+        log::debug!("[QUIC_REGISTER] Inserting into peers map with state Connected...");
         self.peers.write().await.insert(peer_id, peer_conn);
 
-        log::info!("Registered incoming connection from peer {} at {}", peer_id, addr);
+        let conn_count = self.connections.read().await.len();
+        let peer_count = self.peers.read().await.len();
+        log::info!("[QUIC_REGISTER] Successfully registered peer {}. Total connections: {}, peers: {}", 
+            peer_id.to_hex()[..16].to_string(), conn_count, peer_count);
     }
 
     /// Get all connected peers
     pub async fn connected_peers(&self) -> Vec<PeerId> {
-        self.peers
-            .read()
-            .await
+        let peers = self.peers.read().await;
+        let connected: Vec<PeerId> = peers
             .iter()
             .filter(|(_, p)| p.state == ConnectionState::Connected)
             .map(|(id, _)| *id)
-            .collect()
+            .collect();
+        
+        log::debug!("[QUIC] connected_peers: {} total peers, {} connected", peers.len(), connected.len());
+        for (id, p) in peers.iter() {
+            log::debug!("[QUIC]   Peer {}: state={:?}", id.to_hex()[..16].to_string(), p.state);
+        }
+        
+        connected
     }
 
     /// Close the transport
