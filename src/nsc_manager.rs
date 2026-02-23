@@ -3155,9 +3155,29 @@ impl NscManager {
             // Establish QUIC connection using the discovered address
             let manager = get_nsc_manager();
             let mgr = manager.read().await;
+            
+            // Look up full peer_id by matching the truncated prefix from IceMessage
+            // This is safer than looking up by nick since nicks aren't unique across IRC networks
+            let full_peer_id = {
+                let known = mgr.known_peers.read().await;
+                known.values()
+                    .find(|p| p.peer_id.starts_with(&peer_id))
+                    .map(|p| p.peer_id.clone())
+            };
+            let peer_id_to_use = match full_peer_id {
+                Some(full_id) => {
+                    log::info!("[NSC_ICE] (answerer) Found full peer_id matching prefix {} for {}", &peer_id, target);
+                    full_id
+                }
+                None => {
+                    log::warn!("[NSC_ICE] (answerer) No full peer_id found matching prefix {}, cannot connect", peer_id);
+                    return;
+                }
+            };
+            
             log::info!("[NSC_ICE] (answerer) Attempting QUIC connection to {} at {}", target, addr);
             mgr.debug_dump_peer_state().await;
-            if let Err(e) = mgr.connect_to_peer(&peer_id, addr).await {
+            if let Err(e) = mgr.connect_to_peer(&peer_id_to_use, addr).await {
                 log::error!("[NSC_ICE] (answerer) Failed to establish QUIC connection with {}: {}", target, e);
             } else {
                 log::info!("[NSC_ICE] (answerer) QUIC connection established with {} at {}", target, addr);
@@ -3237,8 +3257,28 @@ impl NscManager {
                     log::info!("[NSC_ICE] Attempting QUIC connection to {} at {}", target_nick, addr);
                     let manager = get_nsc_manager();
                     let mgr = manager.read().await;
+                    
+                    // Look up full peer_id by matching the truncated prefix from IceMessage
+                    // This is safer than looking up by nick since nicks aren't unique across IRC networks
+                    let full_peer_id = {
+                        let known = mgr.known_peers.read().await;
+                        known.values()
+                            .find(|p| p.peer_id.starts_with(&peer_id))
+                            .map(|p| p.peer_id.clone())
+                    };
+                    let peer_id_to_use = match full_peer_id {
+                        Some(full_id) => {
+                            log::info!("[NSC_ICE] Found full peer_id matching prefix {} for {}", &peer_id, target_nick);
+                            full_id
+                        }
+                        None => {
+                            log::warn!("[NSC_ICE] No full peer_id found matching prefix {}, cannot connect", peer_id);
+                            return;
+                        }
+                    };
+                    
                     mgr.debug_dump_peer_state().await;
-                    if let Err(e) = mgr.connect_to_peer(&peer_id, addr).await {
+                    if let Err(e) = mgr.connect_to_peer(&peer_id_to_use, addr).await {
                         log::error!("[NSC_ICE] Failed to establish QUIC connection with {}: {}", target_nick, e);
                         // Try relay fallback
                         if let Err(relay_err) = mgr.connect_via_relay(&peer_id, channel_id.as_deref()).await {
