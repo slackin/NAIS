@@ -1131,12 +1131,12 @@ fn app() -> Element {
                                                 
                                                 if let Some(response) = mgr.handle_nsc_ctcp(&from_nick, &irc_channel, &cmd_str, &args_str, &pname).await {
                                                     log::info!("[UI NSC] Sending response to {}", from_nick);
-                                                    // Send CTCP response via NOTICE
+                                                    // Send NSC CTCP via PRIVMSG/CTCP for better compatibility
                                                     // Note: response already includes CTCP delimiters from encode_ctcp
                                                     if let Some(core) = cores_clone.read().get(&pname) {
-                                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Notice {
+                                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
                                                             target: from_nick.clone(),
-                                                            text: response,
+                                                            message: response,
                                                         });
                                                     }
                                                 }
@@ -1351,7 +1351,7 @@ fn app() -> Element {
                                     
                                     // Join each NSC channel's IRC discovery channel
                                     for channel in channels {
-                                        if !channel.irc_channel.is_empty() {
+                                        if !channel.irc_channel.is_empty() && channel.network == profile_for_nsc {
                                             if let Some(core) = cores.read().get(&profile_for_nsc) {
                                                 log::info!("Auto-rejoining NSC discovery channel: {} for '{}'", 
                                                     channel.irc_channel, channel.name);
@@ -5839,9 +5839,9 @@ fn app() -> Element {
                                                                         // Send CTCP decline to inviter
                                                                         let active = state.read().active_profile.clone();
                                                                         if let Some(core) = cores.read().get(&active) {
-                                                                            let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Notice {
+                                                                            let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Ctcp {
                                                                                 target: target_nick,
-                                                                                text: ctcp_response,
+                                                                                message: ctcp_response,
                                                                             });
                                                                         }
                                                                     }
@@ -5874,9 +5874,9 @@ fn app() -> Element {
                                                                         };
                                                                         if let Some(core) = cores.read().get(&profile_to_use) {
                                                                             // Send the accept response
-                                                                            let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Notice {
+                                                                            let _ = core.cmd_tx.try_send(crate::irc_client::IrcCommandEvent::Ctcp {
                                                                                 target: target_nick.clone(),
-                                                                                text: ctcp_response,
+                                                                                message: ctcp_response,
                                                                             });
                                                                             // Join the IRC discovery channel for peer discovery on the correct network
                                                                             if !irc_channel.is_empty() {
