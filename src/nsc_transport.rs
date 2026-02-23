@@ -654,12 +654,6 @@ impl QuicTransport {
     /// Connect to a peer
     pub async fn connect(&self, peer_id: PeerId, addr: SocketAddr) -> TransportResult<()> {
         log::info!("[QUIC_CONNECT] Connecting to peer {} at {}", peer_id.to_hex()[..16].to_string(), addr);
-        
-        // Check if already connected
-        if self.connections.read().await.contains_key(&peer_id) {
-            log::debug!("[QUIC_CONNECT] Already connected to {}", peer_id.to_hex());
-            return Ok(());
-        }
 
         // Create client config
         let client_config = Self::create_client_config()?;
@@ -686,9 +680,12 @@ impl QuicTransport {
                 TransportError::ConnectionFailed(e.to_string())
             })?;
 
-        // Store connection
+        // Store connection (replace any stale existing connection)
         log::debug!("[QUIC_CONNECT] Storing connection in map...");
-        self.connections.write().await.insert(peer_id, connection);
+        if let Some(old) = self.connections.write().await.insert(peer_id, connection) {
+            log::info!("[QUIC_CONNECT] Replacing existing connection for {}", peer_id.to_hex()[..16].to_string());
+            old.close(0u8.into(), b"replaced");
+        }
 
         // Create peer info
         let mut peer_conn = PeerConnection::new(peer_id, addr);
@@ -847,16 +844,13 @@ impl QuicTransport {
     /// This allows bidirectional communication with peers who connected to us
     pub async fn register_connection(&self, peer_id: PeerId, connection: Connection, addr: SocketAddr) {
         log::info!("[QUIC_REGISTER] Registering incoming connection from {} at {}", peer_id.to_hex()[..16].to_string(), addr);
-        
-        // Check if already registered
-        if self.connections.read().await.contains_key(&peer_id) {
-            log::debug!("[QUIC_REGISTER] Peer {} already in connections, skipping", peer_id.to_hex());
-            return;
-        }
 
-        // Store connection
+        // Store connection (replace stale existing entry if present)
         log::debug!("[QUIC_REGISTER] Inserting into connections map...");
-        self.connections.write().await.insert(peer_id, connection);
+        if let Some(old) = self.connections.write().await.insert(peer_id, connection) {
+            log::info!("[QUIC_REGISTER] Replaced existing connection for {}", peer_id.to_hex()[..16].to_string());
+            old.close(0u8.into(), b"replaced");
+        }
 
         // Create peer info
         let mut peer_conn = PeerConnection::new(peer_id, addr);
