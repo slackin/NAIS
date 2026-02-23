@@ -3072,14 +3072,17 @@ impl NscManager {
         };
         ice_agent.set_remote_credentials(remote_creds).await;
         
+        // Gather our candidates FIRST (before adding remote candidates)
+        // This is critical: add_remote_candidate creates pairs with existing local candidates,
+        // so local candidates must be gathered before adding remote ones
+        let candidates = ice_agent.gather_candidates().await
+            .map_err(|e| format!("Failed to gather ICE candidates: {}", e))?;
+        
         // Add remote candidates from offer (compact format)
+        // Now that local candidates exist, this will properly form candidate pairs
         for candidate in offer.expand_candidates() {
             ice_agent.add_remote_candidate(candidate).await;
         }
-        
-        // Gather our candidates
-        let candidates = ice_agent.gather_candidates().await
-            .map_err(|e| format!("Failed to gather ICE candidates: {}", e))?;
         
         let credentials = ice_agent.local_credentials();
         
