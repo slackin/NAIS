@@ -2996,6 +2996,15 @@ impl NscManager {
     /// Create an ICE offer to send to a peer
     /// Returns the CTCP message to send
     pub async fn create_ice_offer(&self, target_nick: &str, channel_id: Option<&str>) -> Result<String, String> {
+        // Check if we already have a pending ICE session with this peer (prevent duplicate sessions)
+        {
+            let sessions = self.pending_ice_sessions.read().await;
+            if sessions.values().any(|s| s.target_nick.eq_ignore_ascii_case(target_nick)) {
+                log::info!("[NSC_ICE] Skipping duplicate ICE offer to {} - session already exists", target_nick);
+                return Err(format!("ICE session already pending for {}", target_nick));
+            }
+        }
+        
         // Create ICE agent and gather candidates
         let ice_agent = Arc::new(IceAgent::new(true)); // We're controlling (initiator)
         
@@ -3062,6 +3071,19 @@ impl NscManager {
     /// Create an ICE answer in response to an offer
     /// Returns the CTCP message to send
     pub async fn create_ice_answer(&self, from_nick: &str, offer: &IceMessage) -> Result<String, String> {
+        // Check if we already have a pending ICE session with this peer (prevent duplicate sessions from glare)
+        {
+            let sessions = self.pending_ice_sessions.read().await;
+            if let Some(existing) = sessions.values().find(|s| s.target_nick.eq_ignore_ascii_case(from_nick)) {
+                // Already have a session - only allow if this is the same session_id (retransmit)
+                if existing.session_id != offer.session_id {
+                    log::info!("[NSC_ICE] Skipping duplicate ICE answer to {} - session {} already exists (received offer for {})", 
+                        from_nick, existing.session_id, offer.session_id);
+                    return Err(format!("ICE session already pending for {}", from_nick));
+                }
+            }
+        }
+        
         // Create ICE agent (not controlling - we're responding)
         let ice_agent = Arc::new(IceAgent::new(false));
         
