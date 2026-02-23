@@ -2040,6 +2040,26 @@ impl NscManager {
                                                     transport_clone.register_connection(peer_id, connection_for_register.clone(), addr).await;
                                                     peer_registered = true;
                                                     log::info!("Registered incoming peer {} for bidirectional messaging", sender_hex);
+                                                    
+                                                    // Sync epoch secrets for channels we own that this peer is a member of
+                                                    // This handles the answerer side (initiator sends Welcome in complete_ice_exchange)
+                                                    let sender_hex_clone = sender_hex.clone();
+                                                    tokio::spawn(async move {
+                                                        // Small delay to ensure connection is fully ready
+                                                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                                        let manager = get_nsc_manager();
+                                                        let mgr = manager.read().await;
+                                                        match mgr.sync_epoch_secrets_to_peer(&sender_hex_clone).await {
+                                                            Ok(count) => {
+                                                                if count > 0 {
+                                                                    log::info!("[NSC_LISTENER] Synced Welcome secrets to incoming peer {} for {} channels", &sender_hex_clone[..16.min(sender_hex_clone.len())], count);
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                log::warn!("[NSC_LISTENER] Failed to sync Welcome secrets to incoming peer: {}", e);
+                                                            }
+                                                        }
+                                                    });
                                                 }
                                                 
                                                 match envelope.message_type {
@@ -2377,7 +2397,46 @@ impl NscManager {
                     None
                 };
                 
-                // Create ICE offer with channel context
+                // If we already have a QUIC connection to this peer, send Welcome directly
+                // instead of starting a new ICE exchange
+                let peer_full_id = {
+                    let known = self.known_peers.read().await;
+                    known.get(from_nick).map(|p| p.peer_id.clone())
+                };
+                
+                if let Some(ref full_id) = peer_full_id {
+                    let already_connected = {
+                        let transport_lock = self.transport.read().await;
+                        if let Some(transport) = transport_lock.as_ref() {
+                            let peers = transport.connected_peers().await;
+                            peers.iter().any(|p| p.to_hex() == *full_id)
+                        } else {
+                            false
+                        }
+                    };
+                    
+                    if already_connected {
+                        if let Some(ref ch_id) = channel_id {
+                            log::info!("[NSC_ICE] Already connected to {} - sending Welcome for channel {} directly", from_nick, ch_id);
+                            // Add peer as channel member first
+                            self.add_channel_member(ch_id, full_id, false).await;
+                            // Send epoch secrets over existing connection
+                            match self.send_welcome_epoch_secrets(full_id, ch_id).await {
+                                Ok(_) => log::info!("[NSC_ICE] Sent Welcome to {} for channel {} over existing connection", from_nick, ch_id),
+                                Err(e) => log::error!("[NSC_ICE] Failed to send Welcome to {} over existing connection: {}", from_nick, e),
+                            }
+                        } else {
+                            log::info!("[NSC_ICE] Already connected to {} - syncing epoch secrets directly", from_nick);
+                            match self.sync_epoch_secrets_to_peer(full_id).await {
+                                Ok(count) => log::info!("[NSC_ICE] Synced {} channel secrets to {} over existing connection", count, from_nick),
+                                Err(e) => log::error!("[NSC_ICE] Failed to sync secrets to {}: {}", from_nick, e),
+                            }
+                        }
+                        return None;
+                    }
+                }
+                
+                // No existing connection - create ICE offer with channel context
                 match self.create_ice_offer(from_nick, channel_id.as_deref()).await {
                     Ok(offer_ctcp) => {
                         log::info!("Created ICE offer for {}", from_nick);
@@ -3391,10 +3450,11 @@ impl NscManager {
             // Try connectivity check to verify the ICE path works
             if let Err(e) = ice_agent.check_connectivity().await {
                 log::warn!("[NSC_ICE] (answerer) Connectivity check failed for {}: {}", target, e);
-                // Clean up ICE agent on failure
+                // Clean up ICE agent and pending session on failure
                 let manager = get_nsc_manager();
                 let mgr = manager.read().await;
                 mgr.active_ice_agents.write().await.remove(&session_id_for_cleanup);
+                mgr.pending_ice_sessions.write().await.remove(&session_id_for_cleanup);
                 return;
             }
             
@@ -3435,11 +3495,12 @@ impl NscManager {
             // The initiator should connect within a few seconds
             tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
             
-            // Clean up ICE agent after timeout
+            // Clean up ICE agent and pending session after timeout
             let manager = get_nsc_manager();
             let mgr = manager.read().await;
             mgr.active_ice_agents.write().await.remove(&session_id_for_cleanup);
-            log::info!("[NSC_ICE] (answerer) Cleaned up ICE agent for session {}", session_id_for_cleanup);
+            mgr.pending_ice_sessions.write().await.remove(&session_id_for_cleanup);
+            log::info!("[NSC_ICE] (answerer) Cleaned up ICE agent and session for {}", session_id_for_cleanup);
         });
         
         // Encode answer as CTCP
