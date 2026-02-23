@@ -1353,8 +1353,45 @@ fn app() -> Element {
                                             if let Some(core) = cores.read().get(&profile_for_nsc) {
                                                 log::info!("Auto-rejoining NSC discovery channel: {} for '{}'", 
                                                     channel.irc_channel, channel.name);
-                                                let _ = core.cmd_tx.try_send(irc_client::IrcCommandEvent::Join {
-                                                    channel: channel.irc_channel.clone(),
+                                                let cmd_tx = core.cmd_tx.clone();
+                                                let join_channel = channel.irc_channel.clone();
+                                                let profile_for_join = profile_for_nsc.clone();
+                                                spawn(async move {
+                                                    if let Err(e) = cmd_tx.send(irc_client::IrcCommandEvent::Join {
+                                                        channel: join_channel.clone(),
+                                                    }).await {
+                                                        log::error!(
+                                                            "Failed to auto-rejoin NSC discovery channel {} on profile {}: {}",
+                                                            join_channel,
+                                                            profile_for_join,
+                                                            e
+                                                        );
+                                                        return;
+                                                    }
+                                                    log::info!(
+                                                        "Queued auto-rejoin JOIN for NSC discovery channel {} on profile {}",
+                                                        join_channel,
+                                                        profile_for_join
+                                                    );
+
+                                                    // Retry once in case the first JOIN races with post-connect server readiness.
+                                                    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                                                    if let Err(e) = cmd_tx.send(irc_client::IrcCommandEvent::Join {
+                                                        channel: join_channel.clone(),
+                                                    }).await {
+                                                        log::warn!(
+                                                            "NSC auto-rejoin retry failed for channel {} on profile {}: {}",
+                                                            join_channel,
+                                                            profile_for_join,
+                                                            e
+                                                        );
+                                                    } else {
+                                                        log::info!(
+                                                            "Queued NSC auto-rejoin retry JOIN for channel {} on profile {}",
+                                                            join_channel,
+                                                            profile_for_join
+                                                        );
+                                                    }
                                                 });
                                             }
                                         }
