@@ -1311,6 +1311,7 @@ impl NscManager {
     /// Returns the message with timestamp for UI display
     pub async fn send_message(&self, channel_id: &str, text: String) -> Result<NscMessage, String> {
         log::info!("[NSC_SEND] Starting send_message to channel {}...", &channel_id[..8.min(channel_id.len())]);
+        self.debug_dump_peer_state().await;
         
         // Create the message
         let timestamp = SystemTime::now()
@@ -2194,7 +2195,8 @@ impl NscManager {
             }
             NscCtcpCommand::InviteAccept => {
                 // Someone accepted our invite - start ICE exchange
-                log::info!("Invite accepted by {}", from_nick);
+                log::info!("[NSC_ICE] Invite accepted by {} - starting ICE exchange", from_nick);
+                self.debug_dump_peer_state().await;
                 
                 // Decode invite_id from args and look up which channel this was for
                 let channel_id: Option<String> = if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, args) {
@@ -2229,7 +2231,8 @@ impl NscManager {
             }
             NscCtcpCommand::IceOffer => {
                 // Received ICE offer - respond with ICE answer
-                log::info!("Received ICE offer from {}", from_nick);
+                log::info!("[NSC_ICE] Received ICE offer from {}", from_nick);
+                self.debug_dump_peer_state().await;
                 
                 if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, args) {
                     if let Ok(offer) = serde_json::from_slice::<IceMessage>(&decoded) {
@@ -2248,6 +2251,8 @@ impl NscManager {
             }
             NscCtcpCommand::IceAnswer => {
                 // Received ICE answer - complete ICE exchange
+                log::info!("[NSC_ICE] Received ICE answer from {}", from_nick);
+                self.debug_dump_peer_state().await;
                 log::info!("Received ICE answer from {}", from_nick);
                 
                 if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, args) {
@@ -3097,30 +3102,34 @@ impl NscManager {
             // Give a moment for answer to be sent
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             
+            log::info!("[NSC_ICE] (answerer) Starting connectivity check for {}", target);
             // Try connectivity check
             if let Err(e) = ice_agent.check_connectivity().await {
-                log::warn!("ICE connectivity check failed for {}: {}", target, e);
+                log::warn!("[NSC_ICE] (answerer) Connectivity check failed for {}: {}", target, e);
                 return;
             }
             
-            log::info!("ICE connectivity verified with {}", target);
+            log::info!("[NSC_ICE] (answerer) Connectivity verified with {}", target);
             
             // Get selected candidate pair
             let Some(selected) = ice_agent.selected_pair().await else {
-                log::warn!("No selected ICE pair for {}", target);
+                log::warn!("[NSC_ICE] (answerer) No selected ICE pair for {}", target);
                 return;
             };
             
             let addr = selected.remote.address;
-            log::info!("Selected ICE candidate: {} for peer {}", addr, target);
+            log::info!("[NSC_ICE] (answerer) Selected candidate: {} for peer {}", addr, target);
             
             // Establish QUIC connection using the discovered address
             let manager = get_nsc_manager();
             let mgr = manager.read().await;
+            log::info!("[NSC_ICE] (answerer) Attempting QUIC connection to {} at {}", target, addr);
+            mgr.debug_dump_peer_state().await;
             if let Err(e) = mgr.connect_to_peer(&peer_id, addr).await {
-                log::error!("Failed to establish QUIC connection with {}: {}", target, e);
+                log::error!("[NSC_ICE] (answerer) Failed to establish QUIC connection with {}: {}", target, e);
             } else {
-                log::info!("QUIC connection established with {} at {}", target, addr);
+                log::info!("[NSC_ICE] (answerer) QUIC connection established with {} at {}", target, addr);
+                mgr.debug_dump_peer_state().await;
             }
         });
         
@@ -3171,9 +3180,10 @@ impl NscManager {
         let channel_id = session.channel_id.clone();
         
         tokio::spawn(async move {
+            log::info!("[NSC_ICE] Starting connectivity check for {}", target_nick);
             match ice_agent.check_connectivity().await {
                 Ok(_) => {
-                    log::info!("ICE connectivity verified with {}", target_nick);
+                    log::info!("[NSC_ICE] Connectivity verified with {}", target_nick);
                     
                     // Get selected candidate pair
                     let Some(selected) = ice_agent.selected_pair().await else {
@@ -3185,16 +3195,19 @@ impl NscManager {
                     log::info!("Selected ICE candidate: {} for peer {}", addr, target_nick);
                     
                     // Establish QUIC connection using the discovered address
+                    log::info!("[NSC_ICE] Attempting QUIC connection to {} at {}", target_nick, addr);
                     let manager = get_nsc_manager();
                     let mgr = manager.read().await;
+                    mgr.debug_dump_peer_state().await;
                     if let Err(e) = mgr.connect_to_peer(&peer_id, addr).await {
-                        log::error!("Failed to establish QUIC connection with {}: {}", target_nick, e);
+                        log::error!("[NSC_ICE] Failed to establish QUIC connection with {}: {}", target_nick, e);
                         // Try relay fallback
                         if let Err(relay_err) = mgr.connect_via_relay(&peer_id, channel_id.as_deref()).await {
                             log::error!("Relay fallback also failed: {}", relay_err);
                         }
                     } else {
-                        log::info!("QUIC connection established with {} at {}", target_nick, addr);
+                        log::info!("[NSC_ICE] QUIC connection established with {} at {}", target_nick, addr);
+                        mgr.debug_dump_peer_state().await;
                         
                         // If this was an invite acceptance, send Welcome with epoch secrets
                         if let Some(ref ch_id) = channel_id {
@@ -3255,6 +3268,47 @@ impl NscManager {
                 .map(|p| p.nick.clone());
             (peer_id.clone(), nick)
         }).collect()
+    }
+    
+    /// Debug helper: dump current peer connection state
+    pub async fn debug_dump_peer_state(&self) {
+        log::info!("[NSC_DEBUG] ========== PEER STATE DUMP ==========");
+        
+        // Dump peer_addresses
+        let addresses = self.peer_addresses.read().await;
+        log::info!("[NSC_DEBUG] peer_addresses ({} entries):", addresses.len());
+        for (peer_id, addr) in addresses.iter() {
+            log::info!("[NSC_DEBUG]   {} -> {}", &peer_id[..16.min(peer_id.len())], addr);
+        }
+        
+        // Dump known_peers
+        let known = self.known_peers.read().await;
+        log::info!("[NSC_DEBUG] known_peers ({} entries):", known.len());
+        for (nick, peer) in known.iter() {
+            log::info!("[NSC_DEBUG]   {} -> peer_id={}", nick, &peer.peer_id[..16.min(peer.peer_id.len())]);
+        }
+        
+        // Dump pending ICE sessions
+        let ice_sessions = self.pending_ice_sessions.read().await;
+        log::info!("[NSC_DEBUG] pending_ice_sessions ({} entries):", ice_sessions.len());
+        for (id, session) in ice_sessions.iter() {
+            log::info!("[NSC_DEBUG]   {} -> target={}, is_initiator={}, channel={:?}", 
+                id, session.target_nick, session.is_initiator, session.channel_id);
+        }
+        
+        // Dump transport state
+        let transport_lock = self.transport.read().await;
+        if let Some(ref transport) = *transport_lock {
+            let connected = transport.connected_peers().await;
+            log::info!("[NSC_DEBUG] transport.connected_peers ({} entries):", connected.len());
+            for peer in &connected {
+                log::info!("[NSC_DEBUG]   {}", hex::encode(peer.0));
+            }
+        } else {
+            log::info!("[NSC_DEBUG] transport: NOT INITIALIZED");
+        }
+        
+        log::info!("[NSC_DEBUG] ========== END PEER STATE DUMP ==========");
     }
     
     /// Start the inbound message handler - accepts connections and routes messages to UI
