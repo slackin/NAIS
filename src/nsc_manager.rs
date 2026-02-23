@@ -2076,6 +2076,24 @@ impl NscManager {
                                                             &channel_hex[..8.min(channel_hex.len())],
                                                             &sender_hex[..16.min(sender_hex.len())]);
 
+                                                        // Owners are authoritative for channel epoch secrets.
+                                                        // Ignore inbound Welcome updates for channels we own to
+                                                        // avoid accidentally overwriting our local channel key.
+                                                        let is_local_owner = {
+                                                            let manager = get_nsc_manager();
+                                                            let mgr = manager.read().await;
+                                                            let info = mgr.channel_info.read().await;
+                                                            info.get(&channel_hex).map(|c| c.is_owner).unwrap_or(false)
+                                                        };
+                                                        if is_local_owner {
+                                                            log::warn!(
+                                                                "[NSC_LISTENER] Ignoring Welcome for locally-owned channel {} from {}",
+                                                                &channel_hex[..8.min(channel_hex.len())],
+                                                                &sender_hex[..16.min(sender_hex.len())]
+                                                            );
+                                                            continue;
+                                                        }
+
                                                         match serde_json::from_slice::<EpochSecrets>(&envelope.payload) {
                                                             Ok(secrets) => {
                                                                 let channel_id = ChannelId::from_bytes(envelope.channel_id);
@@ -3841,6 +3859,24 @@ impl NscManager {
                                                         let sender_hex = hex::encode(envelope.sender_id);
                                                         log::info!("Received Welcome message with epoch secrets for channel {} from {}", 
                                                             channel_hex, sender_hex);
+
+                                                        // Owners are authoritative for channel epoch secrets.
+                                                        // Ignore inbound Welcome updates for channels we own to
+                                                        // avoid accidentally overwriting our local channel key.
+                                                        let is_local_owner = {
+                                                            let manager = get_nsc_manager();
+                                                            let mgr = manager.read().await;
+                                                            let info = mgr.channel_info.read().await;
+                                                            info.get(&channel_hex).map(|c| c.is_owner).unwrap_or(false)
+                                                        };
+                                                        if is_local_owner {
+                                                            log::warn!(
+                                                                "Ignoring Welcome for locally-owned channel {} from {}",
+                                                                channel_hex,
+                                                                sender_hex
+                                                            );
+                                                            continue;
+                                                        }
                                                         
                                                         // Parse epoch secrets from payload
                                                         use crate::nsc_channel::EpochSecrets;
