@@ -9319,6 +9319,7 @@ const IMPORT_NETWORKS: &[(&str, &str, &str, bool)] = &[
     ("IRCnet", "irc.ircnet.net", "", true),
     ("DALnet", "irc.dalnet.net", "", true),
     ("QuakeNet", "irc.quakenet.org", "", false),
+    ("2600", "irc.2600.net", "", true),
 ];
 
 const APP_STYLES: &str = r#"
