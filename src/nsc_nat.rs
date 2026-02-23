@@ -1125,34 +1125,8 @@ impl IceAgent {
                 pair.remote.address, pair.remote.candidate_type, pair.priority);
         }
         
-        // Start a listener task to respond to incoming STUN requests
-        let listener_socket = socket.clone();
-        let remote_creds = self.remote_credentials.read().await.clone();
-        let listener = tokio::spawn(async move {
-            let mut buf = [0u8; 1024];
-            loop {
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(100), 
-                    listener_socket.recv_from(&mut buf)
-                ).await {
-                    Ok(Ok((len, from))) => {
-                        // Check if this is a STUN binding request
-                        if len >= 20 {
-                            let msg_type = u16::from_be_bytes([buf[0], buf[1]]);
-                            if msg_type == STUN_BINDING_REQUEST {
-                                log::debug!("[ICE] Received STUN request from {}, sending response", from);
-                                // Extract transaction ID and send response
-                                let mut txn_id = [0u8; 12];
-                                txn_id.copy_from_slice(&buf[8..20]);
-                                let response = Self::build_binding_response_static(&txn_id, from);
-                                let _ = listener_socket.send_to(&response, from).await;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        });
+        // No separate listener task - check_pair handles both requests and responses
+        // to avoid race conditions on the shared socket
         
         for pair in pairs.iter() {
             // Skip relay candidates in first pass (try direct first)
@@ -1162,7 +1136,6 @@ impl IceAgent {
 
             log::info!("[ICE] Checking pair: {} -> {}", pair.local.address, pair.remote.address);
             if let Ok(()) = self.check_pair(&socket, &pair).await {
-                listener.abort();
                 *self.state.write().await = IceState::Connected;
                 *self.selected_pair.write().await = Some(pair.clone());
                 log::info!("[ICE] SUCCESS! Selected pair: {} -> {}", pair.local.address, pair.remote.address);
@@ -1177,7 +1150,6 @@ impl IceAgent {
         for pair in pairs {
             if pair.local.candidate_type == CandidateType::Relay {
                 if let Ok(()) = self.check_pair(&socket, &pair).await {
-                    listener.abort();
                     *self.state.write().await = IceState::Connected;
                     *self.selected_pair.write().await = Some(pair.clone());
                     log::info!("[ICE] SUCCESS via relay! Selected pair: {} -> {}", pair.local.address, pair.remote.address);
@@ -1186,13 +1158,13 @@ impl IceAgent {
             }
         }
 
-        listener.abort();
         log::error!("[ICE] All connectivity checks failed!");
         *self.state.write().await = IceState::Failed;
         Err(NatError::IceConnectivityFailed)
     }
 
     /// Check a single candidate pair
+    /// Handles both sending our request AND responding to peer's requests
     async fn check_pair(&self, socket: &TokioUdpSocket, pair: &CandidatePair) -> NatResult<()> {
         let remote_addr = pair.remote.address;
         
@@ -1203,21 +1175,49 @@ impl IceAgent {
         // Send connectivity check
         socket.send_to(&request, remote_addr).await?;
 
-        // Wait for response
+        // Loop receiving until we get our response or timeout
+        // We also respond to incoming STUN requests from the peer
+        let deadline = tokio::time::Instant::now() + ICE_CHECK_TIMEOUT;
         let mut buf = [0u8; 1024];
-        let result = timeout(ICE_CHECK_TIMEOUT, socket.recv_from(&mut buf)).await;
-
-        match result {
-            Ok(Ok((len, from))) => {
-                if from == remote_addr {
-                    // Verify it's a valid STUN response
-                    if Self::verify_stun_response(&buf[..len], &transaction_id) {
-                        return Ok(());
-                    }
-                }
-                Err(NatError::IceConnectivityFailed)
+        
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(NatError::IceConnectivityFailed);
             }
-            _ => Err(NatError::IceConnectivityFailed),
+            
+            let result = timeout(remaining, socket.recv_from(&mut buf)).await;
+            
+            match result {
+                Ok(Ok((len, from))) => {
+                    if len >= 20 {
+                        let msg_type = u16::from_be_bytes([buf[0], buf[1]]);
+                        
+                        if msg_type == STUN_BINDING_REQUEST {
+                            // Received a STUN request from peer - send response
+                            log::debug!("[ICE] Received STUN request from {}, sending response", from);
+                            let mut txn_id = [0u8; 12];
+                            txn_id.copy_from_slice(&buf[8..20]);
+                            let response = Self::build_binding_response_static(&txn_id, from);
+                            let _ = socket.send_to(&response, from).await;
+                            // Continue waiting for our response
+                            continue;
+                        } else if msg_type == STUN_BINDING_RESPONSE {
+                            // Check if this is the response we're waiting for
+                            if from == remote_addr && Self::verify_stun_response(&buf[..len], &transaction_id) {
+                                log::debug!("[ICE] Received valid STUN response from {}", from);
+                                return Ok(());
+                            }
+                            // Wrong transaction or sender - continue waiting
+                            continue;
+                        }
+                    }
+                    // Unknown packet - continue waiting
+                    continue;
+                }
+                Ok(Err(_)) => return Err(NatError::IceConnectivityFailed),
+                Err(_) => return Err(NatError::IceConnectivityFailed), // Timeout
+            }
         }
     }
 
