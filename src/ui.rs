@@ -1406,6 +1406,7 @@ fn app() -> Element {
                                 profile_status,
                                 cores,
                                 skip_reconnect,
+                                show_server_log,
                             );
                         }
                     }
@@ -1663,6 +1664,7 @@ fn app() -> Element {
                                                             profile_status,
                                                             cores,
                                                             skip_reconnect,
+                                                            show_server_log,
                                                         );
                                                     }
                                                     profile_menu_open.set(None);
@@ -1692,39 +1694,37 @@ fn app() -> Element {
                                                 },
                                                 "Edit"
                                             }
-                                            // Server Log toggle (advanced only)
-                                            if *settings_show_advanced.read() {
-                                                button {
-                                                    class: "menu-item",
-                                                    onclick: move |_| {
-                                                        let current = show_server_log.read().get(&prof_name_for_log_toggle).copied().unwrap_or(false);
-                                                        show_server_log.write().insert(prof_name_for_log_toggle.clone(), !current);
-                                                        
-                                                        // If we're turning off the log and currently viewing it, switch to first channel
-                                                        if current {
-                                                            let active = state.read().active_profile.clone();
-                                                            if active == prof_name_for_log_toggle {
-                                                                let should_switch = state.read().servers.get(&active)
-                                                                    .map(|s| s.current_channel == "Server Log")
-                                                                    .unwrap_or(false);
+                                            // Server Log toggle - always available
+                                            button {
+                                                class: "menu-item",
+                                                onclick: move |_| {
+                                                    let current = show_server_log.read().get(&prof_name_for_log_toggle).copied().unwrap_or(false);
+                                                    show_server_log.write().insert(prof_name_for_log_toggle.clone(), !current);
+                                                    
+                                                    // If we're turning off the log and currently viewing it, switch to first channel
+                                                    if current {
+                                                        let active = state.read().active_profile.clone();
+                                                        if active == prof_name_for_log_toggle {
+                                                            let should_switch = state.read().servers.get(&active)
+                                                                .map(|s| s.current_channel == "Server Log")
+                                                                .unwrap_or(false);
+                                                            
+                                                            if should_switch {
+                                                                let first_channel = state.read().servers.get(&active)
+                                                                    .and_then(|s| s.channels.first().cloned())
+                                                                    .unwrap_or_default();
                                                                 
-                                                                if should_switch {
-                                                                    let first_channel = state.read().servers.get(&active)
-                                                                        .and_then(|s| s.channels.first().cloned())
-                                                                        .unwrap_or_default();
-                                                                    
-                                                                    if let Some(server) = state.write().servers.get_mut(&active) {
-                                                                        server.current_channel = first_channel;
-                                                                    }
+                                                                if let Some(server) = state.write().servers.get_mut(&active) {
+                                                                    server.current_channel = first_channel;
                                                                 }
                                                             }
                                                         }
-                                                        profile_menu_open.set(None);
-                                                    },
-                                                    {
-                                                        let is_visible = show_server_log.read().get(&prof_name_for_log_toggle).copied().unwrap_or(false);
-                                                        if is_visible { "Hide Server Log" } else { "Show Server Log" }
                                                     }
+                                                    profile_menu_open.set(None);
+                                                },
+                                                {
+                                                    let is_visible = show_server_log.read().get(&prof_name_for_log_toggle).copied().unwrap_or(false);
+                                                    if is_visible { "Hide Server Log" } else { "Show Server Log" }
                                                 }
                                             }
                                             button {
@@ -1842,13 +1842,13 @@ fn app() -> Element {
                         }
                     }
                     ul {
-                        // Server Log channel - only show if enabled for this profile AND advanced mode is on
+                        // Server Log channel - show if enabled for this profile
+                        // (previously required advanced mode, but now always available)
                         {
                             let active_profile = state.read().active_profile.clone();
                             let log_visible = show_server_log.read().get(&active_profile).copied().unwrap_or(false);
-                            let advanced_on = *settings_show_advanced.read();
                             
-                            if log_visible && advanced_on {
+                            if log_visible {
                                 Some(rsx! {
                                     li {
                                         button {
@@ -8023,12 +8023,16 @@ fn connect_profile(
     mut profile_status: Signal<HashMap<String, ConnectionStatus>>,
     mut cores: Signal<HashMap<String, irc_client::CoreHandle>>,
     mut skip_reconnect: Signal<HashMap<String, bool>>,
+    mut show_server_log: Signal<HashMap<String, bool>>,
 ) {
     let core = irc_client::start_core();
     register_shutdown_handle(&profile_name, core.cmd_tx.clone());
     cores.write().insert(profile_name.clone(), core.clone());
     skip_reconnect.write().insert(profile_name.clone(), false);
     profile_status.write().insert(profile_name.clone(), ConnectionStatus::Connecting);
+    
+    // Auto-enable server log visibility during connection so user can see progress
+    show_server_log.write().insert(profile_name.clone(), true);
 
     let cmd_tx = core.cmd_tx.clone();
     let _ = cmd_tx.try_send(IrcCommandEvent::Connect {
@@ -8042,6 +8046,8 @@ fn connect_profile(
     let mut state_mut = state.write();
     if let Some(server_state) = state_mut.servers.get_mut(&profile_name) {
         server_state.status = ConnectionStatus::Connecting;
+        // Switch to Server Log view to show connection progress
+        server_state.current_channel = "Server Log".to_string();
     }
 }
 

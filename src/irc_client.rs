@@ -6,8 +6,83 @@ use irc::client::prelude::{Client, Command as IrcCommand, Config, Response};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
+use lazy_static::lazy_static;
+
+// Reconnection delay settings to prevent rapid cycling and IRC bans
+const RECONNECT_BASE_DELAY_SECS: u64 = 30;      // Initial delay between reconnection attempts
+const RECONNECT_MAX_DELAY_SECS: u64 = 300;      // Maximum delay (5 minutes)
+const RECONNECT_BACKOFF_MULTIPLIER: f64 = 1.5;  // Each failure multiplies delay by this
+
+/// Global reconnection state tracker - persists across core instances
+#[derive(Debug)]
+struct ReconnectState {
+    last_attempt: Option<Instant>,
+    consecutive_failures: u32,
+}
+
+lazy_static! {
+    static ref RECONNECT_TRACKER: Arc<Mutex<HashMap<String, ReconnectState>>> = 
+        Arc::new(Mutex::new(HashMap::new()));
+}
+
+/// Get the required delay before connecting to this server, returns None if no delay needed
+pub fn get_reconnect_delay(server: &str) -> Option<Duration> {
+    let tracker = RECONNECT_TRACKER.lock().ok()?;
+    let state = tracker.get(server)?;
+    let last_attempt = state.last_attempt?;
+    let elapsed = last_attempt.elapsed();
+    let required_delay = calculate_reconnect_delay(state.consecutive_failures);
+    
+    if elapsed < required_delay {
+        Some(required_delay - elapsed)
+    } else {
+        None
+    }
+}
+
+/// Record a connection attempt for a server
+pub fn record_connection_attempt(server: &str) {
+    if let Ok(mut tracker) = RECONNECT_TRACKER.lock() {
+        let state = tracker.entry(server.to_string()).or_insert(ReconnectState {
+            last_attempt: None,
+            consecutive_failures: 0,
+        });
+        state.last_attempt = Some(Instant::now());
+    }
+}
+
+/// Record a connection failure for a server (increases backoff)
+pub fn record_connection_failure(server: &str) {
+    if let Ok(mut tracker) = RECONNECT_TRACKER.lock() {
+        let state = tracker.entry(server.to_string()).or_insert(ReconnectState {
+            last_attempt: None,
+            consecutive_failures: 0,
+        });
+        state.consecutive_failures += 1;
+        log::info!("[IRC] Connection failure #{} for {}, next delay: {}s", 
+            state.consecutive_failures, server, 
+            calculate_reconnect_delay(state.consecutive_failures).as_secs());
+    }
+}
+
+/// Record a successful connection (resets backoff)
+pub fn record_connection_success(server: &str) {
+    if let Ok(mut tracker) = RECONNECT_TRACKER.lock() {
+        if let Some(state) = tracker.get_mut(server) {
+            state.consecutive_failures = 0;
+        }
+    }
+}
+
+/// Reset reconnection state for a server (e.g., user-initiated disconnect)
+pub fn reset_reconnect_state(server: &str) {
+    if let Ok(mut tracker) = RECONNECT_TRACKER.lock() {
+        tracker.remove(server);
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionStatus {
@@ -434,14 +509,29 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent, enable_lo
         }
         IrcEvent::System { channel, text } => {
             // Log connection-related and IRC protocol messages to connection log
-            if text.contains("error") || text.contains("Error") || 
-               text.contains("Connection") || text.contains("TLS") || 
-               text.contains("Stream") || text.starts_with("[IRC]") {
+            // All messages with these prefixes go to the server log
+            let is_connection_message = text.starts_with("[IRC]") ||
+                text.starts_with("[CONN]") ||
+                text.starts_with("[DNS]") ||
+                text.starts_with("[TCP]") ||
+                text.starts_with("[TLS]") ||
+                text.starts_with("[ERROR]") ||
+                text.starts_with("[SERVER ERROR]") ||
+                text.starts_with("═══") ||
+                text.starts_with("[RPL_") ||
+                text.starts_with("[ERR_") ||
+                text.contains("error") || 
+                text.contains("Error") || 
+                text.contains("Connection") ||
+                text.contains("Stream");
+            
+            if is_connection_message {
                 state.connection_log.push(text.clone());
             }
             
-            // Only add to channel messages if it's NOT an IRC protocol message
-            if !text.starts_with("[IRC]") {
+            // Only add to channel messages if it's NOT a connection/protocol message
+            // These belong in the Server Log, not in channel views
+            if !is_connection_message {
                 state.messages.push(ChatMessage {
                     id: next_message_id(),
                     channel,
@@ -531,6 +621,7 @@ pub fn start_core() -> CoreHandle {
 
 async fn core_loop(cmd_rx: Receiver<IrcCommandEvent>, evt_tx: Sender<IrcEvent>) -> Result<(), Box<dyn Error>> {
     let command_rx = cmd_rx;
+    
     loop {
         let Some(command) = command_rx.recv().await.ok() else {
             break;
@@ -543,6 +634,20 @@ async fn core_loop(cmd_rx: Receiver<IrcCommandEvent>, evt_tx: Sender<IrcEvent>) 
                 use_tls,
                 hide_host,
             } => {
+                // Check global reconnection tracker for required delay
+                if let Some(wait_time) = get_reconnect_delay(&server) {
+                    let _ = evt_tx
+                        .send(IrcEvent::System {
+                            channel: channel.clone(),
+                            text: format!("Waiting {:.0} seconds before reconnecting to avoid rate limiting...", wait_time.as_secs_f64()),
+                        })
+                        .await;
+                    tokio::time::sleep(wait_time).await;
+                }
+                
+                // Record this connection attempt
+                record_connection_attempt(&server);
+                
                 if let Err(error) = handle_connection(
                     &server,
                     &nickname,
@@ -554,6 +659,8 @@ async fn core_loop(cmd_rx: Receiver<IrcCommandEvent>, evt_tx: Sender<IrcEvent>) 
                 )
                 .await
                 {
+                    // Record the failure (increases backoff for next attempt)
+                    record_connection_failure(&server);
                     let _ = evt_tx
                         .send(IrcEvent::System {
                             channel: channel.clone(),
@@ -561,6 +668,9 @@ async fn core_loop(cmd_rx: Receiver<IrcCommandEvent>, evt_tx: Sender<IrcEvent>) 
                         })
                         .await;
                     let _ = evt_tx.send(IrcEvent::Disconnected).await;
+                } else {
+                    // Connection ended (user disconnected or server closed after being connected)
+                    // Success is recorded in handle_connection when we get Connected event
                 }
             }
             IrcCommandEvent::Disconnect => {
@@ -577,6 +687,17 @@ async fn core_loop(cmd_rx: Receiver<IrcCommandEvent>, evt_tx: Sender<IrcEvent>) 
         }
     }
     Ok(())
+}
+
+/// Calculate reconnection delay with exponential backoff
+fn calculate_reconnect_delay(consecutive_failures: u32) -> Duration {
+    if consecutive_failures == 0 {
+        return Duration::from_secs(RECONNECT_BASE_DELAY_SECS);
+    }
+    
+    let multiplier = RECONNECT_BACKOFF_MULTIPLIER.powi(consecutive_failures as i32);
+    let delay_secs = (RECONNECT_BASE_DELAY_SECS as f64 * multiplier).min(RECONNECT_MAX_DELAY_SECS as f64);
+    Duration::from_secs(delay_secs as u64)
 }
 
 /// Check if a message is a CTCP message (starts and ends with \x01)
@@ -669,15 +790,91 @@ async fn handle_connection(
     
     // Determine port and log connection type
     let port = if use_tls { 6697 } else { 6667 };
-    let connection_type = if use_tls { "with TLS" } else { "without TLS (plaintext)" };
+    let connection_type = if use_tls { "TLS/SSL encrypted" } else { "plaintext (no encryption)" };
     
-    // Log connection attempt
+    // Log connection attempt with detailed info
     let _ = evt_tx
         .send(IrcEvent::System {
             channel: channel.to_string(),
-            text: format!("[IRC] Configuring connection to {}:{} {}", server, port, connection_type),
+            text: format!("═══ Connection to {} ═══", server),
         })
         .await;
+    
+    let _ = evt_tx
+        .send(IrcEvent::System {
+            channel: channel.to_string(),
+            text: format!("[CONN] Target: {}:{}", server, port),
+        })
+        .await;
+    
+    let _ = evt_tx
+        .send(IrcEvent::System {
+            channel: channel.to_string(),
+            text: format!("[CONN] Security: {}", connection_type),
+        })
+        .await;
+    
+    let _ = evt_tx
+        .send(IrcEvent::System {
+            channel: channel.to_string(),
+            text: format!("[CONN] Nickname: {} (with {} fallbacks)", nickname, fallback_nicks.len()),
+        })
+        .await;
+    
+    let _ = evt_tx
+        .send(IrcEvent::System {
+            channel: channel.to_string(),
+            text: format!("[CONN] Hide hostname: {}", if hide_host { "yes" } else { "no" }),
+        })
+        .await;
+    
+    // DNS resolution logging
+    let _ = evt_tx
+        .send(IrcEvent::System {
+            channel: channel.to_string(),
+            text: format!("[DNS] Resolving {}...", server),
+        })
+        .await;
+    
+    // Try to resolve DNS to show the user what's happening
+    let dns_start = Instant::now();
+    match tokio::net::lookup_host(format!("{}:{}", server, port)).await {
+        Ok(addrs) => {
+            let addrs: Vec<_> = addrs.collect();
+            let dns_time = dns_start.elapsed();
+            let _ = evt_tx
+                .send(IrcEvent::System {
+                    channel: channel.to_string(),
+                    text: format!("[DNS] Resolved to {} address(es) in {:?}", addrs.len(), dns_time),
+                })
+                .await;
+            for (i, addr) in addrs.iter().take(3).enumerate() {
+                let _ = evt_tx
+                    .send(IrcEvent::System {
+                        channel: channel.to_string(),
+                        text: format!("[DNS]   #{}: {}", i + 1, addr),
+                    })
+                    .await;
+            }
+            if addrs.len() > 3 {
+                let _ = evt_tx
+                    .send(IrcEvent::System {
+                        channel: channel.to_string(),
+                        text: format!("[DNS]   ... and {} more", addrs.len() - 3),
+                    })
+                    .await;
+            }
+        }
+        Err(e) => {
+            let _ = evt_tx
+                .send(IrcEvent::System {
+                    channel: channel.to_string(),
+                    text: format!("[DNS] Resolution failed: {}", e),
+                })
+                .await;
+            // Continue anyway - the IRC library will try to connect
+        }
+    }
     
     let mut config = Config::default();
     config.server = Some(server.to_string());
@@ -685,6 +882,8 @@ async fn handle_connection(
     config.alt_nicks = fallback_nicks.clone(); // Use library's built-in nick rollover
     config.port = Some(port);
     config.use_tls = Some(use_tls);
+    // Accept expired/invalid certificates (some IRC servers have expired certs)
+    config.dangerously_accept_invalid_certs = Some(true);
     // Set very long PING timeouts (in seconds) instead of None
     config.ping_time = Some(300); // Send PING every 5 minutes
     config.ping_timeout = Some(600); // Timeout after 10 minutes
@@ -697,16 +896,100 @@ async fn handle_connection(
     let _ = evt_tx
         .send(IrcEvent::System {
             channel: channel.to_string(),
-            text: format!("[IRC] Attempting {} connection to {}:{}...", if use_tls { "TLS" } else { "plaintext" }, server, port),
+            text: format!("[TCP] Connecting to {}:{}...", server, port),
         })
         .await;
 
-    let mut client = Client::from_config(config).await?;
+    let connect_start = Instant::now();
+    let client_result = Client::from_config(config).await;
+    let connect_time = connect_start.elapsed();
+    
+    let mut client = match client_result {
+        Ok(c) => {
+            let _ = evt_tx
+                .send(IrcEvent::System {
+                    channel: channel.to_string(),
+                    text: format!("[TCP] Connected in {:?}", connect_time),
+                })
+                .await;
+            if use_tls {
+                let _ = evt_tx
+                    .send(IrcEvent::System {
+                        channel: channel.to_string(),
+                        text: "[TLS] Secure connection established".to_string(),
+                    })
+                    .await;
+            }
+            c
+        }
+        Err(e) => {
+            let _ = evt_tx
+                .send(IrcEvent::System {
+                    channel: channel.to_string(),
+                    text: format!("[TCP] Connection FAILED after {:?}: {}", connect_time, e),
+                })
+                .await;
+            
+            // Log the full error chain for debugging
+            let mut error_chain = format!("{}", e);
+            let mut source = e.source();
+            while let Some(s) = source {
+                error_chain.push_str(&format!(" -> {}", s));
+                source = s.source();
+            }
+            let _ = evt_tx
+                .send(IrcEvent::System {
+                    channel: channel.to_string(),
+                    text: format!("[DEBUG] Error chain: {}", error_chain),
+                })
+                .await;
+            
+            // Provide more helpful error messages
+            let error_str = error_chain;
+            if error_str.contains("certificate") || error_str.contains("tls") || error_str.contains("ssl") {
+                let _ = evt_tx
+                    .send(IrcEvent::System {
+                        channel: channel.to_string(),
+                        text: "[TLS] Certificate/TLS error - the server may not support TLS on this port".to_string(),
+                    })
+                    .await;
+                let _ = evt_tx
+                    .send(IrcEvent::System {
+                        channel: channel.to_string(),
+                        text: "[TLS] Try: 1) Disable TLS in profile settings, or 2) Use port 6667".to_string(),
+                    })
+                    .await;
+            } else if error_str.contains("refused") {
+                let _ = evt_tx
+                    .send(IrcEvent::System {
+                        channel: channel.to_string(),
+                        text: format!("[TCP] Connection refused - server may be down or port {} blocked", port),
+                    })
+                    .await;
+            } else if error_str.contains("timeout") || error_str.contains("timed out") {
+                let _ = evt_tx
+                    .send(IrcEvent::System {
+                        channel: channel.to_string(),
+                        text: "[TCP] Connection timed out - server unreachable or firewall blocking".to_string(),
+                    })
+                    .await;
+            } else if error_str.contains("reset") {
+                let _ = evt_tx
+                    .send(IrcEvent::System {
+                        channel: channel.to_string(),
+                        text: "[TCP] Connection reset by server - may be banned or rate-limited".to_string(),
+                    })
+                    .await;
+            }
+            
+            return Err(Box::new(e));
+        }
+    };
     
     let _ = evt_tx
         .send(IrcEvent::System {
             channel: channel.to_string(),
-            text: format!("[IRC] {} connection established, getting message stream", if use_tls { "TCP/TLS" } else { "TCP" }),
+            text: "[IRC] Getting message stream...".to_string(),
         })
         .await;
     
@@ -715,17 +998,27 @@ async fn handle_connection(
     let _ = evt_tx
         .send(IrcEvent::System {
             channel: channel.to_string(),
-            text: format!("[IRC] Sending identification"),
+            text: format!("[IRC] Sending registration: NICK {} / USER {}", nickname, nickname),
         })
         .await;
     
     client.identify()?;
+    
+    let _ = evt_tx
+        .send(IrcEvent::System {
+            channel: channel.to_string(),
+            text: "[IRC] Waiting for server response...".to_string(),
+        })
+        .await;
 
     evt_tx
         .send(IrcEvent::Connected {
             server: server.to_string(),
         })
         .await?;
+
+    // Successfully connected - reset the reconnection backoff
+    record_connection_success(server);
 
     let mut consecutive_errors = 0;
     const MAX_CONSECUTIVE_ERRORS: u32 = 10;
@@ -920,6 +1213,8 @@ async fn handle_connection(
                             })
                             .await;
                         let _ = client.send_quit(quit_msg);
+                        // User-initiated quit - reset reconnection backoff
+                        reset_reconnect_state(server);
                         let _ = evt_tx.send(IrcEvent::Disconnected).await;
                         break;
                     }
@@ -940,6 +1235,8 @@ async fn handle_connection(
                             })
                             .await;
                         let _ = client.send_quit("NAIS-client");
+                        // User-initiated disconnect - reset reconnection backoff
+                        reset_reconnect_state(server);
                         let _ = evt_tx.send(IrcEvent::Disconnected).await;
                         break;
                     }
@@ -1662,6 +1959,98 @@ async fn handle_connection(
                     IrcCommand::Response(Response::RPL_LISTEND, _) => {
                         let _ = evt_tx.send(IrcEvent::ChannelListEnd).await;
                     }
+                    IrcCommand::Response(Response::RPL_WELCOME, ref args) => {
+                        // 001 - Welcome message, registration successful
+                        let welcome_msg = args.get(1).cloned().unwrap_or_default();
+                        let _ = evt_tx
+                            .send(IrcEvent::System {
+                                channel: default_channel.clone(),
+                                text: format!("[IRC] ✓ Registration successful: {}", welcome_msg),
+                            })
+                            .await;
+                    }
+                    IrcCommand::Response(Response::RPL_YOURHOST, ref args) => {
+                        // 002 - Your host is...
+                        let host_msg = args.get(1).cloned().unwrap_or_default();
+                        let _ = evt_tx
+                            .send(IrcEvent::System {
+                                channel: default_channel.clone(),
+                                text: format!("[IRC] Server: {}", host_msg),
+                            })
+                            .await;
+                    }
+                    IrcCommand::Response(Response::RPL_CREATED, ref args) => {
+                        // 003 - Server created...
+                        let created_msg = args.get(1).cloned().unwrap_or_default();
+                        let _ = evt_tx
+                            .send(IrcEvent::System {
+                                channel: default_channel.clone(),
+                                text: format!("[IRC] {}", created_msg),
+                            })
+                            .await;
+                    }
+                    IrcCommand::Response(Response::RPL_MYINFO, ref args) => {
+                        // 004 - Server info
+                        if args.len() > 2 {
+                            let server_name = args.get(1).cloned().unwrap_or_default();
+                            let server_ver = args.get(2).cloned().unwrap_or_default();
+                            let _ = evt_tx
+                                .send(IrcEvent::System {
+                                    channel: default_channel.clone(),
+                                    text: format!("[IRC] Software: {} {}", server_name, server_ver),
+                                })
+                                .await;
+                        }
+                    }
+                    IrcCommand::Response(Response::ERR_BADCHANNELKEY, ref args) => {
+                        // 475 - Bad channel key (password required)
+                        let channel_name = args.get(1).cloned().unwrap_or_default();
+                        let _ = evt_tx
+                            .send(IrcEvent::System {
+                                channel: default_channel.clone(),
+                                text: format!("[ERROR] Cannot join {}: Channel requires a password", channel_name),
+                            })
+                            .await;
+                    }
+                    IrcCommand::Response(Response::ERR_NOSUCHCHANNEL, ref args) => {
+                        // 403 - No such channel
+                        let channel_name = args.get(1).cloned().unwrap_or_default();
+                        let _ = evt_tx
+                            .send(IrcEvent::System {
+                                channel: default_channel.clone(),
+                                text: format!("[ERROR] No such channel: {}", channel_name),
+                            })
+                            .await;
+                    }
+                    IrcCommand::Response(Response::ERR_NOTREGISTERED, _) => {
+                        // 451 - Not registered yet
+                        let _ = evt_tx
+                            .send(IrcEvent::System {
+                                channel: default_channel.clone(),
+                                text: "[ERROR] Server says: Not registered yet. Waiting...".to_string(),
+                            })
+                            .await;
+                    }
+                    IrcCommand::Response(Response::ERR_INVITEONLYCHAN, ref args) => {
+                        // 473 - Invite only channel
+                        let channel_name = args.get(1).cloned().unwrap_or_default();
+                        let _ = evt_tx
+                            .send(IrcEvent::System {
+                                channel: default_channel.clone(),
+                                text: format!("[ERROR] Cannot join {}: Channel is invite-only", channel_name),
+                            })
+                            .await;
+                    }
+                    IrcCommand::Response(Response::ERR_CHANNELISFULL, ref args) => {
+                        // 471 - Channel is full
+                        let channel_name = args.get(1).cloned().unwrap_or_default();
+                        let _ = evt_tx
+                            .send(IrcEvent::System {
+                                channel: default_channel.clone(),
+                                text: format!("[ERROR] Cannot join {}: Channel is full", channel_name),
+                            })
+                            .await;
+                    }
                     IrcCommand::Response(Response::ERR_NICKNAMEINUSE, ref args) => {
                         // Nickname is already in use - library handles rollover via alt_nicks
                         // Just inform the user about the rollover
@@ -1680,6 +2069,28 @@ async fn handle_connection(
                                 .send(IrcEvent::System {
                                     channel: default_channel.clone(),
                                     text: format!("[IRC] All nicknames in use. You may need to manually change your nickname with /nick."),
+                                })
+                                .await;
+                        }
+                    }
+                    IrcCommand::ERROR(ref msg) => {
+                        // Server ERROR message
+                        let _ = evt_tx
+                            .send(IrcEvent::System {
+                                channel: default_channel.clone(),
+                                text: format!("[SERVER ERROR] {}", msg),
+                            })
+                            .await;
+                    }
+                    IrcCommand::Response(ref resp, ref args) => {
+                        // Catch-all for other numeric responses - shows all server messages
+                        let code = format!("{:?}", resp);
+                        let msg = args.iter().skip(1).cloned().collect::<Vec<_>>().join(" ");
+                        if !msg.is_empty() {
+                            let _ = evt_tx
+                                .send(IrcEvent::System {
+                                    channel: default_channel.clone(),
+                                    text: format!("[{}] {}", code, msg),
                                 })
                                 .await;
                         }

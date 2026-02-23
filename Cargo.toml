@@ -15,7 +15,7 @@ mobile = ["dioxus/mobile"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "net"] }
-irc = "0.15"
+irc = { version = "1.1", default-features = false, features = ["ctcp", "tls-native", "toml_config"] }
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"
