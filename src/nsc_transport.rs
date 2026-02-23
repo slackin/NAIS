@@ -778,6 +778,26 @@ impl QuicTransport {
         self.peers.read().await.get(peer_id).cloned()
     }
 
+    /// Register an incoming connection (used when accepting connections)
+    /// This allows bidirectional communication with peers who connected to us
+    pub async fn register_connection(&self, peer_id: PeerId, connection: Connection, addr: SocketAddr) {
+        // Check if already registered
+        if self.connections.read().await.contains_key(&peer_id) {
+            log::debug!("Peer {} already registered, skipping", peer_id);
+            return;
+        }
+
+        // Store connection
+        self.connections.write().await.insert(peer_id, connection);
+
+        // Create peer info
+        let mut peer_conn = PeerConnection::new(peer_id, addr);
+        peer_conn.mark_connected();
+        self.peers.write().await.insert(peer_id, peer_conn);
+
+        log::info!("Registered incoming connection from peer {} at {}", peer_id, addr);
+    }
+
     /// Get all connected peers
     pub async fn connected_peers(&self) -> Vec<PeerId> {
         self.peers

@@ -1885,9 +1885,13 @@ impl NscManager {
                         
                         let tx_clone = tx.clone();
                         let our_peer_id = our_peer_id.clone();
+                        let transport_clone = transport.clone();
+                        let connection_for_register = connection.clone();
                         
                         // Spawn task to handle this connection
                         tokio::spawn(async move {
+                            let mut peer_registered = false;
+                            
                             // Read messages from this connection
                             loop {
                                 match connection.accept_uni().await {
@@ -1896,6 +1900,15 @@ impl NscManager {
                                             Ok(envelope) => {
                                                 let sender_hex = hex::encode(&envelope.sender_id);
                                                 let channel_hex = hex::encode(&envelope.channel_id);
+                                                
+                                                // Register the peer connection on first message
+                                                // This enables bidirectional communication
+                                                if !peer_registered {
+                                                    let peer_id = crate::nsc_transport::PeerId(envelope.sender_id);
+                                                    transport_clone.register_connection(peer_id, connection_for_register.clone(), addr).await;
+                                                    peer_registered = true;
+                                                    log::info!("Registered incoming peer {} for bidirectional messaging", sender_hex);
+                                                }
                                                 
                                                 // Decrypt message using channel's group key
                                                 let channel_id = ChannelId::from_bytes(envelope.channel_id);
