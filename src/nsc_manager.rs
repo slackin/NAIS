@@ -1973,56 +1973,104 @@ impl NscManager {
                                                     log::info!("Registered incoming peer {} for bidirectional messaging", sender_hex);
                                                 }
                                                 
-                                                // Decrypt message using channel's group key
-                                                let channel_id = ChannelId::from_bytes(envelope.channel_id);
-                                                
-                                                let text = {
-                                                    let manager = get_nsc_manager();
-                                                    let mgr = manager.read().await;
-                                                    match mgr.channel_manager.decrypt_for_channel(&channel_id, &envelope.payload).await {
-                                                        Ok(plaintext) => String::from_utf8_lossy(&plaintext).to_string(),
-                                                        Err(e) => {
-                                                            log::warn!("Decryption failed for channel {}: {}", channel_hex, e);
-                                                            // Fall back to raw data (for backwards compat)
-                                                            String::from_utf8_lossy(&envelope.payload).to_string()
+                                                match envelope.message_type {
+                                                    MessageType::Welcome => {
+                                                        use crate::nsc_channel::EpochSecrets;
+
+                                                        log::info!("[NSC_LISTENER] Processing Welcome for channel {} from {}",
+                                                            &channel_hex[..8.min(channel_hex.len())],
+                                                            &sender_hex[..16.min(sender_hex.len())]);
+
+                                                        match serde_json::from_slice::<EpochSecrets>(&envelope.payload) {
+                                                            Ok(secrets) => {
+                                                                let channel_id = ChannelId::from_bytes(envelope.channel_id);
+                                                                let manager = get_nsc_manager();
+                                                                let mgr = manager.read().await;
+
+                                                                let name = {
+                                                                    let info = mgr.channel_info.read().await;
+                                                                    info.get(&channel_hex)
+                                                                        .map(|i| i.name.clone())
+                                                                        .unwrap_or_else(|| "Unknown".to_string())
+                                                                };
+
+                                                                match mgr.channel_manager
+                                                                    .join_channel_with_secrets(&channel_id, name, secrets)
+                                                                    .await
+                                                                {
+                                                                    Ok(_) => {
+                                                                        log::info!("[NSC_LISTENER] Stored Welcome epoch secrets for channel {}",
+                                                                            &channel_hex[..8.min(channel_hex.len())]);
+                                                                        mgr.add_channel_member(&channel_hex, &sender_hex, true).await;
+                                                                        let our_full_peer_id = hex::encode(mgr.peer_id.0);
+                                                                        mgr.add_channel_member(&channel_hex, &our_full_peer_id, false).await;
+                                                                    }
+                                                                    Err(e) => {
+                                                                        log::error!("[NSC_LISTENER] Failed to store Welcome secrets: {:?}", e);
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                log::error!("[NSC_LISTENER] Failed to parse Welcome payload: {}", e);
+                                                            }
                                                         }
                                                     }
-                                                };
-                                                
-                                                let timestamp = envelope.timestamp / 1000; // Convert ms to seconds
-                                                let sender_short = if sender_hex.len() >= 16 {
-                                                    sender_hex[..16].to_string()
-                                                } else {
-                                                    sender_hex.clone()
-                                                };
-                                                
-                                                let is_own = sender_hex == our_peer_id;
-                                                
-                                                let msg = NscMessage {
-                                                    timestamp,
-                                                    sender: sender_short.clone(),
-                                                    text: text.clone(),
-                                                    is_own,
-                                                };
-                                                
-                                                // Persist message to storage
-                                                let stored = StoredMessage {
-                                                    timestamp,
-                                                    sender: sender_short,
-                                                    text,
-                                                    is_own,
-                                                };
-                                                if let Err(e) = save_message(&channel_hex, &stored) {
-                                                    log::warn!("Failed to persist message: {}", e);
+                                                    MessageType::ChannelMessage | MessageType::ChannelAction => {
+                                                        // Decrypt message using channel's group key
+                                                        let channel_id = ChannelId::from_bytes(envelope.channel_id);
+
+                                                        let text = {
+                                                            let manager = get_nsc_manager();
+                                                            let mgr = manager.read().await;
+                                                            match mgr.channel_manager.decrypt_for_channel(&channel_id, &envelope.payload).await {
+                                                                Ok(plaintext) => String::from_utf8_lossy(&plaintext).to_string(),
+                                                                Err(e) => {
+                                                                    log::warn!("Decryption failed for channel {}: {}", channel_hex, e);
+                                                                    // Fall back to raw data (for backwards compat)
+                                                                    String::from_utf8_lossy(&envelope.payload).to_string()
+                                                                }
+                                                            }
+                                                        };
+
+                                                        let timestamp = envelope.timestamp / 1000; // Convert ms to seconds
+                                                        let sender_short = if sender_hex.len() >= 16 {
+                                                            sender_hex[..16].to_string()
+                                                        } else {
+                                                            sender_hex.clone()
+                                                        };
+
+                                                        let is_own = sender_hex == our_peer_id;
+
+                                                        let msg = NscMessage {
+                                                            timestamp,
+                                                            sender: sender_short.clone(),
+                                                            text: text.clone(),
+                                                            is_own,
+                                                        };
+
+                                                        // Persist message to storage
+                                                        let stored = StoredMessage {
+                                                            timestamp,
+                                                            sender: sender_short,
+                                                            text,
+                                                            is_own,
+                                                        };
+                                                        if let Err(e) = save_message(&channel_hex, &stored) {
+                                                            log::warn!("Failed to persist message: {}", e);
+                                                        }
+
+                                                        log::info!("[NSC_LISTENER] Delivering message to UI: channel={}, len={}",
+                                                            &channel_hex[..8.min(channel_hex.len())], msg.text.len());
+                                                        if tx_clone.send((channel_hex, msg)).await.is_err() {
+                                                            log::warn!("[NSC_LISTENER] Message receiver dropped - UI not listening!");
+                                                            break;
+                                                        }
+                                                        log::debug!("[NSC_LISTENER] Message delivered successfully");
+                                                    }
+                                                    _ => {
+                                                        log::debug!("[NSC_LISTENER] Ignoring envelope type {:?}", envelope.message_type);
+                                                    }
                                                 }
-                                                
-                                                log::info!("[NSC_LISTENER] Delivering message to UI: channel={}, len={}", 
-                                                    &channel_hex[..8.min(channel_hex.len())], msg.text.len());
-                                                if tx_clone.send((channel_hex, msg)).await.is_err() {
-                                                    log::warn!("[NSC_LISTENER] Message receiver dropped - UI not listening!");
-                                                    break;
-                                                }
-                                                log::debug!("[NSC_LISTENER] Message delivered successfully");
                                             }
                                             Err(e) => {
                                                 log::warn!("[NSC_LISTENER] Failed to receive/parse message: {}", e);
@@ -3428,7 +3476,7 @@ impl NscManager {
                     if let Err(e) = mgr.connect_to_peer(&peer_id_to_use, connect_addr).await {
                         log::error!("[NSC_ICE] Failed to establish QUIC connection with {}: {}", target_nick, e);
                         // Try relay fallback
-                        if let Err(relay_err) = mgr.connect_via_relay(&peer_id, channel_id.as_deref()).await {
+                        if let Err(relay_err) = mgr.connect_via_relay(&peer_id_to_use, channel_id.as_deref()).await {
                             log::error!("Relay fallback also failed: {}", relay_err);
                         }
                     } else {
@@ -3443,13 +3491,13 @@ impl NscManager {
                         
                         // If this was an invite acceptance, send Welcome with epoch secrets
                         if let Some(ref ch_id) = channel_id {
-                            if let Err(e) = mgr.send_welcome_epoch_secrets(&peer_id, ch_id).await {
+                            if let Err(e) = mgr.send_welcome_epoch_secrets(&peer_id_to_use, ch_id).await {
                                 log::error!("Failed to send epoch secrets to {}: {}", target_nick, e);
                             } else {
                                 log::info!("Sent epoch secrets to {} for channel {}", target_nick, ch_id);
                                 
                                 // Add the invitee as a member to our channel members list
-                                mgr.add_channel_member(ch_id, &peer_id, false).await;
+                                mgr.add_channel_member(ch_id, &peer_id_to_use, false).await;
                             }
                         }
                     }
