@@ -2072,7 +2072,7 @@ mod tests {
     
     #[test]
     fn test_epoch_secrets_key_rotation() {
-        let mut shared_secret = [42u8; 32];
+        let shared_secret = [42u8; 32];
         let epoch0 = EpochSecrets::initial(&shared_secret);
         assert_eq!(epoch0.epoch, 0);
         

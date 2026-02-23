@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod irc_client;
 mod nais_channel;
 mod nais_secure_channel;
@@ -6,8 +8,11 @@ mod nsc_crypto;
 mod nsc_irc;
 mod nsc_manager;
 mod nsc_mls;
+#[allow(dead_code)]
 mod nsc_nat;
+#[allow(dead_code)]
 mod nsc_router;
+#[allow(dead_code)]
 mod nsc_transport;
 mod profile;
 mod ui;

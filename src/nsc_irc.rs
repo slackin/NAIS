@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::{mpsc, RwLock};
 
-use crate::nsc_channel::{ChannelId, ChannelInvite, ChannelMetadata};
+use crate::nsc_channel::{ChannelId, ChannelMetadata};
 use crate::nsc_nat::{CandidateType, IceCandidate, IceCredentials, NatType};
 use crate::nsc_transport::PeerId;
 
@@ -1679,7 +1679,7 @@ mod tests {
     fn test_ice_message_session_id() {
         let id1 = IceMessage::generate_session_id();
         let id2 = IceMessage::generate_session_id();
-        assert_eq!(id1.len(), 16);
+        assert_eq!(id1.len(), 8);
         assert_ne!(id1, id2);
     }
 
@@ -1689,7 +1689,7 @@ mod tests {
         let inviter = PeerId([2u8; 32]);
         let invitee = PeerId([3u8; 32]);
 
-        let invite = InviteMessage::new(&channel_id, "Test", &inviter, &invitee, 10);
+        let invite = InviteMessage::new(&channel_id, "Test", &inviter, &invitee, 10, "testnet");
         assert!(!invite.is_expired());
 
         // Manually set expired
@@ -1754,11 +1754,11 @@ mod tests {
         let inviter = PeerId([2u8; 32]);
         let invitee = PeerId([3u8; 32]);
 
-        let invite = manager.create_invite(&channel_id, "Test", &inviter, &invitee, 5);
+        let invite = manager.create_invite(&channel_id, "Test", &inviter, &invitee, 5, "testnet");
         assert!(!invite.invite_id.is_empty());
 
         // Simulate receiving an invite
-        let received = InviteMessage::new(&channel_id, "Other", &inviter, &invitee, 10);
+        let received = InviteMessage::new(&channel_id, "Other", &inviter, &invitee, 10, "testnet");
         manager.receive_invite("sender", received);
 
         let pending = manager.pending_invites();

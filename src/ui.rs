@@ -95,7 +95,7 @@ struct CrossNetworkInviteInfo {
     /// Whether this is a NAIS encrypted channel
     is_nais: bool,
     /// Profile name where we received this invite (for context)
-    received_on_profile: String,
+    _received_on_profile: String,
 }
 
 /// Information for an incoming IRC invite (standard INVITE command)
@@ -400,8 +400,6 @@ fn app() -> Element {
     let mut nsc_messages: Signal<HashMap<String, Vec<(u64, String, String)>>> = use_signal(HashMap::new);
     // Pending NSC invites: invite_id -> PendingInvite
     let mut nsc_pending_invites: Signal<Vec<crate::nsc_manager::PendingInvite>> = use_signal(Vec::new);
-    // Known NSC peers in current IRC channel
-    let mut nsc_peers_in_channel: Signal<Vec<String>> = use_signal(Vec::new);
     // NSC invite modal state: (nick, profile) when showing channel selection
     let mut nsc_invite_modal: Signal<Option<(String, String)>> = use_signal(|| None);
     // NSC channel members for the sidebar
@@ -1098,7 +1096,7 @@ fn app() -> Element {
                                                     channel: channel.clone(),
                                                     server: server.clone(),
                                                     is_nais: channel_type == "nais",
-                                                    received_on_profile: profile_name.clone(),
+                                                    _received_on_profile: profile_name.clone(),
                                                 }));
                                                 
                                                 log::info!("NAIS channel invite from {}: channel={} server={} type={}", 
@@ -2227,7 +2225,7 @@ fn app() -> Element {
                                             }
                                         }
                                     } else {
-                                        for (i, (timestamp, sender, text)) in messages.iter().enumerate() {
+                                        for (i, (_timestamp, sender, text)) in messages.iter().enumerate() {
                                             div {
                                                 key: "{i}",
                                                 class: "message",

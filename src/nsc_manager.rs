@@ -15,9 +15,9 @@ use tokio::sync::{mpsc, RwLock};
 use crate::nsc_channel::{ChannelId, ChannelManager};
 use crate::nsc_crypto::{IdentityKeyPair, PeerSessionManager, PreKeyBundle, X3dhHeader, MessageHeader, TrustManager, TrustCheckResult, TrustVerificationMethod, KeyStorage};
 use crate::nsc_irc::{IceMessage, NscCtcpCommand, encode_ctcp};
-use crate::nsc_nat::{IceAgent, IceCandidate, IceCredentials};
+use crate::nsc_nat::{IceAgent, IceCredentials};
 use crate::nsc_transport::{
-    MessageType, NscEnvelope, PeerId, QuicConfig, QuicTransport, TransportResult, RelayClient,
+    MessageType, NscEnvelope, PeerId, QuicConfig, QuicTransport, RelayClient,
 };
 
 // =============================================================================
@@ -685,10 +685,6 @@ impl NscManager {
         log::info!("Loaded {} peer PreKeyBundles from storage", peer_prekey_bundles.len());
         
         // Initialize channel members - add ourselves to each channel we own
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         let our_peer_id_hex = hex::encode(peer_id.0);
         let our_display_name = format!("{}...", &our_peer_id_hex[..8]);
         let mut channel_members = HashMap::new();
@@ -1931,12 +1927,6 @@ impl NscManager {
         };
         
         let our_peer_id = self.peer_id_hex();
-        let fingerprint = self.fingerprint();
-        let fingerprint_short = if fingerprint.len() > 8 { 
-            fingerprint[..8].to_string() 
-        } else { 
-            fingerprint 
-        };
         
         // Spawn background task to accept connections and read messages
         tokio::spawn(async move {
@@ -2382,10 +2372,6 @@ impl NscManager {
                         // Look up the channel
                         if let Ok(channel_bytes) = hex::decode(&request.channel_id) {
                             if channel_bytes.len() == 32 {
-                                let mut channel_arr = [0u8; 32];
-                                channel_arr.copy_from_slice(&channel_bytes);
-                                let channel_id = ChannelId(channel_arr);
-                                
                                 // Get channel info and build response
                                 if let Some(info) = self.channel_info.read().await.get(&request.channel_id) {
                                     // Only respond if we have a newer version
@@ -4388,6 +4374,7 @@ mod tests {
                     is_owner: true,
                     irc_channel: "#nais-aaaaaaaa".to_string(),
                     network: "TestNetwork".to_string(),
+                    epoch_secrets: None,
                 },
             ],
             messages: HashMap::new(),
@@ -4397,6 +4384,7 @@ mod tests {
             encrypted_trust: None,
             peer_prekey_bundles: HashMap::new(),
             irc_channel_mapping: IrcChannelMapping::default(),
+            left_channels: HashSet::new(),
         };
         
         let json = serde_json::to_string(&storage).unwrap();
