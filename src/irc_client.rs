@@ -1011,18 +1011,10 @@ async fn handle_connection(
         })
         .await;
 
-    evt_tx
-        .send(IrcEvent::Connected {
-            server: server.to_string(),
-        })
-        .await?;
-
-    // Successfully connected - reset the reconnection backoff
-    record_connection_success(server);
-
     let mut consecutive_errors = 0;
     const MAX_CONSECUTIVE_ERRORS: u32 = 10;
     let mut auto_joined = false;
+    let mut connected_emitted = false;
 
     loop {
         tokio::select! {
@@ -1653,6 +1645,17 @@ async fn handle_connection(
                         }
                     }
                     IrcCommand::Response(Response::RPL_ENDOFMOTD, _) => {
+                        if !connected_emitted {
+                            evt_tx
+                                .send(IrcEvent::Connected {
+                                    server: server.to_string(),
+                                })
+                                .await?;
+                            // Successfully connected - reset the reconnection backoff
+                            record_connection_success(server);
+                            connected_emitted = true;
+                        }
+
                         // End of MOTD - now we can join the channel
                         // Sync our nick with what the library actually registered
                         let actual_nick = client.current_nickname().to_string();
@@ -1694,6 +1697,19 @@ async fn handle_connection(
                                     .await;
                                 let _ = client.send_join(channel);
                             }
+                        }
+                    }
+                    IrcCommand::Response(Response::ERR_NOMOTD, _) => {
+                        // Some servers skip MOTD and send ERR_NOMOTD instead.
+                        if !connected_emitted {
+                            evt_tx
+                                .send(IrcEvent::Connected {
+                                    server: server.to_string(),
+                                })
+                                .await?;
+                            // Successfully connected - reset the reconnection backoff
+                            record_connection_success(server);
+                            connected_emitted = true;
                         }
                     }
                     IrcCommand::Response(Response::RPL_NAMREPLY, ref args) => {

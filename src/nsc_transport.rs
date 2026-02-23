@@ -77,6 +77,9 @@ pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 /// Header size (fixed portion)
 pub const HEADER_SIZE: usize = 152;
 
+/// Payload length field offset within an envelope (without signature)
+pub const PAYLOAD_LENGTH_OFFSET: usize = 84;
+
 /// Connection timeout
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -779,7 +782,12 @@ impl QuicTransport {
             })?;
 
         // Get payload length from header
-        let payload_len = u32::from_be_bytes([header[76], header[77], header[78], header[79]]) as usize;
+        let payload_len = u32::from_be_bytes([
+            header[PAYLOAD_LENGTH_OFFSET],
+            header[PAYLOAD_LENGTH_OFFSET + 1],
+            header[PAYLOAD_LENGTH_OFFSET + 2],
+            header[PAYLOAD_LENGTH_OFFSET + 3],
+        ]) as usize;
         log::debug!("[QUIC_RECV] Header read, payload_len={}", payload_len);
 
         if payload_len > MAX_MESSAGE_SIZE {
