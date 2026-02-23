@@ -442,6 +442,8 @@ pub struct NscManager {
     peers_by_irc_channel: Arc<RwLock<HashMap<String, Vec<String>>>>,
     /// Pending ICE sessions: session_id -> (target_nick, IceAgent, channel_id)
     pending_ice_sessions: Arc<RwLock<HashMap<String, PendingIceSession>>>,
+    /// Active ICE agents: session_id -> IceAgent (kept alive to preserve UPnP mappings)
+    active_ice_agents: Arc<RwLock<HashMap<String, Arc<IceAgent>>>>,
     /// Relay client for fallback connectivity (symmetric NAT)
     relay_client: Arc<RelayClient>,
     /// This device's info
@@ -712,6 +714,7 @@ impl NscManager {
             known_peers: Arc::new(RwLock::new(HashMap::new())),
             peers_by_irc_channel: Arc::new(RwLock::new(HashMap::new())),
             pending_ice_sessions: Arc::new(RwLock::new(HashMap::new())),
+            active_ice_agents: Arc::new(RwLock::new(HashMap::new())),
             relay_client: Arc::new(RelayClient::new(peer_id, identity)),
             this_device: Arc::new(RwLock::new(this_device)),
             linked_devices: Arc::new(RwLock::new(storage.devices.clone())),
@@ -2994,7 +2997,7 @@ impl NscManager {
     /// Returns the CTCP message to send
     pub async fn create_ice_offer(&self, target_nick: &str, channel_id: Option<&str>) -> Result<String, String> {
         // Create ICE agent and gather candidates
-        let ice_agent = IceAgent::new(true); // We're controlling (initiator)
+        let ice_agent = Arc::new(IceAgent::new(true)); // We're controlling (initiator)
         
         let candidates = ice_agent.gather_candidates().await
             .map_err(|e| format!("Failed to gather ICE candidates: {}", e))?;
@@ -3047,6 +3050,10 @@ impl NscManager {
         
         self.pending_ice_sessions.write().await.insert(session_id.clone(), session);
         
+        // Store ICE agent to keep UPnP mapping alive until connection is established
+        self.active_ice_agents.write().await.insert(session_id.clone(), ice_agent);
+        log::info!("[NSC_ICE] Stored ICE agent for session {} to preserve UPnP mapping", session_id);
+        
         // Encode as CTCP
         encode_ctcp(NscCtcpCommand::IceOffer, &ice_msg)
             .map_err(|e| format!("Failed to encode ICE offer: {}", e))
@@ -3056,7 +3063,7 @@ impl NscManager {
     /// Returns the CTCP message to send
     pub async fn create_ice_answer(&self, from_nick: &str, offer: &IceMessage) -> Result<String, String> {
         // Create ICE agent (not controlling - we're responding)
-        let ice_agent = IceAgent::new(false);
+        let ice_agent = Arc::new(IceAgent::new(false));
         
         // Set remote credentials from offer
         let remote_creds = IceCredentials {
@@ -3107,9 +3114,14 @@ impl NscManager {
         
         self.pending_ice_sessions.write().await.insert(offer.session_id.clone(), session);
         
+        // Store ICE agent to keep UPnP mapping alive during connectivity check
+        self.active_ice_agents.write().await.insert(offer.session_id.clone(), ice_agent.clone());
+        log::info!("[NSC_ICE] (answerer) Stored ICE agent for session {} to preserve UPnP mapping", offer.session_id);
+        
         // Try to establish connection in background
         let peer_id = offer.peer_id.clone();
         let target = from_nick.to_string();
+        let session_id_for_cleanup = offer.session_id.clone();
         
         tokio::spawn(async move {
             // Give a moment for answer to be sent
@@ -3119,6 +3131,10 @@ impl NscManager {
             // Try connectivity check
             if let Err(e) = ice_agent.check_connectivity().await {
                 log::warn!("[NSC_ICE] (answerer) Connectivity check failed for {}: {}", target, e);
+                // Clean up ICE agent on failure
+                let manager = get_nsc_manager();
+                let mgr = manager.read().await;
+                mgr.active_ice_agents.write().await.remove(&session_id_for_cleanup);
                 return;
             }
             
@@ -3144,6 +3160,10 @@ impl NscManager {
                 log::info!("[NSC_ICE] (answerer) QUIC connection established with {} at {}", target, addr);
                 mgr.debug_dump_peer_state().await;
             }
+            
+            // Clean up ICE agent now that connection is established
+            mgr.active_ice_agents.write().await.remove(&session_id_for_cleanup);
+            log::info!("[NSC_ICE] (answerer) Cleaned up ICE agent for session {}", session_id_for_cleanup);
         });
         
         // Encode answer as CTCP
@@ -3168,8 +3188,14 @@ impl NscManager {
             return Err("Received answer but we are not initiator".to_string());
         }
         
-        // Create ICE agent with our credentials
-        let ice_agent = IceAgent::new(true); // We're controlling
+        // Get the stored ICE agent from create_ice_offer (to preserve UPnP mapping)
+        let ice_agent = {
+            let agents = self.active_ice_agents.read().await;
+            agents.get(&answer.session_id).cloned()
+                .ok_or("No ICE agent found for session")?
+        };
+        
+        log::info!("[NSC_ICE] Reusing stored ICE agent for session {} to preserve UPnP mapping", answer.session_id);
         
         // Set remote credentials from answer
         let remote_creds = IceCredentials {
@@ -3177,10 +3203,6 @@ impl NscManager {
             pwd: answer.pwd.clone(),
         };
         ice_agent.set_remote_credentials(remote_creds).await;
-        
-        // Gather our candidates (we already have them but need to set up the agent)
-        let _our_candidates = ice_agent.gather_candidates().await
-            .map_err(|e| format!("Failed to gather ICE candidates: {}", e))?;
         
         // Add remote candidates from answer (compact format)
         for candidate in answer.expand_candidates() {
@@ -3191,6 +3213,7 @@ impl NscManager {
         let peer_id = answer.peer_id.clone();
         let target_nick = from_nick.to_string();
         let channel_id = session.channel_id.clone();
+        let session_id_for_cleanup = answer.session_id.clone();
         
         tokio::spawn(async move {
             log::info!("[NSC_ICE] Starting connectivity check for {}", target_nick);
@@ -3234,6 +3257,11 @@ impl NscManager {
                             }
                         }
                     }
+                    
+                    // Clean up ICE agent now that connection is established
+                    // (the Arc will be dropped, allowing UPnP cleanup)
+                    mgr.active_ice_agents.write().await.remove(&session_id_for_cleanup);
+                    log::info!("[NSC_ICE] Cleaned up ICE agent for session {}", session_id_for_cleanup);
                 }
                 Err(e) => {
                     log::error!("ICE connectivity check failed: {}, trying relay fallback", e);
@@ -3243,6 +3271,9 @@ impl NscManager {
                     if let Err(relay_err) = mgr.connect_via_relay(&peer_id, channel_id.as_deref()).await {
                         log::error!("Relay fallback also failed: {}", relay_err);
                     }
+                    
+                    // Clean up ICE agent even on failure
+                    mgr.active_ice_agents.write().await.remove(&session_id_for_cleanup);
                 }
             }
         });
@@ -3265,8 +3296,21 @@ impl NscManager {
             .unwrap_or_default()
             .as_secs();
         
-        let mut sessions = self.pending_ice_sessions.write().await;
-        sessions.retain(|_, session| now - session.created_at < 60);
+        // Get stale session IDs first
+        let stale_ids: Vec<String> = {
+            let sessions = self.pending_ice_sessions.read().await;
+            sessions.iter()
+                .filter(|(_, session)| now - session.created_at >= 60)
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        
+        // Remove stale sessions and their ICE agents
+        for id in &stale_ids {
+            self.pending_ice_sessions.write().await.remove(id);
+            self.active_ice_agents.write().await.remove(id);
+            log::info!("[NSC_ICE] Cleaned up stale ICE session: {}", id);
+        }
     }
     
     /// Get connected peers with their nicknames (if known)

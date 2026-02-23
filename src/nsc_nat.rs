@@ -416,10 +416,11 @@ impl IceCandidate {
 
     /// Calculate candidate priority per RFC 5245
     fn calculate_priority(candidate_type: CandidateType, address: SocketAddr) -> u32 {
-        // Type preference (0-126, but we use 127 for UPnP port-mapped since it's most reliable)
+        // Type preference (0-126) - higher is better
+        // Host candidates get highest priority so LAN peers try local IPs first
         let type_pref: u32 = match candidate_type {
-            CandidateType::PortMapped => 126, // Same as host but with external address - most reliable
-            CandidateType::Host => 126,
+            CandidateType::Host => 126,         // Local IPs - best for LAN-to-LAN
+            CandidateType::PortMapped => 120,   // UPnP external address - good for WAN
             CandidateType::PeerReflexive => 110,
             CandidateType::ServerReflexive => 100,
             CandidateType::Relay => 0,
@@ -968,6 +969,8 @@ pub struct IceAgent {
     selected_pair: Arc<RwLock<Option<CandidatePair>>>,
     /// NAT type (if detected)
     nat_type: Arc<RwLock<Option<NatType>>>,
+    /// Active UPnP mapping (kept alive to prevent drop from removing it)
+    upnp_mapping: Arc<RwLock<Option<UPnPMapping>>>,
 }
 
 impl IceAgent {
@@ -985,6 +988,7 @@ impl IceAgent {
             controlling,
             selected_pair: Arc::new(RwLock::new(None)),
             nat_type: Arc::new(RwLock::new(None)),
+            upnp_mapping: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -1017,8 +1021,9 @@ impl IceAgent {
                 let upnp_candidate = IceCandidate::port_mapped(external_addr, local_addr);
                 log::info!("UPnP SUCCESS: {} -> {}", external_addr, local_addr);
                 candidates.push(upnp_candidate);
-                // Store the mapping to keep it alive (don't drop it)
-                // Note: The mapping will be cleaned up when the IceAgent is dropped
+                // Store the mapping to keep it alive - the Drop impl will remove it when IceAgent is dropped
+                *self.upnp_mapping.write().await = Some(mapping);
+                log::info!("[ICE] UPnP mapping stored to prevent premature cleanup");
             }
             Err(e) => {
                 log::info!("UPnP unavailable ({}), falling back to STUN/hole-punching", e);
@@ -1027,10 +1032,14 @@ impl IceAgent {
 
         // === PRIORITY 2: Gather host candidates from local interfaces ===
         if let Ok(interfaces) = get_local_interfaces().await {
+            log::info!("[ICE] Found {} local network interfaces", interfaces.len());
             for addr in interfaces {
+                log::info!("[ICE] Adding host candidate: {}:{}", addr, local_addr.port());
                 let candidate = IceCandidate::host(SocketAddr::new(addr, local_addr.port()));
                 candidates.push(candidate);
             }
+        } else {
+            log::warn!("[ICE] Failed to get local network interfaces");
         }
 
         // === PRIORITY 3: Gather server reflexive candidates via STUN ===
@@ -1067,6 +1076,11 @@ impl IceAgent {
         // Sort by priority (highest first - UPnP candidates will be at top)
         candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
 
+        log::info!("[ICE] Gathered {} local candidates:", candidates.len());
+        for (i, c) in candidates.iter().enumerate() {
+            log::info!("[ICE]   {}: {} (type={:?}, priority={})", i, c.address, c.candidate_type, c.priority);
+        }
+
         *self.local_candidates.write().await = candidates.clone();
         *self.state.write().await = IceState::Complete;
 
@@ -1075,6 +1089,7 @@ impl IceAgent {
 
     /// Add a remote candidate
     pub async fn add_remote_candidate(&self, candidate: IceCandidate) {
+        log::info!("[ICE] Adding remote candidate: {} (type={:?})", candidate.address, candidate.candidate_type);
         self.remote_candidates.write().await.push(candidate.clone());
         
         // Create pairs with all local candidates
@@ -1082,12 +1097,15 @@ impl IceAgent {
         let mut pairs = self.pairs.write().await;
         
         for local in locals {
+            log::debug!("[ICE] Creating pair: local={} ({:?}) <-> remote={} ({:?})", 
+                local.address, local.candidate_type, candidate.address, candidate.candidate_type);
             let pair = CandidatePair::new(local, candidate.clone(), self.controlling);
             pairs.push(pair);
         }
         
         // Sort pairs by priority
         pairs.sort_by(|a, b| b.priority.cmp(&a.priority));
+        log::info!("[ICE] Total candidate pairs: {}", pairs.len());
     }
 
     /// Perform connectivity checks
@@ -1098,17 +1116,59 @@ impl IceAgent {
             .ok_or(NatError::IceConnectivityFailed)?;
 
         let pairs = self.pairs.read().await.clone();
+        log::info!("[ICE] Starting connectivity checks on {} pairs", pairs.len());
         
-        for pair in pairs {
+        // Log all pairs
+        for (i, pair) in pairs.iter().enumerate() {
+            log::info!("[ICE] Pair {}: local={} ({:?}) -> remote={} ({:?}) priority={}", 
+                i, pair.local.address, pair.local.candidate_type, 
+                pair.remote.address, pair.remote.candidate_type, pair.priority);
+        }
+        
+        // Start a listener task to respond to incoming STUN requests
+        let listener_socket = socket.clone();
+        let remote_creds = self.remote_credentials.read().await.clone();
+        let listener = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(100), 
+                    listener_socket.recv_from(&mut buf)
+                ).await {
+                    Ok(Ok((len, from))) => {
+                        // Check if this is a STUN binding request
+                        if len >= 20 {
+                            let msg_type = u16::from_be_bytes([buf[0], buf[1]]);
+                            if msg_type == STUN_BINDING_REQUEST {
+                                log::debug!("[ICE] Received STUN request from {}, sending response", from);
+                                // Extract transaction ID and send response
+                                let mut txn_id = [0u8; 12];
+                                txn_id.copy_from_slice(&buf[8..20]);
+                                let response = Self::build_binding_response_static(&txn_id, from);
+                                let _ = listener_socket.send_to(&response, from).await;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+        
+        for pair in pairs.iter() {
             // Skip relay candidates in first pass (try direct first)
             if pair.local.candidate_type == CandidateType::Relay {
                 continue;
             }
 
+            log::info!("[ICE] Checking pair: {} -> {}", pair.local.address, pair.remote.address);
             if let Ok(()) = self.check_pair(&socket, &pair).await {
+                listener.abort();
                 *self.state.write().await = IceState::Connected;
                 *self.selected_pair.write().await = Some(pair.clone());
-                return Ok(pair);
+                log::info!("[ICE] SUCCESS! Selected pair: {} -> {}", pair.local.address, pair.remote.address);
+                return Ok(pair.clone());
+            } else {
+                log::debug!("[ICE] Pair failed: {} -> {}", pair.local.address, pair.remote.address);
             }
         }
 
@@ -1117,13 +1177,17 @@ impl IceAgent {
         for pair in pairs {
             if pair.local.candidate_type == CandidateType::Relay {
                 if let Ok(()) = self.check_pair(&socket, &pair).await {
+                    listener.abort();
                     *self.state.write().await = IceState::Connected;
                     *self.selected_pair.write().await = Some(pair.clone());
+                    log::info!("[ICE] SUCCESS via relay! Selected pair: {} -> {}", pair.local.address, pair.remote.address);
                     return Ok(pair);
                 }
             }
         }
 
+        listener.abort();
+        log::error!("[ICE] All connectivity checks failed!");
         *self.state.write().await = IceState::Failed;
         Err(NatError::IceConnectivityFailed)
     }
@@ -1174,6 +1238,73 @@ impl IceAgent {
         msg_type == STUN_BINDING_RESPONSE
             && magic == STUN_MAGIC_COOKIE
             && &data[8..20] == expected_txn
+    }
+    
+    /// Build a STUN binding response (static version for use in async blocks)
+    fn build_binding_response_static(transaction_id: &[u8; 12], mapped_addr: std::net::SocketAddr) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(32);
+        
+        // Message Type: Binding Response
+        msg.extend_from_slice(&STUN_BINDING_RESPONSE.to_be_bytes());
+        
+        // Message Length (placeholder, will update)
+        msg.extend_from_slice(&0u16.to_be_bytes());
+        
+        // Magic Cookie
+        msg.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        
+        // Transaction ID
+        msg.extend_from_slice(transaction_id);
+        
+        // XOR-MAPPED-ADDRESS attribute
+        let xor_port = mapped_addr.port() ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+        
+        // Attribute type: XOR-MAPPED-ADDRESS (0x0020)
+        msg.extend_from_slice(&0x0020u16.to_be_bytes());
+        
+        match mapped_addr {
+            std::net::SocketAddr::V4(addr) => {
+                // Attribute length (8 bytes for IPv4)
+                msg.extend_from_slice(&8u16.to_be_bytes());
+                // Reserved
+                msg.push(0);
+                // Family (IPv4 = 0x01)
+                msg.push(0x01);
+                // XOR'd port
+                msg.extend_from_slice(&xor_port.to_be_bytes());
+                // XOR'd address
+                let ip_bytes = addr.ip().octets();
+                let magic_bytes = STUN_MAGIC_COOKIE.to_be_bytes();
+                for i in 0..4 {
+                    msg.push(ip_bytes[i] ^ magic_bytes[i]);
+                }
+            }
+            std::net::SocketAddr::V6(addr) => {
+                // Attribute length (20 bytes for IPv6)
+                msg.extend_from_slice(&20u16.to_be_bytes());
+                // Reserved
+                msg.push(0);
+                // Family (IPv6 = 0x02)
+                msg.push(0x02);
+                // XOR'd port
+                msg.extend_from_slice(&xor_port.to_be_bytes());
+                // XOR'd address (XOR with magic cookie + transaction id)
+                let ip_bytes = addr.ip().octets();
+                let magic_bytes = STUN_MAGIC_COOKIE.to_be_bytes();
+                for i in 0..4 {
+                    msg.push(ip_bytes[i] ^ magic_bytes[i]);
+                }
+                for i in 4..16 {
+                    msg.push(ip_bytes[i] ^ transaction_id[i - 4]);
+                }
+            }
+        }
+        
+        // Update message length
+        let attr_len = (msg.len() - 20) as u16;
+        msg[2..4].copy_from_slice(&attr_len.to_be_bytes());
+        
+        msg
     }
 
     /// Get current state
