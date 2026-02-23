@@ -1409,6 +1409,9 @@ impl NscManager {
                 target_peers.push(peer_id.clone());
                 if let Err(e) = transport.send(peer_id, &envelope).await {
                     log::error!("[NSC_SEND] Failed to send to peer {}: {}", peer_hex, e);
+                    // Evict dead connection so next attempt can reconnect
+                    log::warn!("[NSC_SEND] Removing dead connection for peer {}", peer_hex);
+                    transport.disconnect(peer_id).await;
                 } else {
                     log::info!("[NSC_SEND] Successfully sent {} bytes to peer {}", envelope.payload.len(), peer_hex);
                 }
@@ -1996,6 +1999,9 @@ impl NscManager {
         };
         
         let our_peer_id = self.peer_id_hex();
+        
+        // Start heartbeat loop to keep QUIC connections alive (every 25 seconds)
+        self.start_heartbeat_loop(25);
         
         // Spawn background task to accept connections and read messages
         tokio::spawn(async move {

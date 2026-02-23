@@ -614,7 +614,7 @@ impl QuicTransport {
         let mut transport_config = TransportConfig::default();
         transport_config.keep_alive_interval(Some(KEEPALIVE_INTERVAL));
         transport_config.max_idle_timeout(Some(
-            Duration::from_secs(60).try_into().unwrap(),
+            Duration::from_secs(120).try_into().unwrap(),
         ));
 
         let mut server_config = ServerConfig::with_crypto(Arc::new(
@@ -645,6 +645,9 @@ impl QuicTransport {
 
         let mut transport_config = TransportConfig::default();
         transport_config.keep_alive_interval(Some(KEEPALIVE_INTERVAL));
+        transport_config.max_idle_timeout(Some(
+            Duration::from_secs(120).try_into().unwrap(),
+        ));
 
         client_config.transport_config(Arc::new(transport_config));
 
