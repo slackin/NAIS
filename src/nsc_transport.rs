@@ -627,10 +627,13 @@ impl QuicTransport {
     fn create_client_config() -> TransportResult<ClientConfig> {
         // For P2P, we use a custom certificate verifier that accepts all certs
         // Security comes from the application-layer identity verification
-        let crypto = rustls::ClientConfig::builder()
+        let mut crypto = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
             .with_no_client_auth();
+
+        // Must match server's ALPN protocol
+        crypto.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
 
         let mut client_config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
