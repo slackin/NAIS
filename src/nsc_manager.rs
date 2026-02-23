@@ -1367,8 +1367,22 @@ impl NscManager {
         // Serialize envelope for retry queue (convert Bytes to Vec<u8>)
         let envelope_bytes = envelope.to_bytes().to_vec();
         
-        // Try to send to all connected peers
+        // Determine eligible recipients for this channel (connected + channel members)
         let mut target_peers: Vec<PeerId> = Vec::new();
+        let target_peer_hex: std::collections::HashSet<String> = {
+            let our_peer_hex = hex::encode(self.peer_id.0);
+            let members = self.channel_members.read().await;
+            members
+                .get(channel_id)
+                .map(|list| {
+                    list.iter()
+                        .filter(|m| m.peer_id != our_peer_hex)
+                        .map(|m| m.peer_id.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
         let transport_lock = self.transport.read().await;
         if let Some(ref transport) = *transport_lock {
             let connected_peers = transport.connected_peers().await;
@@ -1377,14 +1391,26 @@ impl NscManager {
             if connected_peers.is_empty() {
                 log::warn!("[NSC_SEND] NO CONNECTED PEERS - message will only be stored locally!");
             }
+
+            if target_peer_hex.is_empty() {
+                log::warn!("[NSC_SEND] Channel {} has no known remote members - message will only be stored locally", 
+                    &channel_id[..8.min(channel_id.len())]);
+            }
             
             for peer_id in &connected_peers {
-                log::info!("[NSC_SEND] Attempting to send to peer {}", hex::encode(peer_id.0));
+                let peer_hex = hex::encode(peer_id.0);
+                if !target_peer_hex.contains(&peer_hex) {
+                    log::debug!("[NSC_SEND] Skipping connected peer {} (not a member of channel {})",
+                        peer_hex, &channel_id[..8.min(channel_id.len())]);
+                    continue;
+                }
+
+                log::info!("[NSC_SEND] Attempting to send to peer {}", peer_hex);
                 target_peers.push(peer_id.clone());
                 if let Err(e) = transport.send(peer_id, &envelope).await {
-                    log::error!("[NSC_SEND] Failed to send to peer {}: {}", hex::encode(peer_id.0), e);
+                    log::error!("[NSC_SEND] Failed to send to peer {}: {}", peer_hex, e);
                 } else {
-                    log::info!("[NSC_SEND] Successfully sent {} bytes to peer {}", envelope.payload.len(), hex::encode(peer_id.0));
+                    log::info!("[NSC_SEND] Successfully sent {} bytes to peer {}", envelope.payload.len(), peer_hex);
                 }
             }
         } else {
@@ -1649,6 +1675,49 @@ impl NscManager {
         
         log::info!("Sent Welcome with epoch secrets to peer {} for channel {}", peer_id_hex, channel_id);
         Ok(())
+    }
+
+    /// Sync epoch secrets to a peer for all channels we own and they are a member of.
+    /// Used after generic ICE connects where no channel context was attached.
+    pub async fn sync_epoch_secrets_to_peer(&self, peer_id_hex: &str) -> Result<usize, String> {
+        let channels_to_sync: Vec<String> = {
+            let channel_info = self.channel_info.read().await;
+            let members = self.channel_members.read().await;
+
+            channel_info
+                .iter()
+                .filter_map(|(channel_id, info)| {
+                    if !info.is_owner {
+                        return None;
+                    }
+
+                    let has_peer = members
+                        .get(channel_id)
+                        .map(|list| list.iter().any(|m| m.peer_id == peer_id_hex))
+                        .unwrap_or(false);
+
+                    if has_peer {
+                        Some(channel_id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        let mut synced = 0usize;
+        for channel_id in channels_to_sync {
+            match self.send_welcome_epoch_secrets(peer_id_hex, &channel_id).await {
+                Ok(_) => {
+                    synced += 1;
+                }
+                Err(e) => {
+                    log::warn!("Failed to sync Welcome secrets to peer {} for channel {}: {}", peer_id_hex, channel_id, e);
+                }
+            }
+        }
+
+        Ok(synced)
     }
     
     /// Advance epoch for a channel and broadcast Commit to all members
@@ -2026,8 +2095,7 @@ impl NscManager {
                                                                 Ok(plaintext) => String::from_utf8_lossy(&plaintext).to_string(),
                                                                 Err(e) => {
                                                                     log::warn!("Decryption failed for channel {}: {}", channel_hex, e);
-                                                                    // Fall back to raw data (for backwards compat)
-                                                                    String::from_utf8_lossy(&envelope.payload).to_string()
+                                                                    continue;
                                                                 }
                                                             }
                                                         };
@@ -3499,6 +3567,19 @@ impl NscManager {
                                 // Add the invitee as a member to our channel members list
                                 mgr.add_channel_member(ch_id, &peer_id_to_use, false).await;
                             }
+                        } else {
+                            match mgr.sync_epoch_secrets_to_peer(&peer_id_to_use).await {
+                                Ok(count) => {
+                                    if count > 0 {
+                                        log::info!("[NSC_ICE] Synced Welcome secrets to {} for {} channels", target_nick, count);
+                                    } else {
+                                        log::debug!("[NSC_ICE] No owned shared channels to sync for {}", target_nick);
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("[NSC_ICE] Failed to sync Welcome secrets to {}: {}", target_nick, e);
+                                }
+                            }
                         }
                     }
                     
@@ -3666,8 +3747,7 @@ impl NscManager {
                                                                 Ok(plaintext) => String::from_utf8_lossy(&plaintext).to_string(),
                                                                 Err(e) => {
                                                                     log::warn!("Decryption failed for channel {}: {}", channel_hex, e);
-                                                                    // Fall back to raw data (for backwards compat or unencrypted messages)
-                                                                    String::from_utf8_lossy(&envelope.payload).to_string()
+                                                                    continue;
                                                                 }
                                                             }
                                                         };
