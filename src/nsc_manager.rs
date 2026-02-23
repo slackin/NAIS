@@ -2099,6 +2099,8 @@ impl NscManager {
                                                                         mgr.add_channel_member(&channel_hex, &sender_hex, true).await;
                                                                         let our_full_peer_id = hex::encode(mgr.peer_id.0);
                                                                         mgr.add_channel_member(&channel_hex, &our_full_peer_id, false).await;
+                                                                        // Persist updated secrets to storage so they survive restart
+                                                                        mgr.save_storage_async().await;
                                                                     }
                                                                     Err(e) => {
                                                                         log::error!("[NSC_LISTENER] Failed to store Welcome secrets: {:?}", e);
@@ -3870,6 +3872,9 @@ impl NscManager {
                                                                         // Also add ourselves as a member
                                                                         let our_peer_id = hex::encode(mgr.peer_id.0);
                                                                         mgr.add_channel_member(&channel_hex, &our_peer_id, false).await;
+                                                                        
+                                                                        // Persist updated secrets to storage so they survive restart
+                                                                        mgr.save_storage_async().await;
                                                                     }
                                                                     Err(e) => {
                                                                         log::error!("Failed to store epoch secrets: {:?}", e);
