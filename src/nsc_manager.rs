@@ -3071,15 +3071,39 @@ impl NscManager {
     /// Create an ICE answer in response to an offer
     /// Returns the CTCP message to send
     pub async fn create_ice_answer(&self, from_nick: &str, offer: &IceMessage) -> Result<String, String> {
-        // Check if we already have a pending ICE session with this peer (prevent duplicate sessions from glare)
+        // Check if we already have a pending ICE session with this peer (detect ICE glare)
         {
-            let sessions = self.pending_ice_sessions.read().await;
-            if let Some(existing) = sessions.values().find(|s| s.target_nick.eq_ignore_ascii_case(from_nick)) {
-                // Already have a session - only allow if this is the same session_id (retransmit)
+            let mut sessions = self.pending_ice_sessions.write().await;
+            if let Some(existing) = sessions.values().find(|s| s.target_nick.eq_ignore_ascii_case(from_nick) && s.is_initiator) {
+                let existing_session_id = existing.session_id.clone();
+                // ICE glare detected - both sides sent offers simultaneously
+                // Use tie-breaker: lower peer_id wins (their offer is accepted)
+                let our_peer_id = self.peer_id.to_hex();
+                let our_peer_id_prefix: String = our_peer_id.chars().take(16).collect();
+                
+                log::info!("[NSC_ICE] Glare detected with {} - our peer_id prefix: {}, their peer_id: {}", 
+                    from_nick, our_peer_id_prefix, offer.peer_id);
+                
+                if our_peer_id_prefix < offer.peer_id {
+                    // We win the tie-breaker - keep our offer, ignore theirs
+                    log::info!("[NSC_ICE] Glare resolution: Our peer_id is lower - keeping our offer (session {}), ignoring their offer ({})", 
+                        existing_session_id, offer.session_id);
+                    return Err(format!("ICE glare: keeping our offer to {} (lower peer_id wins)", from_nick));
+                } else {
+                    // They win the tie-breaker - cancel our offer, accept theirs
+                    log::info!("[NSC_ICE] Glare resolution: Their peer_id is lower - cancelling our offer (session {}), accepting their offer ({})", 
+                        existing_session_id, offer.session_id);
+                    sessions.remove(&existing_session_id);
+                    // Also clean up the ICE agent
+                    drop(sessions); // Release write lock before acquiring another
+                    self.active_ice_agents.write().await.remove(&existing_session_id);
+                }
+            } else if let Some(existing) = sessions.values().find(|s| s.target_nick.eq_ignore_ascii_case(from_nick)) {
+                // We have a session but as responder - only allow if this is the same session_id (retransmit)
                 if existing.session_id != offer.session_id {
-                    log::info!("[NSC_ICE] Skipping duplicate ICE answer to {} - session {} already exists (received offer for {})", 
-                        from_nick, existing.session_id, offer.session_id);
-                    return Err(format!("ICE session already pending for {}", from_nick));
+                    log::info!("[NSC_ICE] Skipping duplicate ICE offer from {} - already responding to session {}", 
+                        from_nick, existing.session_id);
+                    return Err(format!("Already responding to ICE session from {}", from_nick));
                 }
             }
         }
