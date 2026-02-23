@@ -822,6 +822,11 @@ impl QuicTransport {
         self.endpoint.local_addr().map_err(TransportError::IoError)
     }
 
+    /// Get local port (convenience method for ICE signaling)
+    pub fn local_port(&self) -> Option<u16> {
+        self.endpoint.local_addr().ok().map(|a| a.port())
+    }
+
     /// Get peer connection info
     pub async fn get_peer(&self, peer_id: &PeerId) -> Option<PeerConnection> {
         self.peers.read().await.get(peer_id).cloned()

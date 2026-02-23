@@ -3028,13 +3028,19 @@ impl NscManager {
             None
         };
         
-        // Create ICE message
+        // Create ICE message with our QUIC transport port
+        let transport_port = {
+            let transport_lock = self.transport.read().await;
+            transport_lock.as_ref().and_then(|t| t.local_port())
+        };
+        
         let ice_msg = IceMessage::new(
             session_id.clone(),
             &self.peer_id,
             cid.as_ref(),
             credentials,
             &candidates,
+            transport_port,
         );
         
         // Store pending session
@@ -3132,6 +3138,12 @@ impl NscManager {
         
         let credentials = ice_agent.local_credentials();
         
+        // Get our QUIC transport port to include in the answer
+        let transport_port = {
+            let transport_lock = self.transport.read().await;
+            transport_lock.as_ref().and_then(|t| t.local_port())
+        };
+        
         // Create answer with same session ID as offer
         let ice_answer = IceMessage::new(
             offer.session_id.clone(),
@@ -3139,6 +3151,7 @@ impl NscManager {
             None, // Channel ID from offer
             credentials,
             &candidates,
+            transport_port,
         );
         
         // Store pending session for connection establishment
@@ -3167,7 +3180,9 @@ impl NscManager {
         self.active_ice_agents.write().await.insert(offer.session_id.clone(), ice_agent.clone());
         log::info!("[NSC_ICE] (answerer) Stored ICE agent for session {} to preserve UPnP mapping", offer.session_id);
         
-        // Try to establish connection in background
+        // As the answerer (controlled agent), we do NOT initiate the QUIC connection.
+        // The initiator (controlling agent) will connect to us after receiving our answer.
+        // We just need to verify ICE connectivity and record the peer's address.
         let peer_id = offer.peer_id.clone();
         let target = from_nick.to_string();
         let session_id_for_cleanup = offer.session_id.clone();
@@ -3177,7 +3192,7 @@ impl NscManager {
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             
             log::info!("[NSC_ICE] (answerer) Starting connectivity check for {}", target);
-            // Try connectivity check
+            // Try connectivity check to verify the ICE path works
             if let Err(e) = ice_agent.check_connectivity().await {
                 log::warn!("[NSC_ICE] (answerer) Connectivity check failed for {}: {}", target, e);
                 // Clean up ICE agent on failure
@@ -3198,39 +3213,35 @@ impl NscManager {
             let addr = selected.remote.address;
             log::info!("[NSC_ICE] (answerer) Selected candidate: {} for peer {}", addr, target);
             
-            // Establish QUIC connection using the discovered address
+            // Record the peer's address so we can accept their incoming QUIC connection
             let manager = get_nsc_manager();
             let mgr = manager.read().await;
             
             // Look up full peer_id by matching the truncated prefix from IceMessage
-            // This is safer than looking up by nick since nicks aren't unique across IRC networks
             let full_peer_id = {
                 let known = mgr.known_peers.read().await;
                 known.values()
                     .find(|p| p.peer_id.starts_with(&peer_id))
                     .map(|p| p.peer_id.clone())
             };
-            let peer_id_to_use = match full_peer_id {
-                Some(full_id) => {
-                    log::info!("[NSC_ICE] (answerer) Found full peer_id matching prefix {} for {}", &peer_id, target);
-                    full_id
-                }
-                None => {
-                    log::warn!("[NSC_ICE] (answerer) No full peer_id found matching prefix {}, cannot connect", peer_id);
-                    return;
-                }
-            };
             
-            log::info!("[NSC_ICE] (answerer) Attempting QUIC connection to {} at {}", target, addr);
-            mgr.debug_dump_peer_state().await;
-            if let Err(e) = mgr.connect_to_peer(&peer_id_to_use, addr).await {
-                log::error!("[NSC_ICE] (answerer) Failed to establish QUIC connection with {}: {}", target, e);
-            } else {
-                log::info!("[NSC_ICE] (answerer) QUIC connection established with {} at {}", target, addr);
+            if let Some(full_id) = full_peer_id {
+                log::info!("[NSC_ICE] (answerer) Found full peer_id matching prefix {} for {}", &peer_id, target);
+                // Record the peer's address - the initiator will connect to us
+                mgr.peer_addresses.write().await.insert(full_id.clone(), addr);
+                log::info!("[NSC_ICE] (answerer) Recorded peer {} address {} - waiting for their QUIC connection", target, addr);
                 mgr.debug_dump_peer_state().await;
+            } else {
+                log::warn!("[NSC_ICE] (answerer) No full peer_id found matching prefix {}", peer_id);
             }
             
-            // Clean up ICE agent now that connection is established
+            // Keep ICE agent alive for a bit longer to maintain UPnP mapping while waiting for connection
+            // The initiator should connect within a few seconds
+            tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+            
+            // Clean up ICE agent after timeout
+            let manager = get_nsc_manager();
+            let mgr = manager.read().await;
             mgr.active_ice_agents.write().await.remove(&session_id_for_cleanup);
             log::info!("[NSC_ICE] (answerer) Cleaned up ICE agent for session {}", session_id_for_cleanup);
         });
@@ -3283,6 +3294,8 @@ impl NscManager {
         let target_nick = from_nick.to_string();
         let channel_id = session.channel_id.clone();
         let session_id_for_cleanup = answer.session_id.clone();
+        // Get the transport port from the answer - this is the actual QUIC port to connect to
+        let remote_transport_port = answer.transport_port;
         
         tokio::spawn(async move {
             log::info!("[NSC_ICE] Starting connectivity check for {}", target_nick);
@@ -3296,11 +3309,19 @@ impl NscManager {
                         return;
                     };
                     
-                    let addr = selected.remote.address;
-                    log::info!("Selected ICE candidate: {} for peer {}", addr, target_nick);
+                    // Use the IP from ICE but the actual transport port from the answer
+                    let ice_addr = selected.remote.address;
+                    let connect_addr = if let Some(port) = remote_transport_port {
+                        std::net::SocketAddr::new(ice_addr.ip(), port)
+                    } else {
+                        // Fallback to ICE address if no transport port was provided (old clients)
+                        log::warn!("[NSC_ICE] No transport_port in answer, using ICE address port (may fail)");
+                        ice_addr
+                    };
+                    log::info!("[NSC_ICE] Selected ICE candidate: {} -> connecting to QUIC at {}", ice_addr, connect_addr);
                     
-                    // Establish QUIC connection using the discovered address
-                    log::info!("[NSC_ICE] Attempting QUIC connection to {} at {}", target_nick, addr);
+                    // Establish QUIC connection using the transport address
+                    log::info!("[NSC_ICE] Attempting QUIC connection to {} at {}", target_nick, connect_addr);
                     let manager = get_nsc_manager();
                     let mgr = manager.read().await;
                     
@@ -3324,14 +3345,14 @@ impl NscManager {
                     };
                     
                     mgr.debug_dump_peer_state().await;
-                    if let Err(e) = mgr.connect_to_peer(&peer_id_to_use, addr).await {
+                    if let Err(e) = mgr.connect_to_peer(&peer_id_to_use, connect_addr).await {
                         log::error!("[NSC_ICE] Failed to establish QUIC connection with {}: {}", target_nick, e);
                         // Try relay fallback
                         if let Err(relay_err) = mgr.connect_via_relay(&peer_id, channel_id.as_deref()).await {
                             log::error!("Relay fallback also failed: {}", relay_err);
                         }
                     } else {
-                        log::info!("[NSC_ICE] QUIC connection established with {} at {}", target_nick, addr);
+                        log::info!("[NSC_ICE] QUIC connection established with {} at {}", target_nick, connect_addr);
                         mgr.debug_dump_peer_state().await;
                         
                         // If this was an invite acceptance, send Welcome with epoch secrets

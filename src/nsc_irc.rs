@@ -205,6 +205,9 @@ pub struct IceMessage {
     /// NAT type
     #[serde(rename = "n", skip_serializing_if = "Option::is_none")]
     pub nat_type: Option<String>,
+    /// QUIC transport port (the actual port to connect to after ICE completes)
+    #[serde(rename = "q", skip_serializing_if = "Option::is_none")]
+    pub transport_port: Option<u16>,
     /// Timestamp (seconds, not millis to save space)
     #[serde(rename = "t")]
     pub timestamp: u64,
@@ -217,6 +220,7 @@ impl IceMessage {
         channel_id: Option<&ChannelId>,
         credentials: &IceCredentials,
         candidates: &[IceCandidate],
+        transport_port: Option<u16>,
     ) -> Self {
         Self {
             // Truncate session_id to 8 chars for compactness
@@ -230,6 +234,7 @@ impl IceMessage {
             // Use compact candidate format
             candidates: candidates.iter().map(|c| Self::candidate_to_compact(c)).collect(),
             nat_type: None,
+            transport_port,
             // Use seconds instead of millis
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1731,6 +1736,7 @@ mod tests {
             None,
             &credentials,
             &[],
+            None, // No transport port in test
         );
 
         let session_id = manager.start_exchange("testuser", offer).unwrap();
