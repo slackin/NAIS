@@ -105,6 +105,8 @@ const STUN_MAGIC_COOKIE: u32 = 0x2112A442;
 /// Timeouts
 const STUN_TIMEOUT: Duration = Duration::from_secs(3);
 const ICE_CHECK_TIMEOUT: Duration = Duration::from_millis(500);
+/// Timeout for bidirectional ICE check - give more time for both directions
+const ICE_BIDIR_CHECK_TIMEOUT: Duration = Duration::from_millis(1500);
 const HOLE_PUNCH_INTERVAL: Duration = Duration::from_millis(50);
 const HOLE_PUNCH_ATTEMPTS: u32 = 20;
 
@@ -1116,6 +1118,8 @@ impl IceAgent {
             .ok_or(NatError::IceConnectivityFailed)?;
 
         let pairs = self.pairs.read().await.clone();
+        let local_candidates = self.local_candidates.read().await.clone();
+        
         log::info!("[ICE] Starting connectivity checks on {} pairs", pairs.len());
         
         // Log all pairs
@@ -1136,10 +1140,17 @@ impl IceAgent {
 
             log::info!("[ICE] Checking pair: {} -> {}", pair.local.address, pair.remote.address);
             if let Ok(()) = self.check_pair(&socket, &pair).await {
+                // Determine the effective local address for this pair
+                // If our local candidate is a Host with private IP but remote is public,
+                // the remote actually sees us via our ServerReflexive address
+                let effective_pair = self.get_effective_pair(pair, &local_candidates);
+                
                 *self.state.write().await = IceState::Connected;
-                *self.selected_pair.write().await = Some(pair.clone());
-                log::info!("[ICE] SUCCESS! Selected pair: {} -> {}", pair.local.address, pair.remote.address);
-                return Ok(pair.clone());
+                *self.selected_pair.write().await = Some(effective_pair.clone());
+                log::info!("[ICE] SUCCESS! Selected pair: {} ({:?}) -> {} ({:?})", 
+                    effective_pair.local.address, effective_pair.local.candidate_type,
+                    effective_pair.remote.address, effective_pair.remote.candidate_type);
+                return Ok(effective_pair);
             } else {
                 log::debug!("[ICE] Pair failed: {} -> {}", pair.local.address, pair.remote.address);
             }
@@ -1162,9 +1173,48 @@ impl IceAgent {
         *self.state.write().await = IceState::Failed;
         Err(NatError::IceConnectivityFailed)
     }
+    
+    /// Get the effective pair with corrected local address.
+    /// When a Host candidate with private IP successfully connects to a public remote,
+    /// the remote actually sees us via our ServerReflexive address. This function
+    /// returns a pair with the correct externally-visible local address.
+    fn get_effective_pair(&self, pair: &CandidatePair, local_candidates: &[IceCandidate]) -> CandidatePair {
+        let local = &pair.local;
+        let remote = &pair.remote;
+        
+        // Check if we need to adjust: local is Host with private IP, remote is public
+        let local_is_private = !is_public_ip(&local.address.ip());
+        let remote_is_public = is_public_ip(&remote.address.ip());
+        
+        if local.candidate_type == CandidateType::Host && local_is_private && remote_is_public {
+            // Find a ServerReflexive candidate that has this Host as its base
+            let srflx_candidate = local_candidates.iter().find(|c| {
+                c.candidate_type == CandidateType::ServerReflexive 
+                    && c.base_address == Some(local.address)
+            });
+            
+            if let Some(srflx) = srflx_candidate {
+                log::info!("[ICE] Upgrading local address from {} (Host/private) to {} (ServerReflexive/public) for external peer",
+                    local.address, srflx.address);
+                
+                // Create new pair with ServerReflexive local, using controlling flag for priority calculation
+                return CandidatePair::new(srflx.clone(), remote.clone(), self.controlling);
+            } else {
+                log::warn!("[ICE] Local {} is private but no matching ServerReflexive candidate found - remote may have trouble reaching us", 
+                    local.address);
+            }
+        }
+        
+        // No adjustment needed
+        pair.clone()
+    }
 
-    /// Check a single candidate pair
-    /// Handles both sending our request AND responding to peer's requests
+    /// Check a single candidate pair with BIDIRECTIONAL verification
+    /// Requires BOTH:
+    /// 1. We can send to remote AND receive their response (outbound works)
+    /// 2. Remote can send to us - evidenced by receiving a STUN request from them (inbound works)
+    /// 
+    /// This ensures the selected pair will work in both directions, not just outbound.
     async fn check_pair(&self, socket: &TokioUdpSocket, pair: &CandidatePair) -> NatResult<()> {
         let remote_addr = pair.remote.address;
         
@@ -1175,18 +1225,38 @@ impl IceAgent {
         // Send connectivity check
         socket.send_to(&request, remote_addr).await?;
 
-        // Loop receiving until we get our response or timeout
-        // We also respond to incoming STUN requests from the peer
-        let deadline = tokio::time::Instant::now() + ICE_CHECK_TIMEOUT;
+        // Track bidirectional connectivity
+        let mut got_response = false;  // We received a response to our request (outbound OK)
+        let mut got_request = false;   // We received a request from peer (inbound OK)
+        
+        // Loop receiving until we have bidirectional confirmation or timeout
+        // Use longer timeout for bidirectional check
+        let deadline = tokio::time::Instant::now() + ICE_BIDIR_CHECK_TIMEOUT;
         let mut buf = [0u8; 1024];
+        
+        // Also send our request multiple times to ensure it gets through
+        let mut next_retry = tokio::time::Instant::now() + Duration::from_millis(200);
         
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
+                if got_response && !got_request {
+                    log::warn!("[ICE] Pair {} -> {}: Outbound OK but no inbound request received (one-way only)", 
+                        pair.local.address, pair.remote.address);
+                } else if !got_response && got_request {
+                    log::warn!("[ICE] Pair {} -> {}: Inbound OK but no response to our request (one-way only)", 
+                        pair.local.address, pair.remote.address);
+                }
                 return Err(NatError::IceConnectivityFailed);
             }
             
-            let result = timeout(remaining, socket.recv_from(&mut buf)).await;
+            // Retry sending our request periodically
+            if tokio::time::Instant::now() >= next_retry {
+                let _ = socket.send_to(&request, remote_addr).await;
+                next_retry = tokio::time::Instant::now() + Duration::from_millis(200);
+            }
+            
+            let result = timeout(remaining.min(Duration::from_millis(100)), socket.recv_from(&mut buf)).await;
             
             match result {
                 Ok(Ok((len, from))) => {
@@ -1194,29 +1264,42 @@ impl IceAgent {
                         let msg_type = u16::from_be_bytes([buf[0], buf[1]]);
                         
                         if msg_type == STUN_BINDING_REQUEST {
-                            // Received a STUN request from peer - send response
-                            log::debug!("[ICE] Received STUN request from {}, sending response", from);
+                            // Received a STUN request from peer - this proves they can reach us!
+                            log::debug!("[ICE] Received STUN request from {} (proves inbound connectivity)", from);
                             let mut txn_id = [0u8; 12];
                             txn_id.copy_from_slice(&buf[8..20]);
                             let response = Self::build_binding_response_static(&txn_id, from);
                             let _ = socket.send_to(&response, from).await;
-                            // Continue waiting for our response
+                            
+                            // Mark inbound connectivity as confirmed
+                            // Accept requests from any address (NAT may translate remote's address)
+                            got_request = true;
+                            
+                            if got_response && got_request {
+                                log::debug!("[ICE] Bidirectional connectivity confirmed for {} -> {}", 
+                                    pair.local.address, pair.remote.address);
+                                return Ok(());
+                            }
                             continue;
                         } else if msg_type == STUN_BINDING_RESPONSE {
                             // Check if this is the response we're waiting for
-                            if from == remote_addr && Self::verify_stun_response(&buf[..len], &transaction_id) {
-                                log::debug!("[ICE] Received valid STUN response from {}", from);
-                                return Ok(());
+                            if Self::verify_stun_response(&buf[..len], &transaction_id) {
+                                log::debug!("[ICE] Received valid STUN response from {} (proves outbound connectivity)", from);
+                                got_response = true;
+                                
+                                if got_response && got_request {
+                                    log::debug!("[ICE] Bidirectional connectivity confirmed for {} -> {}", 
+                                        pair.local.address, pair.remote.address);
+                                    return Ok(());
+                                }
                             }
-                            // Wrong transaction or sender - continue waiting
                             continue;
                         }
                     }
-                    // Unknown packet - continue waiting
                     continue;
                 }
                 Ok(Err(_)) => return Err(NatError::IceConnectivityFailed),
-                Err(_) => return Err(NatError::IceConnectivityFailed), // Timeout
+                Err(_) => continue, // Timeout on this recv, but continue loop
             }
         }
     }
