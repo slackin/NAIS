@@ -2190,6 +2190,48 @@ impl NscManager {
                                                             }
                                                         }
                                                     }
+                                                    MessageType::Commit => {
+                                                        use crate::nsc_channel::EpochSecrets;
+
+                                                        log::info!(
+                                                            "[NSC_LISTENER] Processing Commit for channel {} from {}",
+                                                            &channel_hex[..8.min(channel_hex.len())],
+                                                            &sender_hex[..16.min(sender_hex.len())]
+                                                        );
+
+                                                        match serde_json::from_slice::<EpochSecrets>(&envelope.payload) {
+                                                            Ok(new_secrets) => {
+                                                                let new_epoch = new_secrets.epoch;
+                                                                let channel_id = ChannelId::from_bytes(envelope.channel_id);
+                                                                let manager = get_nsc_manager();
+                                                                let mgr = manager.read().await;
+
+                                                                match mgr.channel_manager.process_commit(&channel_id, new_secrets).await {
+                                                                    Ok(_) => {
+                                                                        log::info!(
+                                                                            "[NSC_LISTENER] Applied Commit for channel {} -> epoch {}",
+                                                                            &channel_hex[..8.min(channel_hex.len())],
+                                                                            new_epoch
+                                                                        );
+                                                                        mgr.save_storage_async().await;
+                                                                    }
+                                                                    Err(e) => {
+                                                                        log::warn!(
+                                                                            "[NSC_LISTENER] Failed to apply Commit for channel {}: {:?}",
+                                                                            &channel_hex[..8.min(channel_hex.len())],
+                                                                            e
+                                                                        );
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                log::error!(
+                                                                    "[NSC_LISTENER] Failed to parse Commit payload: {}",
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
+                                                    }
                                                     MessageType::ChannelMessage | MessageType::ChannelAction => {
                                                         // Decrypt message using channel's group key
                                                         let channel_id = ChannelId::from_bytes(envelope.channel_id);
