@@ -1722,6 +1722,40 @@ impl NscManager {
 
         Ok(synced)
     }
+
+    /// Attempt to heal channel key drift by re-sending Welcome secrets to a peer
+    /// when decryption fails on a locally-owned channel.
+    async fn resync_on_decrypt_failure(&self, channel_id: &str, sender_peer_id_hex: &str) {
+        let is_local_owner = {
+            let info = self.channel_info.read().await;
+            info.get(channel_id).map(|c| c.is_owner).unwrap_or(false)
+        };
+
+        if !is_local_owner {
+            return;
+        }
+
+        // Ensure membership reflects active traffic from this peer.
+        self.add_channel_member(channel_id, sender_peer_id_hex, false).await;
+
+        match self.send_welcome_epoch_secrets(sender_peer_id_hex, channel_id).await {
+            Ok(_) => {
+                log::info!(
+                    "[NSC_HEAL] Re-sent Welcome epoch secrets to {} for channel {} after decrypt failure",
+                    &sender_peer_id_hex[..16.min(sender_peer_id_hex.len())],
+                    &channel_id[..8.min(channel_id.len())]
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "[NSC_HEAL] Failed to re-send Welcome epoch secrets to {} for channel {}: {}",
+                    &sender_peer_id_hex[..16.min(sender_peer_id_hex.len())],
+                    &channel_id[..8.min(channel_id.len())],
+                    e
+                );
+            }
+        }
+    }
     
     /// Advance epoch for a channel and broadcast Commit to all members
     pub async fn advance_channel_epoch(&self, channel_id: &str) -> Result<u64, String> {
@@ -2141,6 +2175,7 @@ impl NscManager {
                                                                 Ok(plaintext) => String::from_utf8_lossy(&plaintext).to_string(),
                                                                 Err(e) => {
                                                                     log::warn!("Decryption failed for channel {}: {}", channel_hex, e);
+                                                                    mgr.resync_on_decrypt_failure(&channel_hex, &sender_hex).await;
                                                                     continue;
                                                                 }
                                                             }
@@ -3834,6 +3869,7 @@ impl NscManager {
                                                                 Ok(plaintext) => String::from_utf8_lossy(&plaintext).to_string(),
                                                                 Err(e) => {
                                                                     log::warn!("Decryption failed for channel {}: {}", channel_hex, e);
+                                                                    mgr.resync_on_decrypt_failure(&channel_hex, &sender_hex).await;
                                                                     continue;
                                                                 }
                                                             }
