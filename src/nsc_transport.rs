@@ -838,6 +838,11 @@ impl QuicTransport {
         self.endpoint.local_addr().ok().map(|a| a.port())
     }
 
+    /// Get a clone of the connection for a peer (used for spawning reader loops)
+    pub async fn get_connection(&self, peer_id: &PeerId) -> Option<Connection> {
+        self.connections.read().await.get(peer_id).cloned()
+    }
+
     /// Get peer connection info
     pub async fn get_peer(&self, peer_id: &PeerId) -> Option<PeerConnection> {
         self.peers.read().await.get(peer_id).cloned()

@@ -1203,6 +1203,208 @@ impl NscManager {
         Ok(())
     }
     
+    /// Start a reader loop for an outgoing connection
+    /// This enables receiving messages from peers we connected to (not just peers who connected to us)
+    pub async fn start_outgoing_connection_reader(&self, peer_id_hex: &str) -> Result<(), String> {
+        let transport_lock = self.transport.read().await;
+        let transport = transport_lock.as_ref()
+            .ok_or("Transport not initialized")?;
+        
+        // Parse peer ID
+        let bytes = hex::decode(peer_id_hex).map_err(|_| "Invalid peer ID")?;
+        if bytes.len() != 32 {
+            return Err("Invalid peer ID length".to_string());
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        let peer_id = PeerId(arr);
+        
+        // Get the connection
+        let connection = transport.get_connection(&peer_id).await
+            .ok_or("Connection not found for peer")?;
+        
+        let our_peer_id = self.peer_id_hex();
+        let peer_id_hex = peer_id_hex.to_string();
+        
+        // Spawn reader task for this outgoing connection
+        tokio::spawn(async move {
+            log::info!("[OUTGOING_READER] Started reader for outgoing connection to {}", &peer_id_hex[..16.min(peer_id_hex.len())]);
+            
+            loop {
+                match connection.accept_uni().await {
+                    Ok(mut recv_stream) => {
+                        match crate::nsc_transport::QuicTransport::receive_from_stream(&mut recv_stream).await {
+                            Ok(envelope) => {
+                                let sender_hex = hex::encode(&envelope.sender_id);
+                                let channel_hex = hex::encode(&envelope.channel_id);
+                                log::info!("[OUTGOING_READER] Received envelope: sender={}, channel={}, type={:?}, payload_len={}", 
+                                    &sender_hex[..16.min(sender_hex.len())], 
+                                    &channel_hex[..8.min(channel_hex.len())],
+                                    envelope.message_type,
+                                    envelope.payload.len());
+                                
+                                // Process the message based on type
+                                match envelope.message_type {
+                                    MessageType::Welcome => {
+                                        use crate::nsc_channel::EpochSecrets;
+
+                                        log::info!("[OUTGOING_READER] Processing Welcome for channel {} from {}",
+                                            &channel_hex[..8.min(channel_hex.len())],
+                                            &sender_hex[..16.min(sender_hex.len())]);
+
+                                        // Check if we own this channel
+                                        let is_local_owner = {
+                                            let manager = get_nsc_manager();
+                                            let mgr = manager.read().await;
+                                            let info = mgr.channel_info.read().await;
+                                            let result = info.get(&channel_hex).map(|c| c.is_owner).unwrap_or(false);
+                                            if result {
+                                                log::info!(
+                                                    "[OUTGOING_READER] Channel {} is_owner=true, will ignore Welcome",
+                                                    &channel_hex[..8.min(channel_hex.len())]
+                                                );
+                                            } else {
+                                                let found = info.contains_key(&channel_hex);
+                                                log::info!(
+                                                    "[OUTGOING_READER] Channel {} is_owner=false (found={}), will process Welcome",
+                                                    &channel_hex[..8.min(channel_hex.len())],
+                                                    found
+                                                );
+                                            }
+                                            result
+                                        };
+                                        
+                                        if is_local_owner {
+                                            log::warn!(
+                                                "[OUTGOING_READER] Ignoring Welcome for locally-owned channel {} from {}",
+                                                &channel_hex[..8.min(channel_hex.len())],
+                                                &sender_hex[..16.min(sender_hex.len())]
+                                            );
+                                            continue;
+                                        }
+
+                                        match serde_json::from_slice::<EpochSecrets>(&envelope.payload) {
+                                            Ok(secrets) => {
+                                                let key_fp = hex::encode(&secrets.encryption_key[..4]);
+                                                log::info!(
+                                                    "[OUTGOING_READER] [WELCOME_RECV] Received epoch secrets for channel {}: epoch={}, key_fp={}",
+                                                    &channel_hex[..8.min(channel_hex.len())],
+                                                    secrets.epoch,
+                                                    key_fp
+                                                );
+                                                
+                                                let channel_id = ChannelId::from_bytes(envelope.channel_id);
+                                                let manager = get_nsc_manager();
+                                                let mgr = manager.read().await;
+
+                                                let name = {
+                                                    let info = mgr.channel_info.read().await;
+                                                    info.get(&channel_hex)
+                                                        .map(|i| i.name.clone())
+                                                        .unwrap_or_else(|| "Unknown".to_string())
+                                                };
+
+                                                match mgr.channel_manager
+                                                    .join_channel_with_secrets(&channel_id, name, secrets)
+                                                    .await
+                                                {
+                                                    Ok(_) => {
+                                                        log::info!("[OUTGOING_READER] Stored Welcome epoch secrets for channel {}",
+                                                            &channel_hex[..8.min(channel_hex.len())]);
+                                                        mgr.add_channel_member(&channel_hex, &sender_hex, true).await;
+                                                        let our_full_peer_id = hex::encode(mgr.peer_id.0);
+                                                        mgr.add_channel_member(&channel_hex, &our_full_peer_id, false).await;
+                                                        mgr.save_storage_async().await;
+                                                    }
+                                                    Err(e) => {
+                                                        log::error!("[OUTGOING_READER] Failed to store Welcome secrets: {:?}", e);
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                log::error!("[OUTGOING_READER] Failed to parse Welcome payload: {}", e);
+                                            }
+                                        }
+                                    }
+                                    MessageType::ChannelMessage | MessageType::ChannelAction => {
+                                        let channel_id = ChannelId::from_bytes(envelope.channel_id);
+
+                                        let text = {
+                                            let manager = get_nsc_manager();
+                                            let mgr = manager.read().await;
+                                            match mgr.channel_manager.decrypt_for_channel(&channel_id, &envelope.payload).await {
+                                                Ok(plaintext) => String::from_utf8_lossy(&plaintext).to_string(),
+                                                Err(e) => {
+                                                    log::warn!("[OUTGOING_READER] Decryption failed for channel {}: {}", channel_hex, e);
+                                                    mgr.resync_on_decrypt_failure(&channel_hex, &sender_hex).await;
+                                                    continue;
+                                                }
+                                            }
+                                        };
+
+                                        let timestamp = envelope.timestamp / 1000;
+                                        let sender_short = if sender_hex.len() >= 16 {
+                                            sender_hex[..16].to_string()
+                                        } else {
+                                            sender_hex.clone()
+                                        };
+
+                                        let is_own = sender_hex == our_peer_id;
+
+                                        let msg = NscMessage {
+                                            timestamp,
+                                            sender: sender_short.clone(),
+                                            text: text.clone(),
+                                            is_own,
+                                        };
+
+                                        // Persist message
+                                        let stored = StoredMessage {
+                                            timestamp,
+                                            sender: sender_short,
+                                            text,
+                                            is_own,
+                                        };
+                                        if let Err(e) = save_message(&channel_hex, &stored) {
+                                            log::warn!("[OUTGOING_READER] Failed to persist message: {}", e);
+                                        }
+
+                                        // Send to UI
+                                        let manager = get_nsc_manager();
+                                        let mgr = manager.read().await;
+                                        if let Some(ref tx) = mgr.event_tx {
+                                            let _ = tx.send(NscEvent::MessageReceived {
+                                                channel_id: channel_hex.clone(),
+                                                message: msg,
+                                            }).await;
+                                        }
+                                    }
+                                    MessageType::Heartbeat => {
+                                        log::debug!("[OUTGOING_READER] Received heartbeat from {}", &sender_hex[..16.min(sender_hex.len())]);
+                                    }
+                                    _ => {
+                                        log::debug!("[OUTGOING_READER] Ignored message type {:?}", envelope.message_type);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::debug!("[OUTGOING_READER] Failed to receive/parse message: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::debug!("[OUTGOING_READER] Connection stream ended for {}: {}", &peer_id_hex[..16.min(peer_id_hex.len())], e);
+                        break;
+                    }
+                }
+            }
+            
+            log::info!("[OUTGOING_READER] Reader stopped for {}", &peer_id_hex[..16.min(peer_id_hex.len())]);
+        });
+        
+        Ok(())
+    }
+    
     /// Connect to a peer via relay hub (fallback for symmetric NAT)
     pub async fn connect_via_relay(&self, peer_id_hex: &str, channel_id: Option<&str>) -> Result<(), String> {
         use crate::nsc_transport::RelayState;
@@ -2184,7 +2386,21 @@ impl NscManager {
                                                             let manager = get_nsc_manager();
                                                             let mgr = manager.read().await;
                                                             let info = mgr.channel_info.read().await;
-                                                            info.get(&channel_hex).map(|c| c.is_owner).unwrap_or(false)
+                                                            let result = info.get(&channel_hex).map(|c| c.is_owner).unwrap_or(false);
+                                                            if result {
+                                                                log::info!(
+                                                                    "[WELCOME_CHECK] Channel {} is_owner=true in channel_info, will ignore Welcome",
+                                                                    &channel_hex[..8.min(channel_hex.len())]
+                                                                );
+                                                            } else {
+                                                                let found = info.contains_key(&channel_hex);
+                                                                log::info!(
+                                                                    "[WELCOME_CHECK] Channel {} is_owner=false (found={}), will process Welcome",
+                                                                    &channel_hex[..8.min(channel_hex.len())],
+                                                                    found
+                                                                );
+                                                            }
+                                                            result
                                                         };
                                                         if is_local_owner {
                                                             log::warn!(
@@ -3318,6 +3534,15 @@ impl NscManager {
         rand::thread_rng().fill_bytes(&mut secret_bytes);
         let epoch_secrets = crate::nsc_channel::EpochSecrets::initial(&secret_bytes);
         
+        // Log the temporary key fingerprint for debugging
+        let temp_key_fp = hex::encode(&epoch_secrets.encryption_key[..4]);
+        log::info!(
+            "[ACCEPT_INVITE] Created TEMPORARY epoch secrets for channel {}: epoch={}, key_fp={} - WILL BE REPLACED by Welcome",
+            &invite.channel_id[..8.min(invite.channel_id.len())],
+            epoch_secrets.epoch,
+            temp_key_fp
+        );
+        
         // Initialize the channel in channel_manager
         self.channel_manager
             .join_channel_with_secrets(&channel_id_typed, invite.channel_name.clone(), epoch_secrets)
@@ -3790,6 +4015,13 @@ impl NscManager {
                     } else {
                         log::info!("[NSC_ICE] QUIC connection established with {} at {}", target_nick, connect_addr);
                         
+                        // Start reader for this outgoing connection so we can receive messages back
+                        if let Err(e) = mgr.start_outgoing_connection_reader(&peer_id_to_use).await {
+                            log::warn!("[NSC_ICE] Failed to start outgoing connection reader for {}: {}", target_nick, e);
+                        } else {
+                            log::info!("[NSC_ICE] Started reader for outgoing connection to {}", target_nick);
+                        }
+                        
                         // Send initial heartbeat to trigger peer registration on the other side
                         if let Err(e) = mgr.send_heartbeat_to_peer(&peer_id_to_use).await {
                             log::warn!("[NSC_ICE] Failed to send initial heartbeat to {}: {}", target_nick, e);
@@ -4068,7 +4300,21 @@ impl NscManager {
                                                             let manager = get_nsc_manager();
                                                             let mgr = manager.read().await;
                                                             let info = mgr.channel_info.read().await;
-                                                            info.get(&channel_hex).map(|c| c.is_owner).unwrap_or(false)
+                                                            let result = info.get(&channel_hex).map(|c| c.is_owner).unwrap_or(false);
+                                                            if result {
+                                                                log::info!(
+                                                                    "[WELCOME_CHECK] (relay) Channel {} is_owner=true in channel_info, will ignore Welcome",
+                                                                    &channel_hex[..8.min(channel_hex.len())]
+                                                                );
+                                                            } else {
+                                                                let found = info.contains_key(&channel_hex);
+                                                                log::info!(
+                                                                    "[WELCOME_CHECK] (relay) Channel {} is_owner=false (found={}), will process Welcome",
+                                                                    &channel_hex[..8.min(channel_hex.len())],
+                                                                    found
+                                                                );
+                                                            }
+                                                            result
                                                         };
                                                         if is_local_owner {
                                                             log::warn!(
