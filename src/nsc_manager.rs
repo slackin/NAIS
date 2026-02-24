@@ -1643,6 +1643,15 @@ impl NscManager {
         let epoch_secrets = self.channel_manager.get_epoch_secrets(&channel_id_typed).await
             .ok_or("No epoch secrets for this channel")?;
         
+        // Log key fingerprint being sent for debugging
+        let key_fp = hex::encode(&epoch_secrets.encryption_key[..4]);
+        log::info!(
+            "[WELCOME_SEND] Sending epoch secrets for channel {}: epoch={}, key_fp={}",
+            &channel_id[..8.min(channel_id.len())],
+            epoch_secrets.epoch,
+            key_fp
+        );
+        
         // Serialize epoch secrets
         let secrets_json = serde_json::to_vec(&epoch_secrets)
             .map_err(|e| format!("Failed to serialize epoch secrets: {}", e))?;
@@ -1732,6 +1741,9 @@ impl NscManager {
     /// Attempt to heal channel key drift by re-sending Welcome secrets to a peer
     /// when decryption fails on a locally-owned channel.
     async fn resync_on_decrypt_failure(&self, channel_id: &str, sender_peer_id_hex: &str) {
+        // Debug dump channel state to help diagnose key mismatches
+        self.debug_dump_channel_key_state(channel_id).await;
+        
         let is_local_owner = {
             let info = self.channel_info.read().await;
             info.get(channel_id).map(|c| c.is_owner).unwrap_or(false)
@@ -2156,6 +2168,15 @@ impl NscManager {
 
                                                         match serde_json::from_slice::<EpochSecrets>(&envelope.payload) {
                                                             Ok(secrets) => {
+                                                                // Log received key fingerprint for debugging
+                                                                let key_fp = hex::encode(&secrets.encryption_key[..4]);
+                                                                log::info!(
+                                                                    "[WELCOME_RECV] Received epoch secrets for channel {}: epoch={}, key_fp={}",
+                                                                    &channel_hex[..8.min(channel_hex.len())],
+                                                                    secrets.epoch,
+                                                                    key_fp
+                                                                );
+                                                                
                                                                 let channel_id = ChannelId::from_bytes(envelope.channel_id);
                                                                 let manager = get_nsc_manager();
                                                                 let mgr = manager.read().await;
@@ -3883,6 +3904,53 @@ impl NscManager {
         log::info!("[NSC_DEBUG] ========== END PEER STATE DUMP ==========");
     }
     
+    /// Debug helper: dump channel encryption key state for a specific channel
+    pub async fn debug_dump_channel_key_state(&self, channel_id: &str) {
+        log::info!("[NSC_DEBUG] ========== CHANNEL KEY STATE DUMP for {} ==========", &channel_id[..8.min(channel_id.len())]);
+        
+        // Check channel_info
+        let info = self.channel_info.read().await;
+        if let Some(ch_info) = info.get(channel_id) {
+            log::info!("[NSC_DEBUG] channel_info: name={}, is_owner={}", ch_info.name, ch_info.is_owner);
+        } else {
+            log::info!("[NSC_DEBUG] channel_info: NOT FOUND");
+        }
+        drop(info);
+        
+        // Check channel_manager epoch secrets
+        let channel_bytes = match hex::decode(channel_id) {
+            Ok(b) if b.len() == 32 => b,
+            _ => {
+                log::info!("[NSC_DEBUG] Invalid channel ID format");
+                return;
+            }
+        };
+        let mut channel_arr = [0u8; 32];
+        channel_arr.copy_from_slice(&channel_bytes);
+        let channel_id_typed = crate::nsc_channel::ChannelId::from_bytes(channel_arr);
+        
+        if let Some(epoch_secrets) = self.channel_manager.get_epoch_secrets(&channel_id_typed).await {
+            let key_fp = hex::encode(&epoch_secrets.encryption_key[..4]);
+            log::info!("[NSC_DEBUG] channel_manager.epoch_secrets: epoch={}, key_fp={}, msg_count={}", 
+                epoch_secrets.epoch, key_fp, epoch_secrets.message_count);
+        } else {
+            log::info!("[NSC_DEBUG] channel_manager.epoch_secrets: NOT FOUND");
+        }
+        
+        // Check channel_members
+        let members = self.channel_members.read().await;
+        if let Some(member_list) = members.get(channel_id) {
+            log::info!("[NSC_DEBUG] channel_members ({} entries):", member_list.len());
+            for member in member_list {
+                log::info!("[NSC_DEBUG]   {} is_owner={}", &member.peer_id[..16.min(member.peer_id.len())], member.is_owner);
+            }
+        } else {
+            log::info!("[NSC_DEBUG] channel_members: NOT FOUND");
+        }
+        
+        log::info!("[NSC_DEBUG] ========== END CHANNEL KEY STATE DUMP ==========");
+    }
+    
     /// Start the inbound message handler - accepts connections and routes messages to UI
     pub async fn start_inbound_handler(&self) -> Result<(), String> {
         // Ensure transport is initialized
@@ -3986,6 +4054,15 @@ impl NscManager {
                                                         use crate::nsc_channel::EpochSecrets;
                                                         match serde_json::from_slice::<EpochSecrets>(&envelope.payload) {
                                                             Ok(secrets) => {
+                                                                // Log received key fingerprint for debugging
+                                                                let key_fp = hex::encode(&secrets.encryption_key[..4]);
+                                                                log::info!(
+                                                                    "[WELCOME_RECV] (relay) Received epoch secrets for channel {}: epoch={}, key_fp={}",
+                                                                    &channel_hex[..8.min(channel_hex.len())],
+                                                                    secrets.epoch,
+                                                                    key_fp
+                                                                );
+                                                                
                                                                 let channel_id = ChannelId::from_bytes(envelope.channel_id);
                                                                 let manager = get_nsc_manager();
                                                                 let mgr = manager.read().await;

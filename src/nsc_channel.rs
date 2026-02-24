@@ -1755,6 +1755,16 @@ impl ChannelManager {
         let channel = channels.get(channel_id)
             .ok_or_else(|| ChannelError::NotFound(channel_id.to_hex()))?;
         
+        // Log key fingerprint for debugging
+        let key_fp = hex::encode(&channel.epoch_secrets.encryption_key[..4]);
+        log::debug!(
+            "[ENCRYPT_DEBUG] Encrypting for channel {}: epoch={}, key_fp={}, pt_len={}",
+            &channel_id.to_hex()[..8],
+            channel.epoch_secrets.epoch,
+            key_fp,
+            plaintext.len()
+        );
+        
         channel.epoch_secrets.encrypt(plaintext)
             .map_err(|e| ChannelError::InvalidMetadata(e))
     }
@@ -1765,8 +1775,22 @@ impl ChannelManager {
         let channel = channels.get(channel_id)
             .ok_or_else(|| ChannelError::NotFound(channel_id.to_hex()))?;
         
-        channel.epoch_secrets.decrypt(ciphertext)
-            .map_err(|e| ChannelError::InvalidMetadata(e))
+        // Log key fingerprint on decrypt attempt for debugging key mismatch issues
+        let key_fp = hex::encode(&channel.epoch_secrets.encryption_key[..4]);
+        
+        match channel.epoch_secrets.decrypt(ciphertext) {
+            Ok(plaintext) => Ok(plaintext),
+            Err(e) => {
+                log::warn!(
+                    "[DECRYPT_DEBUG] Failed to decrypt for channel {}: epoch={}, key_fp={}, ct_len={}",
+                    &channel_id.to_hex()[..8],
+                    channel.epoch_secrets.epoch,
+                    key_fp,
+                    ciphertext.len()
+                );
+                Err(ChannelError::InvalidMetadata(e))
+            }
+        }
     }
     
     /// Get epoch secrets for a channel (to share with new members)
@@ -1782,15 +1806,33 @@ impl ChannelManager {
         name: String,
         epoch_secrets: EpochSecrets,
     ) -> ChannelResult<()> {
+        let new_key_fp = hex::encode(&epoch_secrets.encryption_key[..4]);
+        
         // Check if we already have this channel
         if self.channels.read().await.contains_key(channel_id) {
             // Update existing channel's epoch secrets
             let mut channels = self.channels.write().await;
             if let Some(channel) = channels.get_mut(channel_id) {
+                let old_key_fp = hex::encode(&channel.epoch_secrets.encryption_key[..4]);
+                log::info!(
+                    "[JOIN_SECRETS] Updating existing channel {}: old_epoch={} old_key_fp={} -> new_epoch={} new_key_fp={}",
+                    &channel_id.to_hex()[..8],
+                    channel.epoch_secrets.epoch,
+                    old_key_fp,
+                    epoch_secrets.epoch,
+                    new_key_fp
+                );
                 channel.epoch_secrets = epoch_secrets;
             }
             return Ok(());
         }
+        
+        log::info!(
+            "[JOIN_SECRETS] Creating new channel {}: epoch={} key_fp={}",
+            &channel_id.to_hex()[..8],
+            epoch_secrets.epoch,
+            new_key_fp
+        );
         
         // Create channel metadata
         let metadata = ChannelMetadata {
