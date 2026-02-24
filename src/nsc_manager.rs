@@ -1653,6 +1653,9 @@ impl NscManager {
             let peer_addresses = self.peer_addresses.read().await.clone();
             drop(self.peer_addresses.read()); // Release lock before async operations
             
+            // Track peers that need ICE re-discovery (stale addresses)
+            let mut stale_peers: Vec<String> = Vec::new();
+            
             for member_hex in &target_peer_hex {
                 if connected_hex.contains(member_hex) {
                     continue; // Already connected
@@ -1693,12 +1696,14 @@ impl NscManager {
                                     }
                                 }
                                 Ok(Err(e)) => {
-                                    log::warn!("[NSC_SEND] Failed to connect to {}: {}", 
+                                    log::warn!("[NSC_SEND] Failed to connect to {}: {} - removing stale address", 
                                         &member_hex[..16.min(member_hex.len())], e);
+                                    stale_peers.push(member_hex.clone());
                                 }
                                 Err(_) => {
-                                    log::warn!("[NSC_SEND] Connection to {} timed out", 
+                                    log::warn!("[NSC_SEND] Connection to {} timed out - removing stale address", 
                                         &member_hex[..16.min(member_hex.len())]);
+                                    stale_peers.push(member_hex.clone());
                                 }
                             }
                         }
@@ -1706,6 +1711,50 @@ impl NscManager {
                 } else {
                     log::debug!("[NSC_SEND] No known address for disconnected member {}", 
                         &member_hex[..16.min(member_hex.len())]);
+                }
+            }
+            
+            // Remove stale addresses and try relay fallback
+            if !stale_peers.is_empty() {
+                let mut addresses = self.peer_addresses.write().await;
+                for peer_hex in &stale_peers {
+                    addresses.remove(peer_hex);
+                    log::info!("[NSC_SEND] Removed stale address for {}", &peer_hex[..16.min(peer_hex.len())]);
+                }
+                drop(addresses);
+                
+                // Try relay fallback for stale peers
+                for peer_hex in &stale_peers {
+                    log::info!("[NSC_SEND] Trying relay fallback for {}", &peer_hex[..16.min(peer_hex.len())]);
+                    match self.connect_via_relay(peer_hex, Some(channel_id)).await {
+                        Ok(()) => {
+                            log::info!("[NSC_SEND] Relay fallback succeeded for {}", &peer_hex[..16.min(peer_hex.len())]);
+                        }
+                        Err(e) => {
+                            log::warn!("[NSC_SEND] Relay fallback failed for {}: {}", &peer_hex[..16.min(peer_hex.len())], e);
+                        }
+                    }
+                }
+                
+                // Request peer re-discovery for the channel (will trigger new ICE exchanges)
+                if let Some(ref tx) = self.event_tx {
+                    // Get channel's IRC info
+                    let (irc_channel, network) = {
+                        let info = self.channel_info.read().await;
+                        info.get(channel_id)
+                            .map(|c| (c.irc_channel.clone(), c.network.clone()))
+                            .unwrap_or_default()
+                    };
+                    
+                    if !irc_channel.is_empty() && !network.is_empty() {
+                        log::info!("[NSC_SEND] Requesting peer re-discovery for channel {} on {}:{}", 
+                            &channel_id[..8.min(channel_id.len())], network, irc_channel);
+                        let _ = tx.send(NscEvent::RequestPeerDiscovery {
+                            nsc_channel_id: channel_id.to_string(),
+                            irc_channel,
+                            network,
+                        }).await;
+                    }
                 }
             }
             
@@ -1936,6 +1985,9 @@ impl NscManager {
                     let addresses = peer_addresses.read().await.clone();
                     
                     // Try to reconnect to channel members we're not connected to
+                    // Track failed attempts to remove truly stale addresses
+                    let mut stale_to_remove: Vec<String> = Vec::new();
+                    
                     for member_hex in &all_members {
                         if connected_hex.contains(member_hex) {
                             continue;
@@ -1960,16 +2012,27 @@ impl NscManager {
                                                 &member_hex[..16.min(member_hex.len())], addr);
                                         }
                                         Ok(Err(e)) => {
-                                            log::debug!("[HEARTBEAT] Failed to reconnect to {}: {}", 
+                                            log::warn!("[HEARTBEAT] Failed to reconnect to {}: {} - marking as stale", 
                                                 &member_hex[..16.min(member_hex.len())], e);
+                                            stale_to_remove.push(member_hex.clone());
                                         }
                                         Err(_) => {
-                                            log::debug!("[HEARTBEAT] Reconnection to {} timed out", 
+                                            log::warn!("[HEARTBEAT] Reconnection to {} timed out - marking as stale", 
                                                 &member_hex[..16.min(member_hex.len())]);
+                                            stale_to_remove.push(member_hex.clone());
                                         }
                                     }
                                 }
                             }
+                        }
+                    }
+                    
+                    // Remove stale addresses that failed to connect
+                    if !stale_to_remove.is_empty() {
+                        let mut addrs = peer_addresses.write().await;
+                        for peer_hex in &stale_to_remove {
+                            addrs.remove(peer_hex);
+                            log::info!("[HEARTBEAT] Removed stale address for {}", &peer_hex[..16.min(peer_hex.len())]);
                         }
                     }
                     
