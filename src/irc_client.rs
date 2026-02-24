@@ -163,6 +163,8 @@ pub enum IrcEvent {
     UserParted { channel: String, user: String },
     /// A user quit IRC (affects all channels)
     UserQuit { user: String },
+    /// A user changed their nickname
+    UserNickChanged { old_nick: String, new_nick: String },
     Users { channel: String, users: Vec<String> },
     Message { channel: String, user: String, text: String },
     Action { channel: String, user: String, text: String },
@@ -471,6 +473,21 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent, enable_lo
             // Remove the user from all channels (no message, that comes via System event)
             for user_list in state.users_by_channel.values_mut() {
                 user_list.retain(|u| u != &user && u.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~') != user);
+            }
+        }
+        IrcEvent::UserNickChanged { old_nick, new_nick } => {
+            // Update the user's nick in all channel user lists
+            for user_list in state.users_by_channel.values_mut() {
+                for entry in user_list.iter_mut() {
+                    // Strip mode prefixes for comparison but preserve them in the new nick
+                    let bare_nick = entry.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~');
+                    if bare_nick == old_nick {
+                        // Preserve the prefix if any
+                        let prefix_len = entry.len() - bare_nick.len();
+                        let prefix = &entry[..prefix_len];
+                        *entry = format!("{}{}", prefix, new_nick);
+                    }
+                }
             }
         }
         IrcEvent::Message { channel, user, text } => {
@@ -1545,6 +1562,32 @@ async fn handle_connection(
                             .send(IrcEvent::System {
                                 channel: default_channel.clone(),
                                 text: detail,
+                            })
+                            .await;
+                    }
+                    IrcCommand::NICK(ref new_nick) => {
+                        let old_nick = message.source_nickname().unwrap_or("unknown").to_string();
+                        // Check if this is our own nick change
+                        if old_nick == self_nick {
+                            self_nick = new_nick.clone();
+                            let _ = evt_tx
+                                .send(IrcEvent::NickChanged {
+                                    new_nick: new_nick.clone(),
+                                })
+                                .await;
+                        }
+                        // Update user list for all channels
+                        let _ = evt_tx
+                            .send(IrcEvent::UserNickChanged {
+                                old_nick: old_nick.clone(),
+                                new_nick: new_nick.clone(),
+                            })
+                            .await;
+                        // Show nick change message
+                        let _ = evt_tx
+                            .send(IrcEvent::System {
+                                channel: default_channel.clone(),
+                                text: format!("{old_nick} is now known as {new_nick}"),
                             })
                             .await;
                     }

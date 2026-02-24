@@ -408,7 +408,7 @@ fn app() -> Element {
     // Load existing NSC channels on startup
     use_effect(move || {
         spawn(async move {
-            let manager = crate::nsc_manager::get_nsc_manager();
+            let manager = crate::nsc_manager::get_nsc_manager_async().await;
             let mgr = manager.read().await;
             let channels = mgr.list_channels().await;
             let fp = mgr.fingerprint();
@@ -416,7 +416,7 @@ fn app() -> Element {
             
             // Load stored messages for all channels
             for channel in &channels {
-                let stored = crate::nsc_manager::load_messages(&channel.channel_id);
+                let stored = crate::nsc_manager::load_messages_async(&channel.channel_id).await;
                 if !stored.is_empty() {
                     let mut msgs = nsc_messages.write();
                     let channel_msgs = msgs.entry(channel.channel_id.clone()).or_insert_with(Vec::new);
@@ -434,7 +434,7 @@ fn app() -> Element {
     // Initialize NSC transport and start listening for incoming messages
     use_effect(move || {
         spawn(async move {
-            let manager = crate::nsc_manager::get_nsc_manager();
+            let manager = crate::nsc_manager::get_nsc_manager_async().await;
             
             // Initialize transport
             {
@@ -482,7 +482,7 @@ fn app() -> Element {
             // Initial fetch
             let ch_id_initial = ch_id.clone();
             spawn(async move {
-                let manager = crate::nsc_manager::get_nsc_manager();
+                let manager = crate::nsc_manager::get_nsc_manager_async().await;
                 let mgr = manager.read().await;
                 let members = mgr.get_channel_members(&ch_id_initial).await;
                 nsc_channel_members.set(members);
@@ -501,7 +501,7 @@ fn app() -> Element {
                         break;
                     }
                     
-                    let manager = crate::nsc_manager::get_nsc_manager();
+                    let manager = crate::nsc_manager::get_nsc_manager_async().await;
                     let mgr = manager.read().await;
                     let members = mgr.get_channel_members(&ch_id_poll).await;
                     nsc_channel_members.set(members);
@@ -1122,7 +1122,7 @@ fn app() -> Element {
                                             
                                             // Spawn async handler
                                             spawn(async move {
-                                                let manager = crate::nsc_manager::get_nsc_manager();
+                                                let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                                 let mgr = manager.read().await;
                                                 
                                                 log::info!("[UI NSC] Calling handle_nsc_ctcp for {} from {} on profile {}", cmd_str, from_nick, pname);
@@ -1186,7 +1186,7 @@ fn app() -> Element {
                                                     let pname = profile_name.clone();
                                                     
                                                     spawn(async move {
-                                                        let manager = crate::nsc_manager::get_nsc_manager();
+                                                        let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                                         let mgr = manager.read().await;
                                                         let nsc_probe = mgr.create_probe_ctcp();
                                                         drop(mgr);
@@ -1252,7 +1252,7 @@ fn app() -> Element {
                                     
                                     if clean_user != our_nick {
                                         spawn(async move {
-                                            let manager = crate::nsc_manager::get_nsc_manager();
+                                            let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                             let mgr = manager.read().await;
                                             
                                             // Check if this channel maps to an NSC channel
@@ -1293,7 +1293,7 @@ fn app() -> Element {
                                         .unwrap_or_default();
                                     
                                     spawn(async move {
-                                        let manager = crate::nsc_manager::get_nsc_manager();
+                                        let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                         let mgr = manager.read().await;
                                         
                                         // Check if this channel maps to an NSC channel
@@ -1342,7 +1342,7 @@ fn app() -> Element {
                                     // Small delay to let the connection stabilize
                                     Delay::new(Duration::from_millis(500)).await;
                                     
-                                    let manager = crate::nsc_manager::get_nsc_manager();
+                                    let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                     let mgr = manager.read().await;
                                     let channels = mgr.list_channels().await;
                                     drop(mgr);
@@ -2085,15 +2085,17 @@ fn app() -> Element {
                                                         let current_msgs = nsc_messages.read();
                                                         if current_msgs.get(&channel_id_inner).map(|m| m.is_empty()).unwrap_or(true) {
                                                             drop(current_msgs);
-                                                            // Load from storage
-                                                            let stored = crate::nsc_manager::load_messages(&channel_id_inner);
-                                                            if !stored.is_empty() {
-                                                                let mut msgs = nsc_messages.write();
-                                                                let channel_msgs = msgs.entry(channel_id_inner).or_insert_with(Vec::new);
-                                                                for m in stored {
-                                                                    channel_msgs.push((m.timestamp, m.sender, m.text));
+                                                            // Load from storage asynchronously
+                                                            spawn(async move {
+                                                                let stored = crate::nsc_manager::load_messages_async(&channel_id_inner).await;
+                                                                if !stored.is_empty() {
+                                                                    let mut msgs = nsc_messages.write();
+                                                                    let channel_msgs = msgs.entry(channel_id_inner).or_insert_with(Vec::new);
+                                                                    for m in stored {
+                                                                        channel_msgs.push((m.timestamp, m.sender, m.text));
+                                                                    }
                                                                 }
-                                                            }
+                                                            });
                                                         }
                                                     }
                                                     
@@ -5659,7 +5661,7 @@ fn app() -> Element {
                                     if !name.is_empty() && !network.is_empty() {
                                         nsc_loading.set(true);
                                         spawn(async move {
-                                            let manager = crate::nsc_manager::get_nsc_manager();
+                                            let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                             let mgr = manager.read().await;
                                             match mgr.create_channel(name.clone(), network.clone()).await {
                                                 Ok(info) => {
@@ -5766,7 +5768,7 @@ fn app() -> Element {
                                                             log::info!("Leave button clicked for channel: {}", cid);
                                                             spawn(async move {
                                                                 log::info!("Attempting to leave channel: {}", cid);
-                                                                let manager = crate::nsc_manager::get_nsc_manager();
+                                                                let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                                                 let mgr = manager.read().await;
                                                                 match mgr.leave_channel(&cid).await {
                                                                     Ok(()) => {
@@ -5867,7 +5869,7 @@ fn app() -> Element {
                                                         onclick: move |_| {
                                                             let iid = invite_id_decline.clone();
                                                             spawn(async move {
-                                                                let manager = crate::nsc_manager::get_nsc_manager();
+                                                                let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                                                 let mgr = manager.read().await;
                                                                 match mgr.decline_invite(&iid).await {
                                                                     Ok((target_nick, ctcp_response)) => {
@@ -5896,7 +5898,7 @@ fn app() -> Element {
                                                         onclick: move |_| {
                                                             let iid = invite_id_accept.clone();
                                                             spawn(async move {
-                                                                let manager = crate::nsc_manager::get_nsc_manager();
+                                                                let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                                                 let mgr = manager.read().await;
                                                                 match mgr.accept_invite(&iid).await {
                                                                     Ok((target_nick, ctcp_response, irc_channel, network)) => {
@@ -5954,7 +5956,7 @@ fn app() -> Element {
                                                                                 drop(state_read);
                                                                                 
                                                                                 if !users.is_empty() {
-                                                                                    let manager = crate::nsc_manager::get_nsc_manager();
+                                                                                    let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                                                                     let mgr = manager.read().await;
                                                                                     
                                                                                     // Clean user list and record pending probes
@@ -6037,7 +6039,7 @@ fn app() -> Element {
                                 if !name.is_empty() && !network.is_empty() && !*nsc_loading.read() {
                                     nsc_loading.set(true);
                                     spawn(async move {
-                                        let manager = crate::nsc_manager::get_nsc_manager();
+                                        let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                         let mgr = manager.read().await;
                                         match mgr.create_channel(name.clone(), network.clone()).await {
                                             Ok(info) => {
@@ -6073,7 +6075,7 @@ fn app() -> Element {
                                                             drop(state_read);
                                                             
                                                             if !users.is_empty() {
-                                                                let manager = crate::nsc_manager::get_nsc_manager();
+                                                                let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                                                 let mgr = manager.read().await;
                                                                 
                                                                 // Clean user list and record pending probes
@@ -6170,7 +6172,7 @@ fn app() -> Element {
                                                 nsc_invite_modal.set(None);
                                                 
                                                 spawn(async move {
-                                                    let manager = crate::nsc_manager::get_nsc_manager();
+                                                    let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                                     let mgr = manager.read().await;
                                                     
                                                     // Send probe first
@@ -6474,7 +6476,7 @@ fn handle_send_message(
             
             // Send via NSC transport layer
             spawn(async move {
-                let manager = crate::nsc_manager::get_nsc_manager();
+                let manager = crate::nsc_manager::get_nsc_manager_async().await;
                 let mgr = manager.read().await;
                 
                 // Initialize transport if not already done
@@ -6539,7 +6541,7 @@ fn handle_send_message(
                 "info" | "status" => {
                     // Show NSC info
                     spawn(async move {
-                        let manager = crate::nsc_manager::get_nsc_manager();
+                        let manager = crate::nsc_manager::get_nsc_manager_async().await;
                         let mgr = manager.read().await;
                         
                         let peer_id = mgr.peer_id_hex();
@@ -6598,7 +6600,7 @@ fn handle_send_message(
                     } else {
                         let addr_str = subarg.clone();
                         spawn(async move {
-                            let manager = crate::nsc_manager::get_nsc_manager();
+                            let manager = crate::nsc_manager::get_nsc_manager_async().await;
                             let mgr = manager.read().await;
                             
                             // Parse address
@@ -6639,7 +6641,7 @@ fn handle_send_message(
                 "peers" => {
                     // List connected peers
                     spawn(async move {
-                        let manager = crate::nsc_manager::get_nsc_manager();
+                        let manager = crate::nsc_manager::get_nsc_manager_async().await;
                         let mgr = manager.read().await;
                         
                         let peer_count = mgr.connected_peer_count().await;

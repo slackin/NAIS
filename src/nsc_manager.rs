@@ -1287,7 +1287,7 @@ impl NscManager {
 
                                         // Check if we own this channel
                                         let is_local_owner = {
-                                            let manager = get_nsc_manager();
+                                            let manager = get_nsc_manager_async().await;
                                             let mgr = manager.read().await;
                                             let info = mgr.channel_info.read().await;
                                             let result = info.get(&channel_hex).map(|c| c.is_owner).unwrap_or(false);
@@ -1327,7 +1327,7 @@ impl NscManager {
                                                 );
                                                 
                                                 let channel_id = ChannelId::from_bytes(envelope.channel_id);
-                                                let manager = get_nsc_manager();
+                                                let manager = get_nsc_manager_async().await;
                                                 let mgr = manager.read().await;
 
                                                 let name = {
@@ -1363,7 +1363,7 @@ impl NscManager {
                                         let channel_id = ChannelId::from_bytes(envelope.channel_id);
 
                                         let text = {
-                                            let manager = get_nsc_manager();
+                                            let manager = get_nsc_manager_async().await;
                                             let mgr = manager.read().await;
                                             match mgr.channel_manager.decrypt_for_channel(&channel_id, &envelope.payload).await {
                                                 Ok(plaintext) => String::from_utf8_lossy(&plaintext).to_string(),
@@ -1403,7 +1403,7 @@ impl NscManager {
                                         }
 
                                         // Send to UI via message_tx (same channel the listener uses)
-                                        let manager = get_nsc_manager();
+                                        let manager = get_nsc_manager_async().await;
                                         let mgr = manager.read().await;
                                         let message_tx_lock = mgr.message_tx.read().await;
                                         if let Some(ref tx) = *message_tx_lock {
@@ -2362,7 +2362,7 @@ impl NscManager {
     
     /// Start background task to check for needed key rotations
     pub async fn start_key_rotation_check(&self) {
-        let manager = get_nsc_manager();
+        let manager = get_nsc_manager_async().await;
         
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
@@ -2387,7 +2387,7 @@ impl NscManager {
     
     /// Start background task to retry unacknowledged messages
     pub async fn start_retry_loop(&self) {
-        let manager = get_nsc_manager();
+        let manager = get_nsc_manager_async().await;
         
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
@@ -2620,7 +2620,7 @@ impl NscManager {
                                                     // (we were the ICE answerer, they initiated the QUIC connection)
                                                     let sender_hex_for_cleanup = sender_hex.clone();
                                                     tokio::spawn(async move {
-                                                        let manager = get_nsc_manager();
+                                                        let manager = get_nsc_manager_async().await;
                                                         let mgr = manager.read().await;
                                                         let removed = mgr.awaiting_incoming_connections.write().await.remove(&sender_hex_for_cleanup).is_some();
                                                         if removed {
@@ -2635,7 +2635,7 @@ impl NscManager {
                                                     tokio::spawn(async move {
                                                         // Small delay to ensure connection is fully ready
                                                         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                                        let manager = get_nsc_manager();
+                                                        let manager = get_nsc_manager_async().await;
                                                         let mgr = manager.read().await;
                                                         match mgr.sync_epoch_secrets_to_peer(&sender_hex_clone).await {
                                                             Ok(count) => {
@@ -2662,7 +2662,7 @@ impl NscManager {
                                                         // Ignore inbound Welcome updates for channels we own to
                                                         // avoid accidentally overwriting our local channel key.
                                                         let is_local_owner = {
-                                                            let manager = get_nsc_manager();
+                                                            let manager = get_nsc_manager_async().await;
                                                             let mgr = manager.read().await;
                                                             let info = mgr.channel_info.read().await;
                                                             let result = info.get(&channel_hex).map(|c| c.is_owner).unwrap_or(false);
@@ -2702,7 +2702,7 @@ impl NscManager {
                                                                 );
                                                                 
                                                                 let channel_id = ChannelId::from_bytes(envelope.channel_id);
-                                                                let manager = get_nsc_manager();
+                                                                let manager = get_nsc_manager_async().await;
                                                                 let mgr = manager.read().await;
 
                                                                 let name = {
@@ -2748,7 +2748,7 @@ impl NscManager {
                                                             Ok(new_secrets) => {
                                                                 let new_epoch = new_secrets.epoch;
                                                                 let channel_id = ChannelId::from_bytes(envelope.channel_id);
-                                                                let manager = get_nsc_manager();
+                                                                let manager = get_nsc_manager_async().await;
                                                                 let mgr = manager.read().await;
 
                                                                 match mgr.channel_manager.process_commit(&channel_id, new_secrets).await {
@@ -2782,7 +2782,7 @@ impl NscManager {
                                                         let channel_id = ChannelId::from_bytes(envelope.channel_id);
 
                                                         let text = {
-                                                            let manager = get_nsc_manager();
+                                                            let manager = get_nsc_manager_async().await;
                                                             let mgr = manager.read().await;
                                                             match mgr.channel_manager.decrypt_for_channel(&channel_id, &envelope.payload).await {
                                                                 Ok(plaintext) => String::from_utf8_lossy(&plaintext).to_string(),
@@ -4134,7 +4134,7 @@ impl NscManager {
             if let Err(e) = ice_agent.check_connectivity().await {
                 log::warn!("[NSC_ICE] (answerer) Connectivity check failed for {}: {}", target, e);
                 // Clean up ICE agent and pending session on failure
-                let manager = get_nsc_manager();
+                let manager = get_nsc_manager_async().await;
                 let mgr = manager.read().await;
                 mgr.active_ice_agents.write().await.remove(&session_id_for_cleanup);
                 mgr.pending_ice_sessions.write().await.remove(&session_id_for_cleanup);
@@ -4153,7 +4153,7 @@ impl NscManager {
             log::info!("[NSC_ICE] (answerer) Selected candidate: {} for peer {}", addr, target);
             
             // Record the peer's address so we can accept their incoming QUIC connection
-            let manager = get_nsc_manager();
+            let manager = get_nsc_manager_async().await;
             let mgr = manager.read().await;
             
             // Look up full peer_id by matching the truncated prefix from IceMessage
@@ -4182,7 +4182,7 @@ impl NscManager {
             tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
             
             // Clean up ICE agent and pending session after timeout
-            let manager = get_nsc_manager();
+            let manager = get_nsc_manager_async().await;
             let mgr = manager.read().await;
             mgr.active_ice_agents.write().await.remove(&session_id_for_cleanup);
             mgr.pending_ice_sessions.write().await.remove(&session_id_for_cleanup);
@@ -4265,7 +4265,7 @@ impl NscManager {
                     
                     // Establish QUIC connection using the transport address
                     log::info!("[NSC_ICE] Attempting QUIC connection to {} at {}", target_nick, connect_addr);
-                    let manager = get_nsc_manager();
+                    let manager = get_nsc_manager_async().await;
                     let mgr = manager.read().await;
                     
                     // Look up full peer_id by matching the truncated prefix from IceMessage
@@ -4345,7 +4345,7 @@ impl NscManager {
                 Err(e) => {
                     log::error!("ICE connectivity check failed: {}, trying relay fallback", e);
                     // Try relay fallback when ICE fails
-                    let manager = get_nsc_manager();
+                    let manager = get_nsc_manager_async().await;
                     let mgr = manager.read().await;
                     if let Err(relay_err) = mgr.connect_via_relay(&peer_id, channel_id.as_deref()).await {
                         log::error!("Relay fallback also failed: {}", relay_err);
@@ -4554,7 +4554,7 @@ impl NscManager {
                                                         let channel_id = ChannelId::from_bytes(envelope.channel_id);
                                                         
                                                         let text = {
-                                                            let manager = get_nsc_manager();
+                                                            let manager = get_nsc_manager_async().await;
                                                             let mgr = manager.read().await;
                                                             match mgr.channel_manager.decrypt_for_channel(&channel_id, &envelope.payload).await {
                                                                 Ok(plaintext) => String::from_utf8_lossy(&plaintext).to_string(),
@@ -4591,7 +4591,7 @@ impl NscManager {
                                                         // Ignore inbound Welcome updates for channels we own to
                                                         // avoid accidentally overwriting our local channel key.
                                                         let is_local_owner = {
-                                                            let manager = get_nsc_manager();
+                                                            let manager = get_nsc_manager_async().await;
                                                             let mgr = manager.read().await;
                                                             let info = mgr.channel_info.read().await;
                                                             let result = info.get(&channel_hex).map(|c| c.is_owner).unwrap_or(false);
@@ -4633,7 +4633,7 @@ impl NscManager {
                                                                 );
                                                                 
                                                                 let channel_id = ChannelId::from_bytes(envelope.channel_id);
-                                                                let manager = get_nsc_manager();
+                                                                let manager = get_nsc_manager_async().await;
                                                                 let mgr = manager.read().await;
                                                                 
                                                                 // Get channel name from channel_info
@@ -4682,7 +4682,7 @@ impl NscManager {
                                                         // Remove from retry queue - message was delivered
                                                         let pending_key = format!("{}:{}", channel_hex, envelope.sequence_number);
                                                         {
-                                                            let manager = get_nsc_manager();
+                                                            let manager = get_nsc_manager_async().await;
                                                             let mgr = manager.read().await;
                                                             let mut queue = mgr.retry_queue.write().await;
                                                             if queue.remove(&pending_key).is_some() {
@@ -4704,7 +4704,7 @@ impl NscManager {
                                                         log::debug!("Received Heartbeat from {}", sender_hex);
                                                         
                                                         // Update peer last seen timestamp
-                                                        let manager = get_nsc_manager();
+                                                        let manager = get_nsc_manager_async().await;
                                                         let mgr = manager.read().await;
                                                         
                                                         // Find peer by ID and update last_seen
@@ -4727,7 +4727,7 @@ impl NscManager {
                                                         // Parse routing info from payload
                                                         // Format: list of (peer_id, address) tuples
                                                         if let Ok(routes) = serde_json::from_slice::<Vec<(String, String)>>(&envelope.payload) {
-                                                            let manager = get_nsc_manager();
+                                                            let manager = get_nsc_manager_async().await;
                                                             let mgr = manager.read().await;
                                                             let mut addresses = mgr.peer_addresses.write().await;
                                                             let route_count = routes.len();
@@ -4747,7 +4747,7 @@ impl NscManager {
                                                         
                                                         // Add member to channel_members map
                                                         {
-                                                            let manager = get_nsc_manager();
+                                                            let manager = get_nsc_manager_async().await;
                                                             let mgr = manager.read().await;
                                                             mgr.add_channel_member(&channel_hex, &sender_hex, false).await;
                                                         }
@@ -4766,7 +4766,7 @@ impl NscManager {
                                                         
                                                         // Remove member from channel_members map
                                                         {
-                                                            let manager = get_nsc_manager();
+                                                            let manager = get_nsc_manager_async().await;
                                                             let mgr = manager.read().await;
                                                             mgr.remove_channel_member(&channel_hex, &sender_hex).await;
                                                         }
@@ -4784,7 +4784,7 @@ impl NscManager {
                                                         
                                                         // Parse and update channel metadata
                                                         if let Ok(metadata) = serde_json::from_slice::<crate::nsc_irc::MetadataResponse>(&envelope.payload) {
-                                                            let manager = get_nsc_manager();
+                                                            let manager = get_nsc_manager_async().await;
                                                             let mgr = manager.read().await;
                                                             let mut info = mgr.channel_info.write().await;
                                                             
@@ -4806,7 +4806,7 @@ impl NscManager {
                                                         match serde_json::from_slice::<EpochSecrets>(&envelope.payload) {
                                                             Ok(new_secrets) => {
                                                                 let channel_id = ChannelId::from_bytes(envelope.channel_id);
-                                                                let manager = get_nsc_manager();
+                                                                let manager = get_nsc_manager_async().await;
                                                                 let mgr = manager.read().await;
                                                                 
                                                                 match mgr.channel_manager.process_commit(&channel_id, new_secrets).await {
@@ -4837,7 +4837,7 @@ impl NscManager {
                                                         
                                                         match PeerSessionManager::deserialize_prekey_bundle(&envelope.payload) {
                                                             Ok(bundle) => {
-                                                                let manager = get_nsc_manager();
+                                                                let manager = get_nsc_manager_async().await;
                                                                 let mgr = manager.read().await;
                                                                 let fingerprint = bundle.identity_key.fingerprint_hex();
                                                                 mgr.peer_prekey_bundles.write().await.insert(fingerprint.clone(), bundle);
@@ -5319,19 +5319,85 @@ pub fn load_messages(channel_id: &str) -> Vec<StoredMessage> {
     storage.messages.get(channel_id).cloned().unwrap_or_default()
 }
 
+/// Load messages for a channel (async version - offloads file I/O to blocking task)
+pub async fn load_messages_async(channel_id: &str) -> Vec<StoredMessage> {
+    let channel_id = channel_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        load_messages(&channel_id)
+    }).await.unwrap_or_default()
+}
+
+/// Load NSC storage asynchronously (offloads file I/O to blocking task)
+pub async fn load_nsc_storage_async() -> NscStorage {
+    tokio::task::spawn_blocking(load_nsc_storage)
+        .await
+        .unwrap_or_default()
+}
+
+/// Save NSC storage asynchronously (offloads file I/O to blocking task)
+pub async fn save_nsc_storage_async(storage: NscStorage) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        save_nsc_storage(&storage)
+    }).await.map_err(|e| e.to_string())?
+}
+
 // =============================================================================
 // Global Instance
 // =============================================================================
 
-use std::sync::OnceLock;
+use tokio::sync::OnceCell;
 
-static NSC_MANAGER: OnceLock<Arc<tokio::sync::RwLock<NscManager>>> = OnceLock::new();
+static NSC_MANAGER: OnceCell<Arc<tokio::sync::RwLock<NscManager>>> = OnceCell::const_new();
 
-/// Get or initialize the global NSC manager
+/// Get or initialize the global NSC manager (async version)
+/// This properly offloads the heavy initialization to a blocking task
+/// to prevent blocking the async runtime and UI thread.
+pub async fn get_nsc_manager_async() -> Arc<tokio::sync::RwLock<NscManager>> {
+    NSC_MANAGER.get_or_init(|| async {
+        // Offload the heavy synchronous initialization to a blocking task
+        // This includes file I/O, crypto operations, and channel setup
+        let result = tokio::task::spawn_blocking(|| {
+            NscManager::new()
+        }).await;
+        
+        match result {
+            Ok(manager) => Arc::new(tokio::sync::RwLock::new(manager)),
+            Err(e) => {
+                log::error!("Failed to initialize NscManager in blocking task: {}", e);
+                // Fallback to creating on current thread (shouldn't happen in practice)
+                Arc::new(tokio::sync::RwLock::new(NscManager::new()))
+            }
+        }
+    }).await.clone()
+}
+
+/// Get the global NSC manager (synchronous version)
+/// This will block if the manager hasn't been initialized yet.
+/// Prefer using get_nsc_manager_async() in async contexts.
 pub fn get_nsc_manager() -> Arc<tokio::sync::RwLock<NscManager>> {
-    NSC_MANAGER.get_or_init(|| {
-        Arc::new(tokio::sync::RwLock::new(NscManager::new()))
-    }).clone()
+    // Try to get without blocking first
+    if let Some(manager) = NSC_MANAGER.get() {
+        return manager.clone();
+    }
+    
+    // Manager not initialized - we need to initialize it
+    // This is a fallback for sync contexts; prefer async version
+    log::warn!("get_nsc_manager() called before async init - consider using get_nsc_manager_async()");
+    
+    // Check if we're in a tokio runtime
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        // We're in a runtime - use block_in_place to avoid blocking the executor
+        tokio::task::block_in_place(|| {
+            handle.block_on(get_nsc_manager_async())
+        })
+    } else {
+        // Not in a runtime - create a temporary one (not ideal but safe fallback)
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create temporary runtime");
+        rt.block_on(get_nsc_manager_async())
+    }
 }
 
 // =============================================================================
