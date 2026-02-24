@@ -945,8 +945,23 @@ impl NscManager {
         let mut members = self.channel_members.write().await;
         let channel_members = members.entry(channel_id.to_string()).or_insert_with(Vec::new);
         
-        // Check if already a member
-        if channel_members.iter().any(|m| m.peer_id == peer_id_hex) {
+        // Check if already a member - handle truncated IDs
+        // If we find a member with a truncated ID that matches, upgrade it to full ID
+        let existing_idx = channel_members.iter().position(|m| {
+            m.peer_id == peer_id_hex || 
+            peer_id_hex.starts_with(&m.peer_id) || 
+            m.peer_id.starts_with(peer_id_hex)
+        });
+        
+        if let Some(idx) = existing_idx {
+            // Upgrade truncated peer_id to full version if we now have it
+            if peer_id_hex.len() > channel_members[idx].peer_id.len() {
+                log::info!("[ADD_MEMBER] Upgrading truncated peer_id {} -> {} for channel {}", 
+                    &channel_members[idx].peer_id,
+                    &peer_id_hex[..16.min(peer_id_hex.len())],
+                    &channel_id[..8.min(channel_id.len())]);
+                channel_members[idx].peer_id = peer_id_hex.to_string();
+            }
             return;
         }
         
@@ -1709,12 +1724,21 @@ impl NscManager {
                         return None;
                     }
 
+                    // Check if peer is a member - handle both truncated and full peer IDs
+                    // Member peer_ids might be truncated (16 chars) from invite flow,
+                    // while peer_id_hex is full (64 chars) from transport
                     let has_peer = members
                         .get(channel_id)
-                        .map(|list| list.iter().any(|m| m.peer_id == peer_id_hex))
+                        .map(|list| list.iter().any(|m| {
+                            // Match if either starts with the other (handles truncation)
+                            peer_id_hex.starts_with(&m.peer_id) || m.peer_id.starts_with(peer_id_hex)
+                        }))
                         .unwrap_or(false);
 
                     if has_peer {
+                        log::debug!("[SYNC_SECRETS] Will sync channel {} to peer {}", 
+                            &channel_id[..8.min(channel_id.len())], 
+                            &peer_id_hex[..16.min(peer_id_hex.len())]);
                         Some(channel_id.clone())
                     } else {
                         None
@@ -1722,6 +1746,11 @@ impl NscManager {
                 })
                 .collect()
         };
+
+        if channels_to_sync.is_empty() {
+            log::debug!("[SYNC_SECRETS] No owned channels where peer {} is a member", 
+                &peer_id_hex[..16.min(peer_id_hex.len())]);
+        }
 
         let mut synced = 0usize;
         for channel_id in channels_to_sync {

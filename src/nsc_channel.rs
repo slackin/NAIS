@@ -1755,9 +1755,9 @@ impl ChannelManager {
         let channel = channels.get(channel_id)
             .ok_or_else(|| ChannelError::NotFound(channel_id.to_hex()))?;
         
-        // Log key fingerprint for debugging
+        // Log key fingerprint for debugging key mismatch issues
         let key_fp = hex::encode(&channel.epoch_secrets.encryption_key[..4]);
-        log::debug!(
+        log::info!(
             "[ENCRYPT_DEBUG] Encrypting for channel {}: epoch={}, key_fp={}, pt_len={}",
             &channel_id.to_hex()[..8],
             channel.epoch_secrets.epoch,
