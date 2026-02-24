@@ -1807,10 +1807,13 @@ impl RelayClient {
     // Internal: Create QUIC client config
     fn create_client_config(&self) -> Result<ClientConfig, String> {
         // For relay connection, we accept any server cert (relay validates us via message signing)
-        let crypto = rustls::ClientConfig::builder()
+        let mut crypto = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
             .with_no_client_auth();
+        
+        // Must match relay-hub's ALPN protocol
+        crypto.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
         
         let mut config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
