@@ -684,9 +684,10 @@ impl QuicTransport {
             })?;
 
         // Store connection (replace any stale existing connection)
-        log::debug!("[QUIC_CONNECT] Storing connection in map...");
+        log::info!("[QUIC_CONNECT] Storing connection (stable_id={}, remote={}) under peer {}", 
+            connection.stable_id(), connection.remote_address(), peer_id.to_hex()[..16].to_string());
         if let Some(old) = self.connections.write().await.insert(peer_id, connection) {
-            log::info!("[QUIC_CONNECT] Replacing existing connection for {}", peer_id.to_hex()[..16].to_string());
+            log::info!("[QUIC_CONNECT] Replacing existing connection (old stable_id={}) for {}", old.stable_id(), peer_id.to_hex()[..16].to_string());
             old.close(0u8.into(), b"replaced");
         }
 
@@ -729,35 +730,48 @@ impl QuicTransport {
                 TransportError::PeerNotFound(peer_id.to_hex())
             })?;
 
-        log::debug!("[QUIC_SEND] Opening uni stream to {}", peer_id.to_hex());
+        // Check connection state before attempting to send
+        if let Some(reason) = connection.close_reason() {
+            log::error!("[QUIC_SEND] Connection to {} is CLOSED: {:?}", peer_id.to_hex()[..16].to_string(), reason);
+            return Err(TransportError::ConnectionClosed);
+        }
+        
+        let remote_addr = connection.remote_address();
+        let stable_id = connection.stable_id();
+        log::info!("[QUIC_SEND] Opening uni stream to {} (remote={}, stable_id={})", 
+            peer_id.to_hex()[..16].to_string(), remote_addr, stable_id);
+        
         // Open a uni-directional stream for the message
         let mut send_stream = connection
             .open_uni()
             .await
             .map_err(|e| {
-                log::error!("[QUIC_SEND] Failed to open stream: {}", e);
+                log::error!("[QUIC_SEND] Failed to open stream to {}: {}", peer_id.to_hex()[..16].to_string(), e);
                 TransportError::SendFailed(e.to_string())
             })?;
 
+        let stream_id = send_stream.id();
+        log::info!("[QUIC_SEND] Opened stream {} to {}", stream_id, peer_id.to_hex()[..16].to_string());
+
         // Write message
         let data = envelope.to_bytes();
-        log::debug!("[QUIC_SEND] Writing {} bytes to stream", data.len());
+        log::info!("[QUIC_SEND] Writing {} bytes to stream {} (type={:?})", data.len(), stream_id, envelope.message_type);
         send_stream
             .write_all(&data)
             .await
             .map_err(|e| {
-                log::error!("[QUIC_SEND] Failed to write data: {}", e);
+                log::error!("[QUIC_SEND] Failed to write data to stream {}: {}", stream_id, e);
                 TransportError::SendFailed(e.to_string())
             })?;
 
         send_stream
             .finish()
             .map_err(|e| {
-                log::error!("[QUIC_SEND] Failed to finish stream: {}", e);
+                log::error!("[QUIC_SEND] Failed to finish stream {}: {}", stream_id, e);
                 TransportError::SendFailed(e.to_string())
             })?;
         
-        log::debug!("[QUIC_SEND] Successfully sent to {}", peer_id.to_hex());
+        log::info!("[QUIC_SEND] Successfully sent {} bytes on stream {} to {}", data.len(), stream_id, peer_id.to_hex()[..16].to_string());
 
         // Update peer stats
         drop(connections);
@@ -840,7 +854,14 @@ impl QuicTransport {
 
     /// Get a clone of the connection for a peer (used for spawning reader loops)
     pub async fn get_connection(&self, peer_id: &PeerId) -> Option<Connection> {
-        self.connections.read().await.get(peer_id).cloned()
+        let conn = self.connections.read().await.get(peer_id).cloned();
+        if let Some(ref c) = conn {
+            log::info!("[QUIC] get_connection for {}: found (stable_id={}, remote={})", 
+                peer_id.to_hex()[..16].to_string(), c.stable_id(), c.remote_address());
+        } else {
+            log::warn!("[QUIC] get_connection for {}: NOT FOUND", peer_id.to_hex()[..16].to_string());
+        }
+        conn
     }
 
     /// Get peer connection info
@@ -851,12 +872,13 @@ impl QuicTransport {
     /// Register an incoming connection (used when accepting connections)
     /// This allows bidirectional communication with peers who connected to us
     pub async fn register_connection(&self, peer_id: PeerId, connection: Connection, addr: SocketAddr) {
-        log::info!("[QUIC_REGISTER] Registering incoming connection from {} at {}", peer_id.to_hex()[..16].to_string(), addr);
+        log::info!("[QUIC_REGISTER] Registering incoming connection from {} at {} (stable_id={})", 
+            peer_id.to_hex()[..16].to_string(), addr, connection.stable_id());
 
         // Store connection (replace stale existing entry if present)
         log::debug!("[QUIC_REGISTER] Inserting into connections map...");
         if let Some(old) = self.connections.write().await.insert(peer_id, connection) {
-            log::info!("[QUIC_REGISTER] Replaced existing connection for {}", peer_id.to_hex()[..16].to_string());
+            log::info!("[QUIC_REGISTER] Replaced existing connection (old stable_id={}) for {}", old.stable_id(), peer_id.to_hex()[..16].to_string());
             old.close(0u8.into(), b"replaced");
         }
 

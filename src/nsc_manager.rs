@@ -1206,13 +1206,22 @@ impl NscManager {
     /// Start a reader loop for an outgoing connection
     /// This enables receiving messages from peers we connected to (not just peers who connected to us)
     pub async fn start_outgoing_connection_reader(&self, peer_id_hex: &str) -> Result<(), String> {
+        log::info!("[OUTGOING_READER] Setting up reader for peer {}...", &peer_id_hex[..16.min(peer_id_hex.len())]);
+        
         let transport_lock = self.transport.read().await;
         let transport = transport_lock.as_ref()
-            .ok_or("Transport not initialized")?;
+            .ok_or_else(|| {
+                log::error!("[OUTGOING_READER] Transport not initialized!");
+                "Transport not initialized"
+            })?;
         
         // Parse peer ID
-        let bytes = hex::decode(peer_id_hex).map_err(|_| "Invalid peer ID")?;
+        let bytes = hex::decode(peer_id_hex).map_err(|e| {
+            log::error!("[OUTGOING_READER] Invalid peer ID hex: {}", e);
+            "Invalid peer ID"
+        })?;
         if bytes.len() != 32 {
+            log::error!("[OUTGOING_READER] Invalid peer ID length: {} (expected 32)", bytes.len());
             return Err("Invalid peer ID length".to_string());
         }
         let mut arr = [0u8; 32];
@@ -1221,16 +1230,32 @@ impl NscManager {
         
         // Get the connection
         let connection = transport.get_connection(&peer_id).await
-            .ok_or("Connection not found for peer")?;
+            .ok_or_else(|| {
+                log::error!("[OUTGOING_READER] Connection not found for peer {}!", &peer_id_hex[..16.min(peer_id_hex.len())]);
+                "Connection not found for peer"
+            })?;
+        
+        // Verify connection is open
+        if let Some(reason) = connection.close_reason() {
+            log::error!("[OUTGOING_READER] Connection to {} is already closed: {:?}", 
+                &peer_id_hex[..16.min(peer_id_hex.len())], reason);
+            return Err(format!("Connection already closed: {:?}", reason));
+        }
         
         let our_peer_id = self.peer_id_hex();
         let peer_id_hex = peer_id_hex.to_string();
+        let stable_id = connection.stable_id();
+        let remote_addr = connection.remote_address();
+        
+        log::info!("[OUTGOING_READER] Connection verified: stable_id={}, remote={}", stable_id, remote_addr);
         
         // Spawn reader task for this outgoing connection
         tokio::spawn(async move {
-            log::info!("[OUTGOING_READER] Started reader for outgoing connection to {}", &peer_id_hex[..16.min(peer_id_hex.len())]);
+            log::info!("[OUTGOING_READER] Started reader for outgoing connection to {} (stable_id={})", 
+                &peer_id_hex[..16.min(peer_id_hex.len())], connection.stable_id());
             
             loop {
+                log::debug!("[OUTGOING_READER] Waiting for uni stream from {}...", &peer_id_hex[..16.min(peer_id_hex.len())]);
                 match connection.accept_uni().await {
                     Ok(mut recv_stream) => {
                         match crate::nsc_transport::QuicTransport::receive_from_stream(&mut recv_stream).await {
