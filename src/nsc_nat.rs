@@ -1105,8 +1105,30 @@ impl IceAgent {
             pairs.push(pair);
         }
         
-        // Sort pairs by priority
-        pairs.sort_by(|a, b| b.priority.cmp(&a.priority));
+        // Check if we're behind the same NAT as the remote peer
+        // (detected by matching external IPs in ServerReflexive candidates)
+        let local_candidates = self.local_candidates.read().await.clone();
+        let remote_candidates = self.remote_candidates.read().await.clone();
+        let same_nat = Self::detect_same_nat(&local_candidates, &remote_candidates);
+        
+        if same_nat {
+            log::info!("[ICE] Same NAT detected - prioritizing private-to-private pairs for LAN connectivity");
+        }
+        
+        // Sort pairs with custom comparison
+        // If same NAT: prioritize private-to-private (LAN direct)
+        // Otherwise: prioritize public-to-public (WAN bidirectional)
+        pairs.sort_by(|a, b| {
+            let a_score = Self::pair_connectivity_score(&a, same_nat);
+            let b_score = Self::pair_connectivity_score(&b, same_nat);
+            
+            // Higher score = higher priority
+            // If scores are equal, fall back to RFC 5245 priority
+            match b_score.cmp(&a_score) {
+                std::cmp::Ordering::Equal => b.priority.cmp(&a.priority),
+                other => other,
+            }
+        });
         log::info!("[ICE] Total candidate pairs: {}", pairs.len());
     }
 
@@ -1119,14 +1141,17 @@ impl IceAgent {
 
         let pairs = self.pairs.read().await.clone();
         let local_candidates = self.local_candidates.read().await.clone();
+        let remote_candidates = self.remote_candidates.read().await.clone();
+        let same_nat = Self::detect_same_nat(&local_candidates, &remote_candidates);
         
-        log::info!("[ICE] Starting connectivity checks on {} pairs", pairs.len());
+        log::info!("[ICE] Starting connectivity checks on {} pairs (same_nat={})", pairs.len(), same_nat);
         
-        // Log all pairs
+        // Log all pairs with their connectivity scores
         for (i, pair) in pairs.iter().enumerate() {
-            log::info!("[ICE] Pair {}: local={} ({:?}) -> remote={} ({:?}) priority={}", 
+            let score = Self::pair_connectivity_score(&pair, same_nat);
+            log::info!("[ICE] Pair {}: local={} ({:?}) -> remote={} ({:?}) priority={}, conn_score={}", 
                 i, pair.local.address, pair.local.candidate_type, 
-                pair.remote.address, pair.remote.candidate_type, pair.priority);
+                pair.remote.address, pair.remote.candidate_type, pair.priority, score);
         }
         
         // No separate listener task - check_pair handles both requests and responses
@@ -1138,7 +1163,8 @@ impl IceAgent {
                 continue;
             }
 
-            log::info!("[ICE] Checking pair: {} -> {}", pair.local.address, pair.remote.address);
+            log::info!("[ICE] Checking pair: {} -> {} (score={})", 
+                pair.local.address, pair.remote.address, Self::pair_connectivity_score(&pair, same_nat));
             if let Ok(()) = self.check_pair(&socket, &pair).await {
                 // Determine the effective local address for this pair
                 // If our local candidate is a Host with private IP but remote is public,
@@ -1207,6 +1233,78 @@ impl IceAgent {
         
         // No adjustment needed
         pair.clone()
+    }
+
+    /// Detect if local and remote peers are behind the same NAT.
+    /// This is determined by checking if any local ServerReflexive candidate
+    /// shares the same external IP as any remote ServerReflexive candidate.
+    /// When peers share a NAT, private-to-private communication is preferred
+    /// as it stays on the LAN without traversing the NAT.
+    fn detect_same_nat(local_candidates: &[IceCandidate], remote_candidates: &[IceCandidate]) -> bool {
+        // Collect external IPs from local ServerReflexive candidates
+        let local_external_ips: Vec<_> = local_candidates
+            .iter()
+            .filter(|c| c.candidate_type == CandidateType::ServerReflexive)
+            .map(|c| c.address.ip())
+            .collect();
+        
+        // Check if any remote ServerReflexive candidate has the same external IP
+        for remote in remote_candidates {
+            if remote.candidate_type == CandidateType::ServerReflexive {
+                if local_external_ips.contains(&remote.address.ip()) {
+                    log::debug!("[ICE] Same external IP detected: {} - peers likely on same LAN", 
+                        remote.address.ip());
+                    return true;
+                }
+            }
+        }
+        
+        false
+    }
+    
+    /// Calculate a connectivity score for pair prioritization.
+    /// Higher scores are better.
+    /// 
+    /// When `same_nat` is true (peers share external IP, likely on same LAN):
+    /// - Prioritize private-to-private pairs (direct LAN traffic)
+    /// 
+    /// When `same_nat` is false (different networks):
+    /// - Prioritize public-to-public pairs (WAN bidirectional)
+    /// - Deprioritize private-to-public (asymmetric, won't work bidirectionally)
+    /// 
+    /// Score categories vary based on same_nat:
+    fn pair_connectivity_score(pair: &CandidatePair, same_nat: bool) -> u32 {
+        let local_is_public = is_public_ip(&pair.local.address.ip());
+        let remote_is_public = is_public_ip(&pair.remote.address.ip());
+        let local_is_port_mapped = pair.local.candidate_type == CandidateType::PortMapped;
+        
+        if same_nat {
+            // Same NAT scenario: prioritize private-to-private (direct LAN)
+            match (local_is_public, remote_is_public) {
+                // Both private - BEST for same-NAT, direct LAN communication
+                (false, false) => 100,
+                // Both public - still works but goes through NAT hairpinning
+                (true, true) => 80,
+                // Mixed - may work depending on NAT configuration
+                _ => 50,
+            }
+        } else {
+            // Different NAT scenario: prioritize public-to-public (WAN bidirectional)
+            match (local_is_public, remote_is_public, local_is_port_mapped) {
+                // Both public - best for WAN bidirectional connectivity
+                (true, true, _) => 100,
+                // UPnP port-mapped local with public remote - good WAN pair
+                (_, true, true) => 95,
+                // Both private - symmetric but won't work across WANs
+                (false, false, _) => 90,
+                // Public local, private remote - unusual but symmetric
+                (true, false, _) => 85,
+                // Private local, public remote - ASYMMETRIC, deprioritize heavily
+                // This pair would only work if NAT hairpinning is supported, and
+                // the remote cannot directly address our private IP anyway
+                (false, true, false) => 10,
+            }
+        }
     }
 
     /// Check a single candidate pair with BIDIRECTIONAL verification
