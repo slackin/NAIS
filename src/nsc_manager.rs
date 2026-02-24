@@ -474,6 +474,8 @@ pub struct NscManager {
     ice_offer_in_progress: Arc<RwLock<HashSet<String>>>,
     /// Per (channel, peer) cooldown timestamps for decrypt-failure resync attempts
     decrypt_resync_backoff_until: Arc<RwLock<HashMap<String, u64>>>,
+    /// Message sender for UI listener (set when start_listener is called)
+    message_tx: Arc<RwLock<Option<mpsc::Sender<(String, NscMessage)>>>>,
 }
 
 /// Pending ICE session info
@@ -733,6 +735,7 @@ impl NscManager {
             pending_probes: Arc::new(RwLock::new(HashMap::new())),
             ice_offer_in_progress: Arc::new(RwLock::new(HashSet::new())),
             decrypt_resync_backoff_until: Arc::new(RwLock::new(HashMap::new())),
+            message_tx: Arc::new(RwLock::new(None)),
         };
         
         // Save identity if newly generated
@@ -1394,14 +1397,18 @@ impl NscManager {
                                             log::warn!("[OUTGOING_READER] Failed to persist message: {}", e);
                                         }
 
-                                        // Send to UI
+                                        // Send to UI via message_tx (same channel the listener uses)
                                         let manager = get_nsc_manager();
                                         let mgr = manager.read().await;
-                                        if let Some(ref tx) = mgr.event_tx {
-                                            let _ = tx.send(NscEvent::MessageReceived {
-                                                channel_id: channel_hex.clone(),
-                                                message: msg,
-                                            }).await;
+                                        let message_tx_lock = mgr.message_tx.read().await;
+                                        if let Some(ref tx) = *message_tx_lock {
+                                            log::info!("[OUTGOING_READER] Delivering message to UI: channel={}, len={}",
+                                                &channel_hex[..8.min(channel_hex.len())], msg.text.len());
+                                            if tx.send((channel_hex.clone(), msg)).await.is_err() {
+                                                log::warn!("[OUTGOING_READER] Message receiver dropped - UI not listening!");
+                                            }
+                                        } else {
+                                            log::warn!("[OUTGOING_READER] message_tx not set - listener not started?");
                                         }
                                     }
                                     MessageType::Heartbeat => {
@@ -2315,6 +2322,12 @@ impl NscManager {
         }
         
         let (tx, rx) = mpsc::channel(100);
+        
+        // Store tx for use by OUTGOING_READER (messages from connections we initiated)
+        {
+            let mut message_tx_lock = self.message_tx.write().await;
+            *message_tx_lock = Some(tx.clone());
+        }
         
         // Get transport reference
         let transport = {
