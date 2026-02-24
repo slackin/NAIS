@@ -472,6 +472,8 @@ pub struct NscManager {
     /// Nicks for whom we're currently creating an ICE offer (for glare detection)
     /// This tracks offers in-progress before candidates are gathered
     ice_offer_in_progress: Arc<RwLock<HashSet<String>>>,
+    /// Per (channel, peer) cooldown timestamps for decrypt-failure resync attempts
+    decrypt_resync_backoff_until: Arc<RwLock<HashMap<String, u64>>>,
 }
 
 /// Pending ICE session info
@@ -501,6 +503,9 @@ pub struct SentInvite {
     /// IRC network this channel belongs to (profile name)
     pub network: String,
 }
+
+/// Cooldown window for decrypt-failure resync (seconds)
+const DECRYPT_RESYNC_BACKOFF_SECS: u64 = 20;
 
 impl NscManager {
     /// Create or load NSC manager
@@ -727,6 +732,7 @@ impl NscManager {
             left_channels: Arc::new(RwLock::new(storage.left_channels.clone())),
             pending_probes: Arc::new(RwLock::new(HashMap::new())),
             ice_offer_in_progress: Arc::new(RwLock::new(HashSet::new())),
+            decrypt_resync_backoff_until: Arc::new(RwLock::new(HashMap::new())),
         };
         
         // Save identity if newly generated
@@ -1733,6 +1739,26 @@ impl NscManager {
 
         if !is_local_owner {
             return;
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let key = format!("{}:{}", channel_id, sender_peer_id_hex);
+        {
+            let mut backoff = self.decrypt_resync_backoff_until.write().await;
+            if let Some(until) = backoff.get(&key) {
+                if now < *until {
+                    log::debug!(
+                        "[NSC_HEAL] Suppressed resync for {} (cooldown {}s remaining)",
+                        &channel_id[..8.min(channel_id.len())],
+                        *until - now
+                    );
+                    return;
+                }
+            }
+            backoff.insert(key, now + DECRYPT_RESYNC_BACKOFF_SECS);
         }
 
         // Ensure membership reflects active traffic from this peer.
