@@ -1640,8 +1640,76 @@ impl NscManager {
 
         let transport_lock = self.transport.read().await;
         if let Some(ref transport) = *transport_lock {
-            let connected_peers = transport.connected_peers().await;
-            log::info!("[NSC_SEND] Transport available, {} connected peers", connected_peers.len());
+            let mut connected_peers = transport.connected_peers().await;
+            log::info!("[NSC_SEND] Transport available, {} connected peers initially", connected_peers.len());
+            
+            // Build a set of connected peer hex IDs for quick lookup
+            let connected_hex: std::collections::HashSet<String> = connected_peers
+                .iter()
+                .map(|p| hex::encode(p.0))
+                .collect();
+            
+            // Try to connect to channel members we have addresses for but aren't connected to
+            let peer_addresses = self.peer_addresses.read().await.clone();
+            drop(self.peer_addresses.read()); // Release lock before async operations
+            
+            for member_hex in &target_peer_hex {
+                if connected_hex.contains(member_hex) {
+                    continue; // Already connected
+                }
+                
+                // Check if we have an address for this peer
+                if let Some(addr) = peer_addresses.get(member_hex) {
+                    log::info!("[NSC_SEND] Attempting to connect to disconnected channel member {} at {}", 
+                        &member_hex[..16.min(member_hex.len())], addr);
+                    
+                    // Parse peer ID
+                    if let Ok(peer_bytes) = hex::decode(member_hex) {
+                        if peer_bytes.len() == 32 {
+                            let mut arr = [0u8; 32];
+                            arr.copy_from_slice(&peer_bytes);
+                            let peer_id = PeerId(arr);
+                            
+                            // Attempt connection with short timeout
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(3),
+                                transport.connect(peer_id, *addr)
+                            ).await {
+                                Ok(Ok(())) => {
+                                    log::info!("[NSC_SEND] Successfully connected to {} at {}", 
+                                        &member_hex[..16.min(member_hex.len())], addr);
+                                    connected_peers.push(peer_id);
+                                    
+                                    // Start reader for this new connection
+                                    if let Err(e) = self.start_outgoing_connection_reader(member_hex).await {
+                                        log::warn!("[NSC_SEND] Failed to start reader for {}: {}", 
+                                            &member_hex[..16.min(member_hex.len())], e);
+                                    }
+                                    
+                                    // Send initial heartbeat to trigger peer registration on other side
+                                    if let Err(e) = self.send_heartbeat_to_peer(member_hex).await {
+                                        log::warn!("[NSC_SEND] Failed to send heartbeat to {}: {}", 
+                                            &member_hex[..16.min(member_hex.len())], e);
+                                    }
+                                }
+                                Ok(Err(e)) => {
+                                    log::warn!("[NSC_SEND] Failed to connect to {}: {}", 
+                                        &member_hex[..16.min(member_hex.len())], e);
+                                }
+                                Err(_) => {
+                                    log::warn!("[NSC_SEND] Connection to {} timed out", 
+                                        &member_hex[..16.min(member_hex.len())]);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    log::debug!("[NSC_SEND] No known address for disconnected member {}", 
+                        &member_hex[..16.min(member_hex.len())]);
+                }
+            }
+            
+            log::info!("[NSC_SEND] After connection attempts, {} connected peers", connected_peers.len());
             
             if connected_peers.is_empty() {
                 log::warn!("[NSC_SEND] NO CONNECTED PEERS - message will only be stored locally!");
@@ -1835,6 +1903,8 @@ impl NscManager {
         let identity = self.identity.clone();
         let peer_id = self.peer_id;
         let sequence_numbers = self.sequence_numbers.clone();
+        let peer_addresses = self.peer_addresses.clone();
+        let channel_members = self.channel_members.clone();
         
         tokio::spawn(async move {
             let interval = tokio::time::Duration::from_secs(interval_secs);
@@ -1845,6 +1915,65 @@ impl NscManager {
                 
                 let transport_lock = transport.read().await;
                 if let Some(ref transport) = *transport_lock {
+                    // Build set of all channel member peer IDs (excluding ourselves)
+                    let our_peer_hex = hex::encode(peer_id.0);
+                    let all_members: std::collections::HashSet<String> = {
+                        let members = channel_members.read().await;
+                        members.values()
+                            .flat_map(|list| list.iter())
+                            .filter(|m| m.peer_id != our_peer_hex)
+                            .map(|m| m.peer_id.clone())
+                            .collect()
+                    };
+                    
+                    // Check for disconnected members we have addresses for
+                    let connected_peers = transport.connected_peers().await;
+                    let connected_hex: std::collections::HashSet<String> = connected_peers
+                        .iter()
+                        .map(|p| hex::encode(p.0))
+                        .collect();
+                    
+                    let addresses = peer_addresses.read().await.clone();
+                    
+                    // Try to reconnect to channel members we're not connected to
+                    for member_hex in &all_members {
+                        if connected_hex.contains(member_hex) {
+                            continue;
+                        }
+                        
+                        if let Some(addr) = addresses.get(member_hex) {
+                            log::info!("[HEARTBEAT] Attempting to reconnect to disconnected member {} at {}", 
+                                &member_hex[..16.min(member_hex.len())], addr);
+                            
+                            if let Ok(peer_bytes) = hex::decode(member_hex) {
+                                if peer_bytes.len() == 32 {
+                                    let mut arr = [0u8; 32];
+                                    arr.copy_from_slice(&peer_bytes);
+                                    let target_peer_id = PeerId(arr);
+                                    
+                                    match tokio::time::timeout(
+                                        std::time::Duration::from_secs(3),
+                                        transport.connect(target_peer_id, *addr)
+                                    ).await {
+                                        Ok(Ok(())) => {
+                                            log::info!("[HEARTBEAT] Reconnected to {} at {}", 
+                                                &member_hex[..16.min(member_hex.len())], addr);
+                                        }
+                                        Ok(Err(e)) => {
+                                            log::debug!("[HEARTBEAT] Failed to reconnect to {}: {}", 
+                                                &member_hex[..16.min(member_hex.len())], e);
+                                        }
+                                        Err(_) => {
+                                            log::debug!("[HEARTBEAT] Reconnection to {} timed out", 
+                                                &member_hex[..16.min(member_hex.len())]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Now send heartbeat to all connected peers
                     let seq = {
                         let mut seqs = sequence_numbers.write().await;
                         let seq = seqs.entry("__heartbeat__".to_string()).or_insert(0);
@@ -4186,6 +4315,18 @@ impl NscManager {
         for (id, session) in ice_sessions.iter() {
             log::info!("[NSC_DEBUG]   {} -> target={}, is_initiator={}, channel={:?}", 
                 id, session.target_nick, session.is_initiator, session.channel_id);
+        }
+        
+        // Dump channel_members
+        let members = self.channel_members.read().await;
+        log::info!("[NSC_DEBUG] channel_members ({} channels):", members.len());
+        for (channel_id, member_list) in members.iter() {
+            log::info!("[NSC_DEBUG]   channel {} ({} members):", 
+                &channel_id[..8.min(channel_id.len())], member_list.len());
+            for member in member_list {
+                log::info!("[NSC_DEBUG]     {} is_owner={}", 
+                    &member.peer_id[..16.min(member.peer_id.len())], member.is_owner);
+            }
         }
         
         // Dump transport state
