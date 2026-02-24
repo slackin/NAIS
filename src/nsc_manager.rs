@@ -476,6 +476,10 @@ pub struct NscManager {
     decrypt_resync_backoff_until: Arc<RwLock<HashMap<String, u64>>>,
     /// Message sender for UI listener (set when start_listener is called)
     message_tx: Arc<RwLock<Option<mpsc::Sender<(String, NscMessage)>>>>,
+    /// Peers we're awaiting incoming QUIC connections from (as answerer in ICE)
+    /// These should NOT be reconnected by the heartbeat loop - the initiator will connect to us.
+    /// Maps peer_id_hex -> timestamp when we started waiting
+    awaiting_incoming_connections: Arc<RwLock<HashMap<String, std::time::Instant>>>,
 }
 
 /// Pending ICE session info
@@ -736,6 +740,7 @@ impl NscManager {
             ice_offer_in_progress: Arc::new(RwLock::new(HashSet::new())),
             decrypt_resync_backoff_until: Arc::new(RwLock::new(HashMap::new())),
             message_tx: Arc::new(RwLock::new(None)),
+            awaiting_incoming_connections: Arc::new(RwLock::new(HashMap::new())),
         };
         
         // Save identity if newly generated
@@ -1954,6 +1959,7 @@ impl NscManager {
         let sequence_numbers = self.sequence_numbers.clone();
         let peer_addresses = self.peer_addresses.clone();
         let channel_members = self.channel_members.clone();
+        let awaiting_incoming = self.awaiting_incoming_connections.clone();
         
         tokio::spawn(async move {
             let interval = tokio::time::Duration::from_secs(interval_secs);
@@ -1984,12 +1990,42 @@ impl NscManager {
                     
                     let addresses = peer_addresses.read().await.clone();
                     
+                    // Get peers we're awaiting incoming connections from (as ICE answerer)
+                    // and clean up expired entries (30 second timeout)
+                    let awaiting_peers: std::collections::HashSet<String> = {
+                        let mut awaiting = awaiting_incoming.write().await;
+                        let now = std::time::Instant::now();
+                        let stale_timeout = std::time::Duration::from_secs(30);
+                        
+                        // Remove entries older than 30 seconds
+                        awaiting.retain(|peer_hex, started_at| {
+                            let elapsed = now.duration_since(*started_at);
+                            if elapsed > stale_timeout {
+                                log::debug!("[HEARTBEAT] Removed stale awaiting_incoming entry for {} ({}s)", 
+                                    &peer_hex[..16.min(peer_hex.len())], elapsed.as_secs());
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        
+                        awaiting.keys().cloned().collect()
+                    };
+                    
                     // Try to reconnect to channel members we're not connected to
                     // Track failed attempts to remove truly stale addresses
                     let mut stale_to_remove: Vec<String> = Vec::new();
                     
                     for member_hex in &all_members {
                         if connected_hex.contains(member_hex) {
+                            continue;
+                        }
+                        
+                        // Skip peers we're awaiting incoming connections from (we're the ICE answerer)
+                        // The initiator should connect to us, not the other way around
+                        if awaiting_peers.contains(member_hex) {
+                            log::debug!("[HEARTBEAT] Skipping {} - awaiting their incoming QUIC connection (ICE answerer)", 
+                                &member_hex[..16.min(member_hex.len())]);
                             continue;
                         }
                         
@@ -2579,6 +2615,19 @@ impl NscManager {
                                                     transport_clone.register_connection(peer_id, connection_for_register.clone(), addr).await;
                                                     peer_registered = true;
                                                     log::info!("Registered incoming peer {} for bidirectional messaging", sender_hex);
+                                                    
+                                                    // Remove from awaiting_incoming_connections since they connected successfully
+                                                    // (we were the ICE answerer, they initiated the QUIC connection)
+                                                    let sender_hex_for_cleanup = sender_hex.clone();
+                                                    tokio::spawn(async move {
+                                                        let manager = get_nsc_manager();
+                                                        let mgr = manager.read().await;
+                                                        let removed = mgr.awaiting_incoming_connections.write().await.remove(&sender_hex_for_cleanup).is_some();
+                                                        if removed {
+                                                            log::info!("[NSC_LISTENER] Removed {} from awaiting_incoming_connections - connection established", 
+                                                                &sender_hex_for_cleanup[..16.min(sender_hex_for_cleanup.len())]);
+                                                        }
+                                                    });
                                                     
                                                     // Sync epoch secrets for channels we own that this peer is a member of
                                                     // This handles the answerer side (initiator sends Welcome in complete_ice_exchange)
@@ -4119,6 +4168,9 @@ impl NscManager {
                 log::info!("[NSC_ICE] (answerer) Found full peer_id matching prefix {} for {}", &peer_id, target);
                 // Record the peer's address - the initiator will connect to us
                 mgr.peer_addresses.write().await.insert(full_id.clone(), addr);
+                // Mark that we're awaiting an incoming connection from this peer
+                // This prevents the heartbeat from trying to connect to them (we're the answerer!)
+                mgr.awaiting_incoming_connections.write().await.insert(full_id.clone(), std::time::Instant::now());
                 log::info!("[NSC_ICE] (answerer) Recorded peer {} address {} - waiting for their QUIC connection", target, addr);
                 mgr.debug_dump_peer_state().await;
             } else {
