@@ -1,0 +1,84 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v0.1.0)'
+        required: false
+        default: 'dev'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev libopus-dev
+      
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+      
+      - name: Build release
+        run: cargo build --release
+      
+      - name: Upload Linux binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: nais_client-linux-x86_64
+          path: target/release/nais_client
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      
+      - name: Build release
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: nais_client-windows-x86_64
+          path: target/x86_64-pc-windows-msvc/release/nais_client.exe
+
+  create-release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          cp artifacts/nais_client-linux-x86_64/nais_client release/nais_client-linux-x86_64
+          cp artifacts/nais_client-windows-x86_64/nais_client.exe release/nais_client-windows-x86_64.exe
+          chmod +x release/nais_client-linux-x86_64
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/nais_client-linux-x86_64
+            release/nais_client-windows-x86_64.exe
+          generate_release_notes: true

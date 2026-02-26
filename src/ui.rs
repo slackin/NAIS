@@ -332,6 +332,12 @@ fn app() -> Element {
     let mut topic_collapsed = use_signal(|| false);
     let mut user_menu_open: Signal<Option<String>> = use_signal(|| None);
     let mut ctcp_submenu_open: Signal<bool> = use_signal(|| false);
+    
+    // Virtual scrolling state for message performance optimization
+    // Only render messages within the visible viewport + buffer
+    let mut visible_message_range: Signal<(usize, usize)> = use_signal(|| (0, 100));
+    // Cache for sorted user lists per channel (profile+channel -> sorted users)
+    let mut cached_sorted_users: Signal<HashMap<String, Vec<String>>> = use_signal(HashMap::new);
 
     // WHOIS popup state
     let mut whois_popup: Signal<Option<WhoisInfo>> = use_signal(|| None);
@@ -1729,7 +1735,8 @@ fn app() -> Element {
                                                 },
                                                 "Edit"
                                             }
-                                            // Server Log toggle - always available
+                                            // Server Log toggle - only available in advanced mode
+                                            if *settings_show_advanced.read() {
                                             button {
                                                 class: "menu-item",
                                                 onclick: move |_| {
@@ -1761,6 +1768,7 @@ fn app() -> Element {
                                                     let is_visible = show_server_log.read().get(&prof_name_for_log_toggle).copied().unwrap_or(false);
                                                     if is_visible { "Hide Server Log" } else { "Show Server Log" }
                                                 }
+                                            }
                                             }
                                             button {
                                                 class: "menu-item",
@@ -1877,13 +1885,13 @@ fn app() -> Element {
                         }
                     }
                     ul {
-                        // Server Log channel - show if enabled for this profile
-                        // (previously required advanced mode, but now always available)
+                        // Server Log channel - show if enabled for this profile and advanced mode is on
                         {
                             let active_profile = state.read().active_profile.clone();
                             let log_visible = show_server_log.read().get(&active_profile).copied().unwrap_or(false);
+                            let advanced_on = *settings_show_advanced.read();
                             
-                            if log_visible {
+                            if log_visible && advanced_on {
                                 Some(rsx! {
                                     li {
                                         button {
@@ -1959,11 +1967,16 @@ fn app() -> Element {
                         
                         // Regular channels
                         {
-                            let channels = state.read()
+                            let advanced_on = *settings_show_advanced.read();
+                            let channels: Vec<String> = state.read()
                                 .servers
                                 .get(&state.read().active_profile)
                                 .map(|s| s.channels.clone())
-                                .unwrap_or_default();
+                                .unwrap_or_default()
+                                .into_iter()
+                                // Hide #nais-* IRC channels when Advanced Features is off
+                                .filter(|c| advanced_on || !c.starts_with("#nais-"))
+                                .collect();
                             
                             let topics_map = state.read()
                                 .servers
@@ -2006,6 +2019,8 @@ fn app() -> Element {
                                                         }
                                                         // Clear NSC channel selection
                                                         nsc_current_channel.set(None);
+                                                        // Reset virtual scroll to show only recent messages
+                                                        visible_message_range.set((0, 100));
                                                         // Force scroll to bottom on channel change
                                                         force_scroll_to_bottom.set(true);
                                                         // Focus the chat input
@@ -2099,6 +2114,8 @@ fn app() -> Element {
                                                         }
                                                     }
                                                     
+                                                    // Reset virtual scroll to show only recent messages
+                                                    visible_message_range.set((0, 100));
                                                     force_scroll_to_bottom.set(true);
                                                     // Focus the chat input
                                                     let _ = document::eval(
@@ -2197,6 +2214,8 @@ fn app() -> Element {
 
                     div {
                         class: "messages",
+                        // CSS optimization: hint that content will scroll for GPU acceleration
+                        style: "will-change: scroll-position; contain: content;",
                         onscroll: move |_evt| {
                             // Detect if user is at the bottom of scroll
                             spawn(async move {
@@ -2358,7 +2377,10 @@ fn app() -> Element {
                                 }
                             } else {
                                 // Clone and filter in one pass - only current channel messages
-                                let filtered: Vec<_> = server_state
+                                // Performance optimization: only render the last N messages
+                                const MAX_VISIBLE_MESSAGES: usize = 150;
+                                
+                                let all_filtered: Vec<_> = server_state
                                     .map(|s| s.messages.iter()
                                         .filter(|m| m.channel == current_channel)
                                         .cloned()
@@ -2366,8 +2388,41 @@ fn app() -> Element {
                                     .unwrap_or_default();
                                 drop(state_read);
                                 
+                                let total_count = all_filtered.len();
+                                let (visible_start, _) = *visible_message_range.read();
+                                
+                                // Calculate start index: show from visible_start or from (total - MAX) if not expanded
+                                let start_idx = if visible_start > 0 {
+                                    0 // User wants to see older messages
+                                } else if total_count > MAX_VISIBLE_MESSAGES {
+                                    total_count - MAX_VISIBLE_MESSAGES
+                                } else {
+                                    0
+                                };
+                                
+                                let visible_messages: Vec<_> = all_filtered.into_iter()
+                                    .skip(start_idx)
+                                    .collect();
+                                
+                                let hidden_count = start_idx;
+                                
                                 rsx! {
-                                    for msg in filtered {
+                                    if hidden_count > 0 {
+                                        div {
+                                            class: "message system",
+                                            style: "text-align: center; cursor: pointer;",
+                                            onclick: move |_| {
+                                                // Expand to show all messages
+                                                visible_message_range.set((1, 0));
+                                            },
+                                            div {
+                                                class: "system-text",
+                                                style: "color: var(--accent);",
+                                                "⬆ Load {hidden_count} earlier messages"
+                                            }
+                                        }
+                                    }
+                                    for msg in visible_messages {
                                         {
                                             let id = msg.id;
                                             message_view(msg, id)
@@ -2553,7 +2608,9 @@ fn app() -> Element {
                             // IMPORTANT: Capture active_profile here so click handlers use the profile
                             // that was active when the user list was rendered, not when clicked
                             let userlist_profile = state.read().active_profile.clone();
-                            let mut users = state.read()
+                            
+                            // Get raw user list for current channel
+                            let raw_users = state.read()
                                 .servers
                                 .get(&userlist_profile)
                                 .and_then(|s| {
@@ -2561,29 +2618,48 @@ fn app() -> Element {
                                 })
                                 .unwrap_or_default();
                             
-                            // Sort users: ops (@) first, then voice (+), then regular users
-                            users.sort_by(|a, b| {
-                                let a_prefix = a.chars().next().unwrap_or(' ');
-                                let b_prefix = b.chars().next().unwrap_or(' ');
-                                
-                                let a_rank = match a_prefix {
-                                    '@' => 0, // Ops first
-                                    '+' => 1, // Voice second
-                                    _ => 2,   // Regular users last
-                                };
-                                let b_rank = match b_prefix {
-                                    '@' => 0,
-                                    '+' => 1,
-                                    _ => 2,
-                                };
-                                
-                                // First compare by rank, then alphabetically
-                                a_rank.cmp(&b_rank).then_with(|| {
-                                    let a_name = a.trim_start_matches(['@', '+']);
-                                    let b_name = b.trim_start_matches(['@', '+']);
-                                    a_name.to_lowercase().cmp(&b_name.to_lowercase())
-                                })
-                            });
+                            // Create cache key for this profile+channel
+                            let cache_key = format!("{}:{}", userlist_profile, current_channel);
+                            
+                            // Check if we need to re-sort (compare with cached)
+                            let cached = cached_sorted_users.read();
+                            let need_resort = cached.get(&cache_key)
+                                .map(|sorted| sorted.len() != raw_users.len())
+                                .unwrap_or(true);
+                            drop(cached);
+                            
+                            let users = if need_resort {
+                                // Sort users: ops (@) first, then voice (+), then regular users
+                                let mut sorted = raw_users;
+                                sorted.sort_by(|a, b| {
+                                    let a_prefix = a.chars().next().unwrap_or(' ');
+                                    let b_prefix = b.chars().next().unwrap_or(' ');
+                                    
+                                    let a_rank = match a_prefix {
+                                        '@' => 0, // Ops first
+                                        '+' => 1, // Voice second
+                                        _ => 2,   // Regular users last
+                                    };
+                                    let b_rank = match b_prefix {
+                                        '@' => 0,
+                                        '+' => 1,
+                                        _ => 2,
+                                    };
+                                    
+                                    // First compare by rank, then alphabetically
+                                    a_rank.cmp(&b_rank).then_with(|| {
+                                        let a_name = a.trim_start_matches(['@', '+']);
+                                        let b_name = b.trim_start_matches(['@', '+']);
+                                        a_name.to_lowercase().cmp(&b_name.to_lowercase())
+                                    })
+                                });
+                                // Update cache with newly sorted list
+                                cached_sorted_users.write().insert(cache_key.clone(), sorted.clone());
+                                sorted
+                            } else {
+                                // Use cached sorted list
+                                cached_sorted_users.read().get(&cache_key).cloned().unwrap_or_default()
+                            };
                             
                             rsx! {
                                 div {
@@ -8135,6 +8211,9 @@ fn message_view(msg: ChatMessage, key: u64) -> Element {
         div {
             key: "{key}",
             class: format!("message{system_class}{action_class}"),
+            // content-visibility: auto allows the browser to skip rendering off-screen messages
+            // contain-intrinsic-size provides a placeholder size for scroll calculations
+            style: "content-visibility: auto; contain-intrinsic-size: auto 60px;",
             onclick: move |_| {
                 if !msg.is_system && !always_show_timestamps() {
                     show_timestamp_clicked.set(true);
