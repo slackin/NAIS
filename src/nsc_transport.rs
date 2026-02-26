@@ -701,6 +701,51 @@ impl QuicTransport {
         Ok(())
     }
 
+    /// Send hole-punch packets to a remote address using the QUIC endpoint.
+    /// This initiates a QUIC connection attempt but doesn't wait for completion.
+    /// The Initial packets sent by QUIC act as NAT hole-punch packets.
+    /// 
+    /// This is useful when the answerer needs to punch a hole from their side
+    /// so the initiator's QUIC connection can reach them through NAT.
+    pub fn send_hole_punch(&self, addr: SocketAddr) -> TransportResult<()> {
+        log::info!("[HOLE_PUNCH_QUIC] Sending hole-punch packets to {}", addr);
+
+        // Create client config
+        let client_config = Self::create_client_config()?;
+
+        // Start connection attempt (this sends Initial packets immediately)
+        // We don't await the result - just starting the connection sends packets
+        let connecting = self
+            .endpoint
+            .connect_with(client_config, addr, "localhost")
+            .map_err(|e| {
+                log::error!("[HOLE_PUNCH_QUIC] connect_with failed: {}", e);
+                TransportError::ConnectionFailed(e.to_string())
+            })?;
+
+        // Spawn task to handle the connection (will likely fail, but that's okay)
+        tokio::spawn(async move {
+            match tokio::time::timeout(std::time::Duration::from_secs(3), connecting).await {
+                Ok(Ok(conn)) => {
+                    // Connection succeeded (unexpected but fine) - close it
+                    log::info!("[HOLE_PUNCH_QUIC] Unexpected connection success - closing");
+                    conn.close(0u8.into(), b"hole_punch_only");
+                }
+                Ok(Err(e)) => {
+                    // Connection failed (expected - peer may not be ready)
+                    log::debug!("[HOLE_PUNCH_QUIC] Connection failed (expected): {}", e);
+                }
+                Err(_) => {
+                    // Timeout (expected)
+                    log::debug!("[HOLE_PUNCH_QUIC] Connection timed out (expected)");
+                }
+            }
+        });
+
+        log::info!("[HOLE_PUNCH_QUIC] Hole-punch packets sent to {}", addr);
+        Ok(())
+    }
+
     /// Accept incoming connections
     pub async fn accept(&self) -> TransportResult<(Connection, SocketAddr)> {
         let incoming = self

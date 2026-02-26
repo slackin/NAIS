@@ -1211,6 +1211,23 @@ impl NscManager {
         Ok(())
     }
     
+    /// Send hole-punch packets via QUIC to help NAT traversal.
+    /// This sends QUIC Initial packets to the specified address, which creates
+    /// a NAT mapping allowing the peer to send packets back to us.
+    pub async fn send_quic_hole_punch(&self, addr: SocketAddr) -> Result<(), String> {
+        log::info!("[HOLE_PUNCH] Sending QUIC hole-punch packets to {}", addr);
+        
+        let transport_lock = self.transport.read().await;
+        let transport = transport_lock.as_ref()
+            .ok_or_else(|| {
+                log::error!("[HOLE_PUNCH] Transport not initialized!");
+                "Transport not initialized"
+            })?;
+        
+        transport.send_hole_punch(addr)
+            .map_err(|e| format!("Hole-punch failed: {}", e))
+    }
+    
     /// Start a reader loop for an outgoing connection
     /// This enables receiving messages from peers we connected to (not just peers who connected to us)
     pub async fn start_outgoing_connection_reader(&self, peer_id_hex: &str) -> Result<(), String> {
@@ -1658,12 +1675,27 @@ impl NscManager {
             let peer_addresses = self.peer_addresses.read().await.clone();
             drop(self.peer_addresses.read()); // Release lock before async operations
             
+            // Get peers we're awaiting incoming connections from (as ICE answerer)
+            // We should NOT try to connect outbound to these - they should connect to us
+            let awaiting_peers: std::collections::HashSet<String> = {
+                let awaiting = self.awaiting_incoming_connections.read().await;
+                awaiting.keys().cloned().collect()
+            };
+            
             // Track peers that need ICE re-discovery (stale addresses)
             let mut stale_peers: Vec<String> = Vec::new();
             
             for member_hex in &target_peer_hex {
                 if connected_hex.contains(member_hex) {
                     continue; // Already connected
+                }
+                
+                // Skip peers we're awaiting incoming connections from (we're the ICE answerer)
+                // The initiator should connect to us, not the other way around
+                if awaiting_peers.contains(member_hex) {
+                    log::debug!("[NSC_SEND] Skipping {} - awaiting their incoming QUIC connection (ICE answerer)", 
+                        &member_hex[..16.min(member_hex.len())]);
+                    continue;
                 }
                 
                 // Check if we have an address for this peer
@@ -3908,6 +3940,19 @@ impl NscManager {
         // Create ICE agent and gather candidates
         let ice_agent = Arc::new(IceAgent::new(true)); // We're controlling (initiator)
         
+        // Get our QUIC transport port - this is sent to the peer so they know which port to connect to
+        let transport_port = {
+            let transport_lock = self.transport.read().await;
+            transport_lock.as_ref().and_then(|t| t.local_port())
+        };
+        
+        if transport_port.is_some() {
+            log::info!("[NSC_ICE] QUIC transport on port {}", transport_port.unwrap());
+        } else {
+            log::warn!("[NSC_ICE] Transport not initialized - QUIC connection may fail");
+        }
+        
+        // Gather ICE candidates (uses separate socket from QUIC to avoid protocol conflicts)
         let candidates = match ice_agent.gather_candidates().await {
             Ok(c) => c,
             Err(e) => {
@@ -4062,9 +4107,22 @@ impl NscManager {
         };
         ice_agent.set_remote_credentials(remote_creds).await;
         
+        // Get our QUIC transport port - this is sent to the peer so they know which port to connect to
+        let transport_port = {
+            let transport_lock = self.transport.read().await;
+            transport_lock.as_ref().and_then(|t| t.local_port())
+        };
+        
+        if transport_port.is_some() {
+            log::info!("[NSC_ICE] (answerer) QUIC transport on port {}", transport_port.unwrap());
+        } else {
+            log::warn!("[NSC_ICE] (answerer) Transport not initialized - QUIC connection may fail");
+        }
+        
         // Gather our candidates FIRST (before adding remote candidates)
         // This is critical: add_remote_candidate creates pairs with existing local candidates,
         // so local candidates must be gathered before adding remote ones
+        // Note: ICE uses its own socket, separate from QUIC, to avoid protocol conflicts
         let candidates = ice_agent.gather_candidates().await
             .map_err(|e| format!("Failed to gather ICE candidates: {}", e))?;
         
@@ -4076,13 +4134,7 @@ impl NscManager {
         
         let credentials = ice_agent.local_credentials();
         
-        // Get our QUIC transport port to include in the answer
-        let transport_port = {
-            let transport_lock = self.transport.read().await;
-            transport_lock.as_ref().and_then(|t| t.local_port())
-        };
-        
-        // Create answer with same session ID as offer
+        // Create answer with same session ID as offer (transport_port already retrieved above)
         let ice_answer = IceMessage::new(
             offer.session_id.clone(),
             &self.peer_id,
@@ -4120,10 +4172,12 @@ impl NscManager {
         
         // As the answerer (controlled agent), we do NOT initiate the QUIC connection.
         // The initiator (controlling agent) will connect to us after receiving our answer.
-        // We just need to verify ICE connectivity and record the peer's address.
+        // We just need to verify ICE connectivity, punch holes, and record the peer's address.
         let peer_id = offer.peer_id.clone();
         let target = from_nick.to_string();
         let session_id_for_cleanup = offer.session_id.clone();
+        // Get remote transport port for hole-punching (we use our QUIC endpoint directly)
+        let remote_transport_port = offer.transport_port;
         
         tokio::spawn(async move {
             // Give a moment for answer to be sent
@@ -4149,8 +4203,30 @@ impl NscManager {
                 return;
             };
             
-            let addr = selected.remote.address;
-            log::info!("[NSC_ICE] (answerer) Selected candidate: {} for peer {}", addr, target);
+            let ice_addr = selected.remote.address;
+            log::info!("[NSC_ICE] (answerer) Selected ICE candidate: {} for peer {}", ice_addr, target);
+            
+            // Punch hole using QUIC's endpoint (sends QUIC Initial packets)
+            // This creates NAT mapping so the initiator's QUIC connection can reach us
+            if let Some(remote_port) = remote_transport_port {
+                let quic_target = std::net::SocketAddr::new(ice_addr.ip(), remote_port);
+                log::info!("[NSC_ICE] (answerer) Punching hole to {} for QUIC via endpoint", quic_target);
+                let manager = get_nsc_manager();
+                let mgr = manager.read().await;
+                if let Err(e) = mgr.send_quic_hole_punch(quic_target).await {
+                    log::warn!("[NSC_ICE] (answerer) QUIC hole-punching failed: {} - connection may still work", e);
+                }
+            } else {
+                log::warn!("[NSC_ICE] (answerer) Missing remote transport port - skipping hole-punch");
+            }
+            
+            // Record the peer's address (using QUIC port, not ICE port)
+            let addr = if let Some(remote_port) = remote_transport_port {
+                std::net::SocketAddr::new(ice_addr.ip(), remote_port)
+            } else {
+                ice_addr // Fallback to ICE address
+            };
+            log::info!("[NSC_ICE] (answerer) Using address {} for peer {} (QUIC port)", addr, target);
             
             // Record the peer's address so we can accept their incoming QUIC connection
             let manager = get_nsc_manager();
@@ -4261,7 +4337,20 @@ impl NscManager {
                         log::warn!("[NSC_ICE] No transport_port in answer, using ICE address port (may fail)");
                         ice_addr
                     };
-                    log::info!("[NSC_ICE] Selected ICE candidate: {} -> connecting to QUIC at {}", ice_addr, connect_addr);
+                    log::info!("[NSC_ICE] Selected ICE candidate: {} -> will connect to QUIC at {}", ice_addr, connect_addr);
+                    
+                    // Punch hole using QUIC's endpoint (sends QUIC Initial packets)
+                    // This creates NAT mapping so our QUIC connection can reach them
+                    {
+                        let manager = get_nsc_manager();
+                        let mgr = manager.read().await;
+                        log::info!("[NSC_ICE] Punching hole to {} for QUIC via endpoint", connect_addr);
+                        if let Err(e) = mgr.send_quic_hole_punch(connect_addr).await {
+                            log::warn!("[NSC_ICE] QUIC hole-punching failed: {} - connection may still work", e);
+                        }
+                    }
+                    // Small delay to let hole-punch packets propagate
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     
                     // Establish QUIC connection using the transport address
                     log::info!("[NSC_ICE] Attempting QUIC connection to {} at {}", target_nick, connect_addr);

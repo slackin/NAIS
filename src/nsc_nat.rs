@@ -1004,19 +1004,68 @@ impl IceAgent {
         *self.remote_credentials.write().await = Some(credentials);
     }
 
-    /// Gather local candidates
+    /// Create a UDP socket bound to a specific port with SO_REUSEADDR enabled
+    /// Used for hole-punching on the transport port
+    pub async fn create_reusable_socket(port: u16) -> NatResult<TokioUdpSocket> {
+        use std::net::UdpSocket as StdUdpSocket;
+        
+        // Create a std socket first so we can set socket options
+        let addr: SocketAddr = format!("0.0.0.0:{}", port).parse()
+            .map_err(|e| NatError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+        
+        // Use socket2 for cross-platform socket options
+        let socket2_socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        
+        // Enable SO_REUSEADDR (allows binding to a port already in use)
+        socket2_socket.set_reuse_address(true)?;
+        
+        // On Unix-like systems, also enable SO_REUSEPORT if available
+        #[cfg(unix)]
+        socket2_socket.set_reuse_port(true)?;
+        
+        // Set non-blocking before binding
+        socket2_socket.set_nonblocking(true)?;
+        
+        // Bind to the specified port
+        socket2_socket.bind(&addr.into())?;
+        
+        // Convert to std socket, then to tokio socket
+        let std_socket: StdUdpSocket = socket2_socket.into();
+        let tokio_socket = TokioUdpSocket::from_std(std_socket)?;
+        
+        log::debug!("[ICE] Created reusable socket on port {}", port);
+        Ok(tokio_socket)
+    }
+
+    /// Gather local candidates (backwards-compatible wrapper)
     pub async fn gather_candidates(&self) -> NatResult<Vec<IceCandidate>> {
+        self.gather_candidates_for_port(None).await
+    }
+
+    /// Gather local candidates
+    /// 
+    /// When `transport_port` is provided, it's used for informational purposes only.
+    /// ICE uses its own socket for connectivity checks to avoid conflicts with QUIC.
+    /// After ICE completes, use `punch_hole_for_quic()` to prepare NAT for QUIC connection.
+    pub async fn gather_candidates_for_port(&self, _transport_port: Option<u16>) -> NatResult<Vec<IceCandidate>> {
         *self.state.write().await = IceState::Gathering;
         let mut candidates = Vec::new();
 
-        // Bind local socket
+        // Always use a separate socket for ICE to avoid conflicts with QUIC
+        // The transport_port is handled separately via punch_hole_for_quic()
         let socket = Arc::new(TokioUdpSocket::bind("0.0.0.0:0").await?);
         let local_addr = socket.local_addr()?;
+        
         *self.socket.write().await = Some(socket.clone());
 
         // === PRIORITY 1: Try UPnP port mapping first ===
         // This provides the most reliable direct connectivity
         log::info!("Attempting UPnP port mapping for direct P2P...");
+        log::info!("Attempting UPnP port mapping for local port {}...", local_addr.port());
         match UPnPPortMapper::create_mapping(local_addr.port(), "NAIS Secure Channel") {
             Ok(mapping) => {
                 let external_addr = SocketAddr::new(mapping.external_ip, mapping.external_port);
@@ -2476,6 +2525,52 @@ pub enum ConnectionType {
     DirectP2P,
     /// Relayed through TURN server
     Relayed,
+}
+
+// =============================================================================
+// UDP Hole Punching for QUIC
+// =============================================================================
+
+/// Punch a UDP hole from local_port to remote_addr by sending empty UDP packets.
+/// This creates a NAT mapping that allows the remote peer to send packets back.
+/// 
+/// This should be called by the answerer (non-initiator) before the initiator
+/// attempts to connect via QUIC, to ensure the NAT mapping exists.
+///
+/// # Arguments
+/// * `local_port` - The local port to punch hole from (should be QUIC transport port)
+/// * `remote_addr` - The remote address to punch hole to (peer's external IP + transport port)
+/// * `num_packets` - Number of hole-punch packets to send (default: 5)
+///
+/// # Returns
+/// Ok(()) on success, or an error if hole punching fails
+pub async fn punch_hole_for_quic(local_port: u16, remote_addr: SocketAddr, num_packets: usize) -> NatResult<()> {
+    log::info!("[HOLE_PUNCH] Punching hole from local port {} to {}", local_port, remote_addr);
+    
+    // Create a socket bound to the local port using SO_REUSEADDR
+    // This allows us to share the port with QUIC
+    let socket = IceAgent::create_reusable_socket(local_port).await?;
+    
+    // Send multiple empty packets to punch the hole
+    // The packets don't need any content - they just create the NAT mapping
+    let hole_punch_data = b"NAIS_HOLE_PUNCH";
+    
+    for i in 0..num_packets {
+        match socket.send_to(hole_punch_data, remote_addr).await {
+            Ok(n) => {
+                log::debug!("[HOLE_PUNCH] Sent hole-punch packet {} ({} bytes) to {}", i + 1, n, remote_addr);
+            }
+            Err(e) => {
+                log::warn!("[HOLE_PUNCH] Failed to send hole-punch packet {}: {}", i + 1, e);
+            }
+        }
+        
+        // Small delay between packets
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    
+    log::info!("[HOLE_PUNCH] Sent {} hole-punch packets from port {} to {}", num_packets, local_port, remote_addr);
+    Ok(())
 }
 
 // =============================================================================
