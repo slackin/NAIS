@@ -332,6 +332,12 @@ fn app() -> Element {
     let mut topic_collapsed = use_signal(|| false);
     let mut user_menu_open: Signal<Option<String>> = use_signal(|| None);
     let mut ctcp_submenu_open: Signal<bool> = use_signal(|| false);
+    
+    // Virtual scrolling state for message performance optimization
+    // Only render messages within the visible viewport + buffer
+    let mut visible_message_range: Signal<(usize, usize)> = use_signal(|| (0, 100));
+    // Cache for sorted user lists per channel (profile+channel -> sorted users)
+    let mut cached_sorted_users: Signal<HashMap<String, Vec<String>>> = use_signal(HashMap::new);
 
     // WHOIS popup state
     let mut whois_popup: Signal<Option<WhoisInfo>> = use_signal(|| None);
@@ -408,7 +414,7 @@ fn app() -> Element {
     // Load existing NSC channels on startup
     use_effect(move || {
         spawn(async move {
-            let manager = crate::nsc_manager::get_nsc_manager();
+            let manager = crate::nsc_manager::get_nsc_manager_async().await;
             let mgr = manager.read().await;
             let channels = mgr.list_channels().await;
             let fp = mgr.fingerprint();
@@ -416,7 +422,7 @@ fn app() -> Element {
             
             // Load stored messages for all channels
             for channel in &channels {
-                let stored = crate::nsc_manager::load_messages(&channel.channel_id);
+                let stored = crate::nsc_manager::load_messages_async(&channel.channel_id).await;
                 if !stored.is_empty() {
                     let mut msgs = nsc_messages.write();
                     let channel_msgs = msgs.entry(channel.channel_id.clone()).or_insert_with(Vec::new);
@@ -434,7 +440,7 @@ fn app() -> Element {
     // Initialize NSC transport and start listening for incoming messages
     use_effect(move || {
         spawn(async move {
-            let manager = crate::nsc_manager::get_nsc_manager();
+            let manager = crate::nsc_manager::get_nsc_manager_async().await;
             
             // Initialize transport
             {
@@ -482,7 +488,7 @@ fn app() -> Element {
             // Initial fetch
             let ch_id_initial = ch_id.clone();
             spawn(async move {
-                let manager = crate::nsc_manager::get_nsc_manager();
+                let manager = crate::nsc_manager::get_nsc_manager_async().await;
                 let mgr = manager.read().await;
                 let members = mgr.get_channel_members(&ch_id_initial).await;
                 nsc_channel_members.set(members);
@@ -501,7 +507,7 @@ fn app() -> Element {
                         break;
                     }
                     
-                    let manager = crate::nsc_manager::get_nsc_manager();
+                    let manager = crate::nsc_manager::get_nsc_manager_async().await;
                     let mgr = manager.read().await;
                     let members = mgr.get_channel_members(&ch_id_poll).await;
                     nsc_channel_members.set(members);
@@ -1122,7 +1128,7 @@ fn app() -> Element {
                                             
                                             // Spawn async handler
                                             spawn(async move {
-                                                let manager = crate::nsc_manager::get_nsc_manager();
+                                                let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                                 let mgr = manager.read().await;
                                                 
                                                 log::info!("[UI NSC] Calling handle_nsc_ctcp for {} from {} on profile {}", cmd_str, from_nick, pname);
@@ -1186,7 +1192,7 @@ fn app() -> Element {
                                                     let pname = profile_name.clone();
                                                     
                                                     spawn(async move {
-                                                        let manager = crate::nsc_manager::get_nsc_manager();
+                                                        let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                                         let mgr = manager.read().await;
                                                         let nsc_probe = mgr.create_probe_ctcp();
                                                         drop(mgr);
@@ -1252,7 +1258,7 @@ fn app() -> Element {
                                     
                                     if clean_user != our_nick {
                                         spawn(async move {
-                                            let manager = crate::nsc_manager::get_nsc_manager();
+                                            let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                             let mgr = manager.read().await;
                                             
                                             // Check if this channel maps to an NSC channel
@@ -1293,7 +1299,7 @@ fn app() -> Element {
                                         .unwrap_or_default();
                                     
                                     spawn(async move {
-                                        let manager = crate::nsc_manager::get_nsc_manager();
+                                        let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                         let mgr = manager.read().await;
                                         
                                         // Check if this channel maps to an NSC channel
@@ -1342,7 +1348,7 @@ fn app() -> Element {
                                     // Small delay to let the connection stabilize
                                     Delay::new(Duration::from_millis(500)).await;
                                     
-                                    let manager = crate::nsc_manager::get_nsc_manager();
+                                    let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                     let mgr = manager.read().await;
                                     let channels = mgr.list_channels().await;
                                     drop(mgr);
@@ -1729,7 +1735,8 @@ fn app() -> Element {
                                                 },
                                                 "Edit"
                                             }
-                                            // Server Log toggle - always available
+                                            // Server Log toggle - only available in advanced mode
+                                            if *settings_show_advanced.read() {
                                             button {
                                                 class: "menu-item",
                                                 onclick: move |_| {
@@ -1761,6 +1768,7 @@ fn app() -> Element {
                                                     let is_visible = show_server_log.read().get(&prof_name_for_log_toggle).copied().unwrap_or(false);
                                                     if is_visible { "Hide Server Log" } else { "Show Server Log" }
                                                 }
+                                            }
                                             }
                                             button {
                                                 class: "menu-item",
@@ -1877,13 +1885,13 @@ fn app() -> Element {
                         }
                     }
                     ul {
-                        // Server Log channel - show if enabled for this profile
-                        // (previously required advanced mode, but now always available)
+                        // Server Log channel - show if enabled for this profile and advanced mode is on
                         {
                             let active_profile = state.read().active_profile.clone();
                             let log_visible = show_server_log.read().get(&active_profile).copied().unwrap_or(false);
+                            let advanced_on = *settings_show_advanced.read();
                             
-                            if log_visible {
+                            if log_visible && advanced_on {
                                 Some(rsx! {
                                     li {
                                         button {
@@ -1959,11 +1967,16 @@ fn app() -> Element {
                         
                         // Regular channels
                         {
-                            let channels = state.read()
+                            let advanced_on = *settings_show_advanced.read();
+                            let channels: Vec<String> = state.read()
                                 .servers
                                 .get(&state.read().active_profile)
                                 .map(|s| s.channels.clone())
-                                .unwrap_or_default();
+                                .unwrap_or_default()
+                                .into_iter()
+                                // Hide #nais-* IRC channels when Advanced Features is off
+                                .filter(|c| advanced_on || !c.starts_with("#nais-"))
+                                .collect();
                             
                             let topics_map = state.read()
                                 .servers
@@ -2006,6 +2019,8 @@ fn app() -> Element {
                                                         }
                                                         // Clear NSC channel selection
                                                         nsc_current_channel.set(None);
+                                                        // Reset virtual scroll to show only recent messages
+                                                        visible_message_range.set((0, 100));
                                                         // Force scroll to bottom on channel change
                                                         force_scroll_to_bottom.set(true);
                                                         // Focus the chat input
@@ -2085,18 +2100,22 @@ fn app() -> Element {
                                                         let current_msgs = nsc_messages.read();
                                                         if current_msgs.get(&channel_id_inner).map(|m| m.is_empty()).unwrap_or(true) {
                                                             drop(current_msgs);
-                                                            // Load from storage
-                                                            let stored = crate::nsc_manager::load_messages(&channel_id_inner);
-                                                            if !stored.is_empty() {
-                                                                let mut msgs = nsc_messages.write();
-                                                                let channel_msgs = msgs.entry(channel_id_inner).or_insert_with(Vec::new);
-                                                                for m in stored {
-                                                                    channel_msgs.push((m.timestamp, m.sender, m.text));
+                                                            // Load from storage asynchronously
+                                                            spawn(async move {
+                                                                let stored = crate::nsc_manager::load_messages_async(&channel_id_inner).await;
+                                                                if !stored.is_empty() {
+                                                                    let mut msgs = nsc_messages.write();
+                                                                    let channel_msgs = msgs.entry(channel_id_inner).or_insert_with(Vec::new);
+                                                                    for m in stored {
+                                                                        channel_msgs.push((m.timestamp, m.sender, m.text));
+                                                                    }
                                                                 }
-                                                            }
+                                                            });
                                                         }
                                                     }
                                                     
+                                                    // Reset virtual scroll to show only recent messages
+                                                    visible_message_range.set((0, 100));
                                                     force_scroll_to_bottom.set(true);
                                                     // Focus the chat input
                                                     let _ = document::eval(
@@ -2195,6 +2214,8 @@ fn app() -> Element {
 
                     div {
                         class: "messages",
+                        // CSS optimization: hint that content will scroll for GPU acceleration
+                        style: "will-change: scroll-position; contain: content;",
                         onscroll: move |_evt| {
                             // Detect if user is at the bottom of scroll
                             spawn(async move {
@@ -2356,7 +2377,10 @@ fn app() -> Element {
                                 }
                             } else {
                                 // Clone and filter in one pass - only current channel messages
-                                let filtered: Vec<_> = server_state
+                                // Performance optimization: only render the last N messages
+                                const MAX_VISIBLE_MESSAGES: usize = 150;
+                                
+                                let all_filtered: Vec<_> = server_state
                                     .map(|s| s.messages.iter()
                                         .filter(|m| m.channel == current_channel)
                                         .cloned()
@@ -2364,8 +2388,41 @@ fn app() -> Element {
                                     .unwrap_or_default();
                                 drop(state_read);
                                 
+                                let total_count = all_filtered.len();
+                                let (visible_start, _) = *visible_message_range.read();
+                                
+                                // Calculate start index: show from visible_start or from (total - MAX) if not expanded
+                                let start_idx = if visible_start > 0 {
+                                    0 // User wants to see older messages
+                                } else if total_count > MAX_VISIBLE_MESSAGES {
+                                    total_count - MAX_VISIBLE_MESSAGES
+                                } else {
+                                    0
+                                };
+                                
+                                let visible_messages: Vec<_> = all_filtered.into_iter()
+                                    .skip(start_idx)
+                                    .collect();
+                                
+                                let hidden_count = start_idx;
+                                
                                 rsx! {
-                                    for msg in filtered {
+                                    if hidden_count > 0 {
+                                        div {
+                                            class: "message system",
+                                            style: "text-align: center; cursor: pointer;",
+                                            onclick: move |_| {
+                                                // Expand to show all messages
+                                                visible_message_range.set((1, 0));
+                                            },
+                                            div {
+                                                class: "system-text",
+                                                style: "color: var(--accent);",
+                                                "⬆ Load {hidden_count} earlier messages"
+                                            }
+                                        }
+                                    }
+                                    for msg in visible_messages {
                                         {
                                             let id = msg.id;
                                             message_view(msg, id)
@@ -2551,7 +2608,9 @@ fn app() -> Element {
                             // IMPORTANT: Capture active_profile here so click handlers use the profile
                             // that was active when the user list was rendered, not when clicked
                             let userlist_profile = state.read().active_profile.clone();
-                            let mut users = state.read()
+                            
+                            // Get raw user list for current channel
+                            let raw_users = state.read()
                                 .servers
                                 .get(&userlist_profile)
                                 .and_then(|s| {
@@ -2559,29 +2618,48 @@ fn app() -> Element {
                                 })
                                 .unwrap_or_default();
                             
-                            // Sort users: ops (@) first, then voice (+), then regular users
-                            users.sort_by(|a, b| {
-                                let a_prefix = a.chars().next().unwrap_or(' ');
-                                let b_prefix = b.chars().next().unwrap_or(' ');
-                                
-                                let a_rank = match a_prefix {
-                                    '@' => 0, // Ops first
-                                    '+' => 1, // Voice second
-                                    _ => 2,   // Regular users last
-                                };
-                                let b_rank = match b_prefix {
-                                    '@' => 0,
-                                    '+' => 1,
-                                    _ => 2,
-                                };
-                                
-                                // First compare by rank, then alphabetically
-                                a_rank.cmp(&b_rank).then_with(|| {
-                                    let a_name = a.trim_start_matches(['@', '+']);
-                                    let b_name = b.trim_start_matches(['@', '+']);
-                                    a_name.to_lowercase().cmp(&b_name.to_lowercase())
-                                })
-                            });
+                            // Create cache key for this profile+channel
+                            let cache_key = format!("{}:{}", userlist_profile, current_channel);
+                            
+                            // Check if we need to re-sort (compare with cached)
+                            let cached = cached_sorted_users.read();
+                            let need_resort = cached.get(&cache_key)
+                                .map(|sorted| sorted.len() != raw_users.len())
+                                .unwrap_or(true);
+                            drop(cached);
+                            
+                            let users = if need_resort {
+                                // Sort users: ops (@) first, then voice (+), then regular users
+                                let mut sorted = raw_users;
+                                sorted.sort_by(|a, b| {
+                                    let a_prefix = a.chars().next().unwrap_or(' ');
+                                    let b_prefix = b.chars().next().unwrap_or(' ');
+                                    
+                                    let a_rank = match a_prefix {
+                                        '@' => 0, // Ops first
+                                        '+' => 1, // Voice second
+                                        _ => 2,   // Regular users last
+                                    };
+                                    let b_rank = match b_prefix {
+                                        '@' => 0,
+                                        '+' => 1,
+                                        _ => 2,
+                                    };
+                                    
+                                    // First compare by rank, then alphabetically
+                                    a_rank.cmp(&b_rank).then_with(|| {
+                                        let a_name = a.trim_start_matches(['@', '+']);
+                                        let b_name = b.trim_start_matches(['@', '+']);
+                                        a_name.to_lowercase().cmp(&b_name.to_lowercase())
+                                    })
+                                });
+                                // Update cache with newly sorted list
+                                cached_sorted_users.write().insert(cache_key.clone(), sorted.clone());
+                                sorted
+                            } else {
+                                // Use cached sorted list
+                                cached_sorted_users.read().get(&cache_key).cloned().unwrap_or_default()
+                            };
                             
                             rsx! {
                                 div {
@@ -5659,7 +5737,7 @@ fn app() -> Element {
                                     if !name.is_empty() && !network.is_empty() {
                                         nsc_loading.set(true);
                                         spawn(async move {
-                                            let manager = crate::nsc_manager::get_nsc_manager();
+                                            let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                             let mgr = manager.read().await;
                                             match mgr.create_channel(name.clone(), network.clone()).await {
                                                 Ok(info) => {
@@ -5766,7 +5844,7 @@ fn app() -> Element {
                                                             log::info!("Leave button clicked for channel: {}", cid);
                                                             spawn(async move {
                                                                 log::info!("Attempting to leave channel: {}", cid);
-                                                                let manager = crate::nsc_manager::get_nsc_manager();
+                                                                let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                                                 let mgr = manager.read().await;
                                                                 match mgr.leave_channel(&cid).await {
                                                                     Ok(()) => {
@@ -5867,7 +5945,7 @@ fn app() -> Element {
                                                         onclick: move |_| {
                                                             let iid = invite_id_decline.clone();
                                                             spawn(async move {
-                                                                let manager = crate::nsc_manager::get_nsc_manager();
+                                                                let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                                                 let mgr = manager.read().await;
                                                                 match mgr.decline_invite(&iid).await {
                                                                     Ok((target_nick, ctcp_response)) => {
@@ -5896,7 +5974,7 @@ fn app() -> Element {
                                                         onclick: move |_| {
                                                             let iid = invite_id_accept.clone();
                                                             spawn(async move {
-                                                                let manager = crate::nsc_manager::get_nsc_manager();
+                                                                let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                                                 let mgr = manager.read().await;
                                                                 match mgr.accept_invite(&iid).await {
                                                                     Ok((target_nick, ctcp_response, irc_channel, network)) => {
@@ -5954,7 +6032,7 @@ fn app() -> Element {
                                                                                 drop(state_read);
                                                                                 
                                                                                 if !users.is_empty() {
-                                                                                    let manager = crate::nsc_manager::get_nsc_manager();
+                                                                                    let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                                                                     let mgr = manager.read().await;
                                                                                     
                                                                                     // Clean user list and record pending probes
@@ -6037,7 +6115,7 @@ fn app() -> Element {
                                 if !name.is_empty() && !network.is_empty() && !*nsc_loading.read() {
                                     nsc_loading.set(true);
                                     spawn(async move {
-                                        let manager = crate::nsc_manager::get_nsc_manager();
+                                        let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                         let mgr = manager.read().await;
                                         match mgr.create_channel(name.clone(), network.clone()).await {
                                             Ok(info) => {
@@ -6073,7 +6151,7 @@ fn app() -> Element {
                                                             drop(state_read);
                                                             
                                                             if !users.is_empty() {
-                                                                let manager = crate::nsc_manager::get_nsc_manager();
+                                                                let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                                                 let mgr = manager.read().await;
                                                                 
                                                                 // Clean user list and record pending probes
@@ -6170,7 +6248,7 @@ fn app() -> Element {
                                                 nsc_invite_modal.set(None);
                                                 
                                                 spawn(async move {
-                                                    let manager = crate::nsc_manager::get_nsc_manager();
+                                                    let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                                     let mgr = manager.read().await;
                                                     
                                                     // Send probe first
@@ -6474,7 +6552,7 @@ fn handle_send_message(
             
             // Send via NSC transport layer
             spawn(async move {
-                let manager = crate::nsc_manager::get_nsc_manager();
+                let manager = crate::nsc_manager::get_nsc_manager_async().await;
                 let mgr = manager.read().await;
                 
                 // Initialize transport if not already done
@@ -6539,7 +6617,7 @@ fn handle_send_message(
                 "info" | "status" => {
                     // Show NSC info
                     spawn(async move {
-                        let manager = crate::nsc_manager::get_nsc_manager();
+                        let manager = crate::nsc_manager::get_nsc_manager_async().await;
                         let mgr = manager.read().await;
                         
                         let peer_id = mgr.peer_id_hex();
@@ -6598,7 +6676,7 @@ fn handle_send_message(
                     } else {
                         let addr_str = subarg.clone();
                         spawn(async move {
-                            let manager = crate::nsc_manager::get_nsc_manager();
+                            let manager = crate::nsc_manager::get_nsc_manager_async().await;
                             let mgr = manager.read().await;
                             
                             // Parse address
@@ -6639,7 +6717,7 @@ fn handle_send_message(
                 "peers" => {
                     // List connected peers
                     spawn(async move {
-                        let manager = crate::nsc_manager::get_nsc_manager();
+                        let manager = crate::nsc_manager::get_nsc_manager_async().await;
                         let mgr = manager.read().await;
                         
                         let peer_count = mgr.connected_peer_count().await;
@@ -8133,6 +8211,9 @@ fn message_view(msg: ChatMessage, key: u64) -> Element {
         div {
             key: "{key}",
             class: format!("message{system_class}{action_class}"),
+            // content-visibility: auto allows the browser to skip rendering off-screen messages
+            // contain-intrinsic-size provides a placeholder size for scroll calculations
+            style: "content-visibility: auto; contain-intrinsic-size: auto 60px;",
             onclick: move |_| {
                 if !msg.is_system && !always_show_timestamps() {
                     show_timestamp_clicked.set(true);
