@@ -156,14 +156,32 @@ impl Profile {
             hide_host: true,
         }
     }
+
+    /// Pre-configured Libera.Chat profile with #convey and #convey-dev channels
+    pub fn libera_chat() -> Self {
+        let nickname = get_system_username();
+        Self {
+            name: "Libera.Chat".to_string(),
+            server: "irc.libera.chat".to_string(),
+            nickname,
+            channel: "#convey,#convey-dev".to_string(),
+            use_tls: true,
+            auto_connect: true,
+            enable_logging: true,
+            scrollback_limit: 1000,
+            log_buffer_size: 1000,
+            hide_host: true,
+        }
+    }
 }
 
 impl Default for ProfileStore {
     fn default() -> Self {
         let support_profile = Profile::support();
+        let libera_profile = Profile::libera_chat();
         Self {
-            profiles: vec![support_profile.clone()],
-            last_used: Some(support_profile.name.clone()),
+            profiles: vec![libera_profile.clone(), support_profile],
+            last_used: Some(libera_profile.name.clone()),
             default_nickname: None,
             show_timestamps: false,
             show_advanced: false,

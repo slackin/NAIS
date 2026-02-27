@@ -1,0 +1,40 @@
+# NAIS ChanServ Configuration
+# Long-term host for NAIS Secure Channels
+# Edit this file to customize your deployment
+
+# Bot identity
+nickname = "NAIS-Services"
+display_name = "NAIS Channel Services"
+
+# QUIC server binding - adjust if behind NAT/firewall
+bind_address = "0.0.0.0:4434"
+
+# Relay hub for NAT traversal fallback (optional)
+# relay_hub = "hub.pugbot.net:4433"
+
+# IRC connection for peer discovery
+[irc]
+server = "irc.libera.chat"
+port = 6697
+use_tls = true
+nick = "NAIS-ChanServ"
+alt_nicks = ["NAIS-CS", "NAIS-Services", "NAIS-CS-T3D", "NAISChanServ"]
+channels = ["#nais-chanserv"]
+
+# Storage settings
+[storage]
+# Uses /var/lib/nais-chanserv when running as systemd service
+data_dir = "/var/lib/nais-chanserv"
+message_ttl_days = 7
+max_messages_per_channel = 10000
+
+# Hosted channels - add your channels here
+[[channels]]
+name = "general" 
+topic = "General NAIS discussion"
+auto_register = true
+
+[[channels]]
+name = "development"
+topic = "NAIS development and testing"
+auto_register = true

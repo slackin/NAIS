@@ -451,7 +451,13 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent, enable_lo
             // Append users from this NAMES reply to the existing list
             let user_list = state.users_by_channel.entry(channel).or_insert_with(Vec::new);
             for user in users {
-                if !user_list.contains(&user) {
+                // Case-insensitive duplicate check (IRC nicks are case-insensitive)
+                let bare_new = user.trim_start_matches(|c: char| c == '@' || c == '+' || c == '%' || c == '!' || c == '~');
+                let already_present = user_list.iter().any(|u| {
+                    let bare = u.trim_start_matches(|c: char| c == '@' || c == '+' || c == '%' || c == '!' || c == '~');
+                    bare.eq_ignore_ascii_case(bare_new)
+                });
+                if !already_present {
                     user_list.push(user);
                 }
             }
@@ -459,20 +465,32 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent, enable_lo
         IrcEvent::UserJoined { channel, user } => {
             // Add the user to the channel's user list (no message, that comes via System event)
             let user_list = state.users_by_channel.entry(channel).or_insert_with(Vec::new);
-            if !user_list.contains(&user) {
+            // Case-insensitive duplicate check (IRC nicks are case-insensitive)
+            let dominated = user_list.iter().any(|u| {
+                let bare = u.trim_start_matches(|c: char| c == '@' || c == '+' || c == '%' || c == '!' || c == '~');
+                bare.eq_ignore_ascii_case(&user)
+            });
+            if !dominated {
                 user_list.push(user);
             }
         }
         IrcEvent::UserParted { channel, user } => {
             // Remove the user from the channel's user list (no message, that comes via System event)
+            // Use case-insensitive comparison since IRC nicks are case-insensitive
             if let Some(user_list) = state.users_by_channel.get_mut(&channel) {
-                user_list.retain(|u| u != &user && u.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~') != user);
+                user_list.retain(|u| {
+                    let bare = u.trim_start_matches(|c: char| c == '@' || c == '+' || c == '%' || c == '!' || c == '~');
+                    !bare.eq_ignore_ascii_case(&user)
+                });
             }
         }
         IrcEvent::UserQuit { user } => {
             // Remove the user from all channels (no message, that comes via System event)
             for user_list in state.users_by_channel.values_mut() {
-                user_list.retain(|u| u != &user && u.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~') != user);
+                user_list.retain(|u| {
+                    let bare = u.trim_start_matches(|c: char| c == '@' || c == '+' || c == '%' || c == '!' || c == '~');
+                    !bare.eq_ignore_ascii_case(&user)
+                });
             }
         }
         IrcEvent::UserNickChanged { old_nick, new_nick } => {
@@ -480,8 +498,8 @@ pub fn apply_event_to_server(state: &mut ServerState, event: IrcEvent, enable_lo
             for user_list in state.users_by_channel.values_mut() {
                 for entry in user_list.iter_mut() {
                     // Strip mode prefixes for comparison but preserve them in the new nick
-                    let bare_nick = entry.trim_start_matches(|c| c == '@' || c == '+' || c == '%' || c == '!' || c == '~');
-                    if bare_nick == old_nick {
+                    let bare_nick = entry.trim_start_matches(|c: char| c == '@' || c == '+' || c == '%' || c == '!' || c == '~');
+                    if bare_nick.eq_ignore_ascii_case(&old_nick) {
                         // Preserve the prefix if any
                         let prefix_len = entry.len() - bare_nick.len();
                         let prefix = &entry[..prefix_len];
@@ -753,7 +771,7 @@ fn handle_ctcp_query(command: &str, args: &str) -> Option<String> {
             Some(create_ctcp_response("VERSION", "NAIS-client v0.1.0 (Rust)"))
         }
         "CLIENTINFO" => {
-            Some(create_ctcp_response("CLIENTINFO", "ACTION VERSION CLIENTINFO TIME PING FINGER SOURCE USERINFO VOICE_CALL VOICE_ACCEPT VOICE_REJECT VOICE_CANCEL NAIS_PROBE NAIS_INFO NAIS_JOIN NAIS_ACCEPT NAIS_CONNECT NAIS_LEAVE"))
+            Some(create_ctcp_response("CLIENTINFO", "ACTION VERSION CLIENTINFO TIME PING FINGER SOURCE USERINFO VOICE_CALL VOICE_ACCEPT VOICE_REJECT VOICE_CANCEL NAIS_PROBE NAIS_INFO NAIS_JOIN NAIS_ACCEPT NAIS_CONNECT NAIS_LEAVE NAIS_QUERY_CHANNELS NAIS_QUERY_CHANNELS_RESPONSE"))
         }
         "TIME" => {
             let now = chrono::Local::now();
@@ -775,7 +793,7 @@ fn handle_ctcp_query(command: &str, args: &str) -> Option<String> {
         // Voice CTCP commands are handled separately - return None to let them be forwarded to voice system
         "VOICE_CALL" | "VOICE_ACCEPT" | "VOICE_REJECT" | "VOICE_CANCEL" => None,
         // NAIS channel CTCP commands are handled separately
-        "NAIS_PROBE" | "NAIS_INFO" | "NAIS_JOIN" | "NAIS_ACCEPT" | "NAIS_CONNECT" | "NAIS_LEAVE" => None,
+        "NAIS_PROBE" | "NAIS_INFO" | "NAIS_JOIN" | "NAIS_ACCEPT" | "NAIS_CONNECT" | "NAIS_LEAVE" | "NAIS_QUERY_CHANNELS" | "NAIS_QUERY_CHANNELS_RESPONSE" => None,
         _ => None,
     }
 }
@@ -787,7 +805,7 @@ fn is_voice_ctcp(command: &str) -> bool {
 
 /// Check if a CTCP command is NAIS channel-related (NSC = Nais Secure Channels)
 fn is_nais_ctcp(command: &str) -> bool {
-    command.starts_with("NSC_") || matches!(command, "NAIS_PROBE" | "NAIS_INFO" | "NAIS_JOIN" | "NAIS_ACCEPT" | "NAIS_CONNECT" | "NAIS_LEAVE" | "NAIS_CHANNEL_INVITE" | "NAIS_MSG")
+    command.starts_with("NSC_") || matches!(command, "NAIS_PROBE" | "NAIS_INFO" | "NAIS_JOIN" | "NAIS_ACCEPT" | "NAIS_CONNECT" | "NAIS_LEAVE" | "NAIS_CHANNEL_INVITE" | "NAIS_MSG" | "NAIS_QUERY_CHANNELS" | "NAIS_QUERY_CHANNELS_RESPONSE")
 }
 
 async fn handle_connection(
@@ -1551,17 +1569,18 @@ async fn handle_connection(
                                 user: user.to_string(),
                             })
                             .await;
-                        // Show quit message
+                        // Show quit message in all channels the user is in
                         let note = reason.clone().unwrap_or_default();
                         let detail = if note.is_empty() {
                             format!("{user} quit.")
                         } else {
                             format!("{user} quit: {note}")
                         };
+                        // Send to default channel (always) for visibility
                         let _ = evt_tx
                             .send(IrcEvent::System {
                                 channel: default_channel.clone(),
-                                text: detail,
+                                text: detail.clone(),
                             })
                             .await;
                     }

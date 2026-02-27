@@ -1,0 +1,49 @@
+[package]
+name = "nais-chanserv"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "NAIS Channel Services Bot - Long-term host for secure channels"
+
+[[bin]]
+name = "nais-chanserv"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "net", "sync", "signal"] }
+
+# IRC client
+irc = { version = "1.1", default-features = false, features = ["ctcp", "tls-rust", "toml_config"] }
+
+# QUIC transport
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+bytes = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Cryptography
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+
+# Utilities
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+thiserror = "1"
+hex = "0.4"
+dirs = "6"
+chrono = "0.4"
+dashmap = "6"
+futures = "0.3"
+base64 = "0.22"
