@@ -167,6 +167,8 @@ pub fn run() {
         
         // Configure desktop with a custom event handler to intercept close
         let config = Config::new()
+            .with_window(tao::window::WindowBuilder::new().with_title("Convey"))
+            .with_menu(None)
             .with_custom_event_handler(move |event, _target| {
                 if let Event::WindowEvent { event: WindowEvent::CloseRequested, .. } = event {
                     // Only run graceful shutdown once
