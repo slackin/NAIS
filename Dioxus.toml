@@ -3,7 +3,7 @@ name = "nais_client"
 default_platform = "desktop"
 
 [application.desktop]
-window_title = "NAIS Client"
+window_title = "Convey"
 
 [application.mobile]
 android_min_sdk = 24

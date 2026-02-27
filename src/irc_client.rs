@@ -768,7 +768,7 @@ fn create_ctcp_response(command: &str, response: &str) -> String {
 fn handle_ctcp_query(command: &str, args: &str) -> Option<String> {
     match command {
         "VERSION" => {
-            Some(create_ctcp_response("VERSION", "NAIS-client v0.1.0 (Rust)"))
+            Some(create_ctcp_response("VERSION", "Convey v0.1.0 (Rust)"))
         }
         "CLIENTINFO" => {
             Some(create_ctcp_response("CLIENTINFO", "ACTION VERSION CLIENTINFO TIME PING FINGER SOURCE USERINFO VOICE_CALL VOICE_ACCEPT VOICE_REJECT VOICE_CANCEL NAIS_PROBE NAIS_INFO NAIS_JOIN NAIS_ACCEPT NAIS_CONNECT NAIS_LEAVE NAIS_QUERY_CHANNELS NAIS_QUERY_CHANNELS_RESPONSE"))
@@ -782,13 +782,13 @@ fn handle_ctcp_query(command: &str, args: &str) -> Option<String> {
         }
         "FINGER" => {
             // Return user information (in a real client, this might include idle time)
-            Some(create_ctcp_response("FINGER", "NAIS-client user"))
+            Some(create_ctcp_response("FINGER", "Convey user"))
         }
         "SOURCE" => {
             Some(create_ctcp_response("SOURCE", "https://github.com/nais-client"))
         }
         "USERINFO" => {
-            Some(create_ctcp_response("USERINFO", "NAIS IRC Client"))
+            Some(create_ctcp_response("USERINFO", "Convey IRC Client"))
         }
         // Voice CTCP commands are handled separately - return None to let them be forwarded to voice system
         "VOICE_CALL" | "VOICE_ACCEPT" | "VOICE_REJECT" | "VOICE_CANCEL" => None,

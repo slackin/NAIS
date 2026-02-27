@@ -324,7 +324,7 @@ fn app() -> Element {
         store.default_nickname.clone().unwrap_or_else(|| {
             std::env::var("USER")
                 .or_else(|_| std::env::var("USERNAME"))
-                .unwrap_or_else(|_| "nais".to_string())
+                .unwrap_or_else(|_| "convey".to_string())
         })
     });
 
@@ -953,16 +953,17 @@ fn app() -> Element {
                                         from, from_lower, command, response, pending_keys, is_pending_invite);
                                     
                                     if is_pending_invite && command == "VERSION" {
-                                        // Check if this is a NAIS client - check for multiple variations
-                                        // Response could be "NAIS-client v0.1.0 (Rust)" or similar
+                                        // Check if this is a Convey/NAIS client - check for multiple variations
+                                        // Response could be "Convey v0.1.0 (Rust)" or "NAIS-client v0.1.0 (Rust)" (legacy)
                                         let response_upper = response.to_uppercase();
+                                        let contains_convey = response_upper.contains("CONVEY");
                                         let contains_nais = response_upper.contains("NAIS");
                                         let contains_nais_client = response_upper.contains("NAIS-CLIENT");
                                         let contains_nais_underscore = response_upper.contains("NAIS_CLIENT");
-                                        let is_nais = contains_nais || contains_nais_client || contains_nais_underscore;
+                                        let is_nais = contains_convey || contains_nais || contains_nais_client || contains_nais_underscore;
                                         
-                                        log::info!("NAIS detection for '{}': response='{}', response_upper='{}', contains_nais={}, contains_nais_client={}, is_nais={}", 
-                                            from, response, response_upper, contains_nais, contains_nais_client, is_nais);
+                                        log::info!("Convey detection for '{}': response='{}', response_upper='{}', contains_convey={}, contains_nais={}, is_nais={}", 
+                                            from, response, response_upper, contains_convey, contains_nais, is_nais);
                                         
                                         if is_nais {
                                             // Found NAIS client! Remove from pending and show popup immediately
@@ -1090,7 +1091,7 @@ fn app() -> Element {
                                                     &profile_name,
                                                     IrcEvent::System {
                                                         channel: current_channel,
-                                                        text: format!("[NAIS] Discovered peer: {} ({}:{}) in channel {}", 
+                                                        text: format!("[Convey] Discovered peer: {} ({}:{}) in channel {}", 
                                                             from, ip, port, &channel_id[..8.min(channel_id.len())]),
                                                     },
                                                 );
@@ -1130,9 +1131,9 @@ fn app() -> Element {
                                                     &profile_name,
                                                     IrcEvent::System {
                                                         channel: current_channel,
-                                                        text: format!("[NAIS] {} {} invites you to join {}{} on {}", 
+                                                        text: format!("[Convey] {} {} invites you to join {}{} on {}", 
                                                             type_indicator, from, channel, 
-                                                            if channel_type == "nais" { " (NAIS encrypted)" } else { "" },
+                                                            if channel_type == "nais" { " (encrypted)" } else { "" },
                                                             server),
                                                     },
                                                 );
@@ -1359,7 +1360,7 @@ fn app() -> Element {
                                                         &profile_name,
                                                         IrcEvent::System {
                                                             channel: channel.clone(),
-                                                            text: format!("[NAIS] Detected secure channel (ID: {}). Probing for peers...", 
+                                                            text: format!("[Convey] Detected secure channel (ID: {}). Probing for peers...", 
                                                                 &channel_id[..8.min(channel_id.len())]),
                                                         },
                                                     );
@@ -1644,7 +1645,7 @@ fn app() -> Element {
                     class: "top-bar-left",
                     h1 { 
                         class: "app-title",
-                        "NAIS-client" 
+                        "Convey" 
                     }
                     input {
                         class: "profile-search compact",
@@ -4109,7 +4110,7 @@ fn app() -> Element {
                                     if info.is_nais_client {
                                         span {
                                             style: "color: #4CAF50;",
-                                            "✓ NAIS client detected - showing all channels across servers"
+                                            "✓ Convey client detected - showing all channels across servers"
                                         }
                                     } else {
                                         span {
@@ -4190,14 +4191,14 @@ fn app() -> Element {
                                                             if is_cross_server {
                                                                 span {
                                                                     style: "font-size: 11px; color: var(--text-muted);",
-                                                                    "Cross-server invite via NAIS"
+                                                                    "Cross-server invite via Convey"
                                                                 }
                                                             }
                                                         }
                                                         if is_nais_channel {
                                                             span {
                                                                 style: "font-size: 11px; color: #4CAF50; background: rgba(76,175,80,0.1); padding: 2px 6px; border-radius: 4px;",
-                                                                "NAIS"
+                                                                "Secure"
                                                             }
                                                         }
                                                     }
@@ -4365,7 +4366,7 @@ fn app() -> Element {
                                         style: "display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;",
                                         h3 {
                                             style: "margin: 0; color: #FF9800;",
-                                            "⚠ Not a NAIS Client"
+                                            "⚠ Not a Convey Client"
                                         }
                                         button {
                                             style: "background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 18px;",
@@ -4376,7 +4377,7 @@ fn app() -> Element {
                                     div {
                                         style: "color: var(--text); line-height: 1.5;",
                                         span { style: "font-weight: bold;", "{target_nick}" }
-                                        " does not appear to be running a NAIS client, or did not respond in time."
+                                        " does not appear to be running a Convey client, or did not respond in time."
                                     }
                                     div {
                                         style: "display: flex; justify-content: flex-end; margin-top: 16px;",
@@ -4498,7 +4499,7 @@ fn app() -> Element {
                                                         if ch_type == "nais" {
                                                             span {
                                                                 style: "font-size: 11px; color: #4CAF50; background: rgba(76,175,80,0.1); padding: 2px 6px; border-radius: 4px;",
-                                                                "NAIS"
+                                                                "Secure"
                                                             }
                                                         }
                                                     }
@@ -4567,7 +4568,7 @@ fn app() -> Element {
                                     if invite.is_nais {
                                         span {
                                             style: "margin-left: 8px; font-size: 11px; background: rgba(76,175,80,0.1); padding: 2px 6px; border-radius: 4px;",
-                                            "NAIS Encrypted"
+                                            "Encrypted"
                                         }
                                     }
                                 }
@@ -4682,7 +4683,7 @@ fn app() -> Element {
                                                 let new_nickname = {
                                                     let profs = profiles.read();
                                                     profs.first().map(|p| p.nickname.clone())
-                                                        .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "nais".to_string()))
+                                                        .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "convey".to_string()))
                                                 };
                                                 
                                                 let new_profile_name = profile::profile_name(&server, &new_nickname, &channel);
@@ -5152,7 +5153,7 @@ fn app() -> Element {
                     },
                     div {
                         class: "modal-title",
-                        "Welcome to NAIS IRC Client"
+                        "Welcome to Convey"
                     }
                     div {
                         class: "modal-body",
@@ -5674,7 +5675,7 @@ fn app() -> Element {
                                     class: "send",
                                     style: "padding:6px 10px; font-size:12px;",
                                     onclick: move |_| {
-                                        let default_nick = "nais".to_string();
+                                        let default_nick = "convey".to_string();
                                         let name = unique_profile_label(
                                             label,
                                             server,
@@ -8369,11 +8370,11 @@ fn handle_send_message(
                         "voice" | "call" => "/voice <nickname> - Start a voice call\n(For channel voice mode, use: /mode +v nickname)",
                         "devoice" => "/devoice <nickname> - Remove voice mode (-v) from a user",
                         "hangup" | "endcall" => "/hangup - End the current voice call",
-                        "naiscreate" => "/naiscreate [name] - Create a new NAIS secure P2P channel\nCreates a moderated IRC channel for discovery with encrypted P2P messaging",
-                        "naisjoin" => "/naisjoin <#channel> - Join a NAIS secure channel\nJoins an existing NAIS channel and connects to peers",
-                        "naisleave" => "/naisleave [channel_id] - Leave a NAIS secure channel",
-                        "naislist" => "/naislist - List active NAIS channels and their peers",
-                        "naisprobe" => "/naisprobe [#channel] - Manually probe users in channel for NAIS capability",
+                        "naiscreate" => "/naiscreate [name] - Create a new secure P2P channel\nCreates a moderated IRC channel for discovery with encrypted P2P messaging",
+                        "naisjoin" => "/naisjoin <#channel> - Join a secure channel\nJoins an existing secure channel and connects to peers",
+                        "naisleave" => "/naisleave [channel_id] - Leave a secure channel",
+                        "naislist" => "/naislist - List active secure channels and their peers",
+                        "naisprobe" => "/naisprobe [#channel] - Manually probe users in channel for Convey capability",
                         "help" => "/help [command] - Show help information",
                         _ => "Unknown command. Use /help for a list of commands.",
                     }
@@ -8409,7 +8410,7 @@ fn handle_send_message(
                     &active_profile,
                     IrcEvent::System {
                         channel: channel.clone(),
-                        text: format!("Creating NAIS channel: {} ({})", 
+                        text: format!("Creating secure channel: {} ({})", 
                             channel_name.as_deref().unwrap_or("unnamed"), 
                             irc_channel),
                     },
@@ -8442,7 +8443,7 @@ fn handle_send_message(
                     &active_profile,
                     IrcEvent::System {
                         channel: channel.clone(),
-                        text: format!("NAIS channel created. Channel ID: {}\nOther NAIS clients joining {} will auto-discover and connect P2P.", 
+                        text: format!("Secure channel created. Channel ID: {}\nOther Convey clients joining {} will auto-discover and connect P2P.", 
                             channel_id, irc_channel),
                     },
                 );
@@ -8456,7 +8457,7 @@ fn handle_send_message(
                         &active_profile,
                         IrcEvent::System {
                             channel,
-                            text: "Usage: /naisjoin <#channel> - Join a NAIS P2P channel\nThe channel must have a NAIS topic (NAIS:v1:...)".to_string(),
+                            text: "Usage: /naisjoin <#channel> - Join a secure P2P channel\nThe channel must have a secure topic (NAIS:v1:...)".to_string(),
                         },
                     );
                 } else {
@@ -8479,7 +8480,7 @@ fn handle_send_message(
                         &active_profile,
                         IrcEvent::System {
                             channel: channel.clone(),
-                            text: format!("Joining {} to discover NAIS peers...\nIf this is a NAIS channel, peers will be probed automatically.", target),
+                            text: format!("Joining {} to discover peers...\nIf this is a secure channel, peers will be probed automatically.", target),
                         },
                     );
                 }
@@ -8496,7 +8497,7 @@ fn handle_send_message(
                 if let Some(handle) = handle.as_ref() {
                     let _ = handle.cmd_tx.try_send(IrcCommandEvent::Part {
                         channel: target.clone(),
-                        reason: Some("Leaving NAIS channel".to_string()),
+                        reason: Some("Leaving secure channel".to_string()),
                     });
                 }
                 
@@ -8506,7 +8507,7 @@ fn handle_send_message(
                     &active_profile,
                     IrcEvent::System {
                         channel: channel.clone(),
-                        text: format!("Left NAIS channel: {}", target),
+                        text: format!("Left secure channel: {}", target),
                     },
                 );
             }
@@ -8526,9 +8527,9 @@ fn handle_send_message(
                     }
                     
                     let list_text = if nais_channels.is_empty() {
-                        "No active NAIS channels.\n\nUse /naiscreate [name] to create a new NAIS channel\nUse /naisjoin #channel to join an existing NAIS channel".to_string()
+                        "No active secure channels.\n\nUse /naiscreate [name] to create a new secure channel\nUse /naisjoin #channel to join an existing secure channel".to_string()
                     } else {
-                        format!("Active NAIS channels:\n{}", nais_channels.join("\n"))
+                        format!("Active secure channels:\n{}", nais_channels.join("\n"))
                     };
                     
                     apply_event_with_config(
@@ -8591,7 +8592,7 @@ fn handle_send_message(
                             &active_profile,
                             IrcEvent::System {
                                 channel: channel.clone(),
-                                text: format!("Probing {} users in {} for NAIS capability...", probed_count, target_channel),
+                                text: format!("Probing {} users in {} for Convey capability...", probed_count, target_channel),
                             },
                         );
                     } else {
@@ -9520,7 +9521,7 @@ async fn fetch_og_image_async(url: String) -> Option<String> {
     // Try to fetch the page and extract OG image
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
-        .user_agent("Mozilla/5.0 (compatible; NAIS-client/0.1.0)")
+        .user_agent("Mozilla/5.0 (compatible; Convey/0.1.0)")
         .build()
         .ok()?;
     
@@ -9581,7 +9582,7 @@ fn get_or_fetch_og_image(url: &str) -> Option<String> {
 async fn download_image_async(url: String) -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
-        .user_agent("Mozilla/5.0 (compatible; NAIS-client/0.1.0)")
+        .user_agent("Mozilla/5.0 (compatible; Convey/0.1.0)")
         .build()
         .ok()?;
     
@@ -9776,7 +9777,7 @@ async fn fetch_discourse_data_async(url: String) -> Option<DiscourseData> {
     
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
-        .user_agent("Mozilla/5.0 (compatible; NAIS-client/0.1.0)")
+        .user_agent("Mozilla/5.0 (compatible; Convey/0.1.0)")
         .build()
         .ok()?;
     
