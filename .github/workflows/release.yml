@@ -2,6 +2,8 @@ name: Build Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -59,7 +61,6 @@ jobs:
   create-release:
     needs: [build-linux, build-windows]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
     steps:
@@ -75,10 +76,28 @@ jobs:
           cp artifacts/nais_client-windows-x86_64/nais_client.exe release/nais_client-windows-x86_64.exe
           chmod +x release/nais_client-linux-x86_64
       
-      - name: Create Release
+      # For tagged releases (v*), create a versioned release
+      - name: Create Tagged Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
             release/nais_client-linux-x86_64
             release/nais_client-windows-x86_64.exe
           generate_release_notes: true
+
+      # For pushes to main, update the rolling "latest" release
+      - name: Update Latest Release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest Build
+          body: |
+            Automated build from the latest commit on main.
+            Commit: ${{ github.sha }}
+          prerelease: false
+          make_latest: true
+          files: |
+            release/nais_client-linux-x86_64
+            release/nais_client-windows-x86_64.exe
