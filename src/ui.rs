@@ -1277,12 +1277,17 @@ fn app() -> Element {
                                                 let ch_id = channel_id_for_register.clone();
                                                 let irc_ch = irc_channel_for_register.clone();
                                                 let pname = pname_for_register.clone();
+                                                let mut nsc_channels_handle = nsc_channels.clone();
                                                 async move {
                                                     let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                                     let mgr = manager.read().await;
                                                     match mgr.join_existing_channel(&ch_id, &irc_ch, &pname).await {
                                                         Ok(Some(id)) => {
                                                             log::info!("[NAIS TOPIC] Registered new secure channel {} from topic in {}", &id[..8.min(id.len())], irc_ch);
+                                                            // Refresh the secure channels list in the UI
+                                                            let channels = mgr.list_channels().await;
+                                                            drop(mgr);
+                                                            nsc_channels_handle.set(channels);
                                                         }
                                                         Ok(None) => {
                                                             log::debug!("[NAIS TOPIC] Channel {} already registered or previously left", &ch_id[..8.min(ch_id.len())]);

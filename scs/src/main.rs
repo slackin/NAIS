@@ -569,67 +569,74 @@ struct StoredIdentity {
 struct EpochSecrets {
     /// Current epoch number
     epoch: u64,
-    /// Application secret for message encryption
-    application_secret: [u8; 32],
-    /// Confirmation key for membership changes
-    confirmation_key: [u8; 32],
-    /// Membership key
-    membership_key: [u8; 32],
+    /// Epoch secret (matches client nsc_channel::EpochSecrets)
+    epoch_secret: [u8; 32],
+    /// Sender data secret
+    sender_data_secret: [u8; 32],
+    /// Encryption key
+    encryption_key: [u8; 32],
     /// When this epoch started
-    epoch_start: u64,
+    started_at: u64,
+    /// Messages encrypted in this epoch
+    message_count: u32,
 }
 
 impl EpochSecrets {
-    /// Create new epoch secrets
+    /// Create new epoch secrets (matches client nsc_channel::EpochSecrets::initial)
     fn new(epoch: u64) -> Self {
         let mut rng = rand::thread_rng();
-        let mut application_secret = [0u8; 32];
-        let mut confirmation_key = [0u8; 32];
-        let mut membership_key = [0u8; 32];
+        let mut shared_secret = [0u8; 32];
+        rng.fill_bytes(&mut shared_secret);
 
-        rng.fill_bytes(&mut application_secret);
-        rng.fill_bytes(&mut confirmation_key);
-        rng.fill_bytes(&mut membership_key);
+        let hkdf = Hkdf::<Sha256>::new(None, &shared_secret);
+
+        let mut epoch_secret = [0u8; 32];
+        let mut sender_data_secret = [0u8; 32];
+        let mut encryption_key = [0u8; 32];
+
+        hkdf.expand(b"NSC_EpochSecret", &mut epoch_secret).unwrap();
+        hkdf.expand(b"NSC_SenderData", &mut sender_data_secret).unwrap();
+        hkdf.expand(b"NSC_EncryptionKey", &mut encryption_key).unwrap();
 
         Self {
             epoch,
-            application_secret,
-            confirmation_key,
-            membership_key,
-            epoch_start: now_millis(),
+            epoch_secret,
+            sender_data_secret,
+            encryption_key,
+            started_at: now_millis(),
+            message_count: 0,
         }
     }
 
     /// Derive message key for a specific sequence
     fn derive_message_key(&self, sequence: u64) -> [u8; 32] {
-        let hk = Hkdf::<Sha256>::new(None, &self.application_secret);
+        let hk = Hkdf::<Sha256>::new(None, &self.encryption_key);
         let info = format!("message-key-{}", sequence);
         let mut key = [0u8; 32];
         hk.expand(info.as_bytes(), &mut key).unwrap();
         key
     }
 
-    /// Advance to next epoch
+    /// Advance to next epoch (matches client nsc_channel::EpochSecrets::advance)
     fn advance(&self) -> Self {
-        let hk = Hkdf::<Sha256>::new(None, &self.application_secret);
+        let hkdf = Hkdf::<Sha256>::new(None, &self.epoch_secret);
 
-        let mut new_app_secret = [0u8; 32];
-        let mut new_conf_key = [0u8; 32];
-        let mut new_member_key = [0u8; 32];
+        let mut new_epoch_secret = [0u8; 32];
+        let mut sender_data_secret = [0u8; 32];
+        let mut encryption_key = [0u8; 32];
 
-        hk.expand(b"next-application-secret", &mut new_app_secret)
-            .unwrap();
-        hk.expand(b"next-confirmation-key", &mut new_conf_key)
-            .unwrap();
-        hk.expand(b"next-membership-key", &mut new_member_key)
-            .unwrap();
+        let epoch_bytes = (self.epoch + 1).to_be_bytes();
+        hkdf.expand(&epoch_bytes, &mut new_epoch_secret).unwrap();
+        hkdf.expand(b"NSC_SenderData", &mut sender_data_secret).unwrap();
+        hkdf.expand(b"NSC_EncryptionKey", &mut encryption_key).unwrap();
 
         Self {
             epoch: self.epoch + 1,
-            application_secret: new_app_secret,
-            confirmation_key: new_conf_key,
-            membership_key: new_member_key,
-            epoch_start: now_millis(),
+            epoch_secret: new_epoch_secret,
+            sender_data_secret,
+            encryption_key,
+            started_at: now_millis(),
+            message_count: 0,
         }
     }
 }
@@ -1260,14 +1267,49 @@ impl Scs {
                     from
                 );
 
-                // Save state
+                // Serialize epoch secrets to send Welcome to the new member
+                let secrets_json = match serde_json::to_vec(&channel.epoch_secrets) {
+                    Ok(json) => json,
+                    Err(e) => {
+                        log::error!("Failed to serialize epoch secrets for Welcome: {}", e);
+                        // Still save state even if Welcome fails
+                        drop(channels);
+                        if let Err(e) = self.save_state().await {
+                            log::warn!("Failed to save state after member join: {}", e);
+                        }
+                        return;
+                    }
+                };
+
+                let mut welcome_envelope = NscEnvelope {
+                    version: PROTOCOL_VERSION,
+                    message_type: MessageType::Welcome,
+                    flags: 0,
+                    sender_id: self.identity.public_key(),
+                    channel_id: channel_id.0,
+                    sequence_number: 0,
+                    timestamp: now_millis(),
+                    payload: Bytes::from(secrets_json),
+                    signature: [0u8; 64],
+                };
+                welcome_envelope.sign(&self.identity.signing_key);
+
+                // Save state before sending (drop write lock)
                 drop(channels);
                 if let Err(e) = self.save_state().await {
                     log::warn!("Failed to save state after member join: {}", e);
                 }
 
-                // Send welcome with epoch secrets
-                // In real implementation, would encrypt epoch secrets for the new member
+                // Send Welcome with epoch secrets to the new member
+                if let Some(peer) = self.peers.get(&from) {
+                    if let Err(e) = self.send_to_peer(&peer.connection, &welcome_envelope).await {
+                        log::warn!("Failed to send Welcome to new member {}: {}", from, e);
+                    } else {
+                        log::info!("Sent Welcome with epoch secrets to new member {} for channel {}", from, channel_id);
+                    }
+                } else {
+                    log::warn!("New member {} not directly connected, cannot send Welcome", from);
+                }
             }
         }
     }
@@ -1442,15 +1484,39 @@ impl Scs {
                 let channel_id = ChannelId(id);
 
                 if let Some(channel) = channels.get(&channel_id) {
-                    // Send welcome with epoch secrets
                     log::info!("Processing join request from {} for {}", from, channel_id);
 
-                    // In real implementation:
-                    // 1. Verify peer identity
-                    // 2. Encrypt epoch secrets for peer
-                    // 3. Send Welcome message
-                    // 4. Add to members
-                    let _ = channel;
+                    // Serialize epoch secrets and send Welcome message to the joining peer
+                    let secrets_json = match serde_json::to_vec(&channel.epoch_secrets) {
+                        Ok(json) => json,
+                        Err(e) => {
+                            log::error!("Failed to serialize epoch secrets for {}: {}", channel_id, e);
+                            return;
+                        }
+                    };
+
+                    let mut envelope = NscEnvelope {
+                        version: PROTOCOL_VERSION,
+                        message_type: MessageType::Welcome,
+                        flags: 0,
+                        sender_id: self.identity.public_key(),
+                        channel_id: id,
+                        sequence_number: 0,
+                        timestamp: now_millis(),
+                        payload: Bytes::from(secrets_json),
+                        signature: [0u8; 64],
+                    };
+                    envelope.sign(&self.identity.signing_key);
+
+                    if let Some(peer) = self.peers.get(&from) {
+                        if let Err(e) = self.send_to_peer(&peer.connection, &envelope).await {
+                            log::warn!("Failed to send Welcome to {}: {}", from, e);
+                        } else {
+                            log::info!("Sent Welcome with epoch secrets to {} for channel {}", from, channel_id);
+                        }
+                    } else {
+                        log::warn!("Peer {} not connected, cannot send Welcome", from);
+                    }
                 }
             }
         }

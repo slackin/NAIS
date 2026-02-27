@@ -3139,8 +3139,23 @@ impl NscManager {
                         
                         // IMPORTANT: Initiate ICE exchange to establish P2P connection with discovered peer
                         // Without this, we only have metadata but no actual transport connection
-                        log::info!("[NSC_ICE] Initiating ICE exchange with discovered peer {}", from_nick);
-                        match self.create_ice_offer(from_nick, None).await {
+                        // Pass the first shared channel_id so that Welcome with epoch secrets
+                        // gets sent once the QUIC connection is established.
+                        let first_shared_channel: Option<String> = {
+                            let info = self.channel_info.read().await;
+                            let members = self.channel_members.read().await;
+                            info.iter()
+                                .find(|(ch_id, ch_info)| {
+                                    ch_info.is_owner && members.get(*ch_id)
+                                        .map(|list| list.iter().any(|m| {
+                                            peer_id_hex.starts_with(&m.peer_id) || m.peer_id.starts_with(&peer_id_hex)
+                                        }))
+                                        .unwrap_or(false)
+                                })
+                                .map(|(ch_id, _)| ch_id.clone())
+                        };
+                        log::info!("[NSC_ICE] Initiating ICE exchange with discovered peer {} (channel_hint={:?})", from_nick, first_shared_channel.as_deref().map(|c| &c[..8.min(c.len())]));
+                        match self.create_ice_offer(from_nick, first_shared_channel.as_deref()).await {
                             Ok(offer_ctcp) => {
                                 log::info!("[NSC_ICE] Created ICE offer for discovered peer {}", from_nick);
                                 return Some(offer_ctcp);
