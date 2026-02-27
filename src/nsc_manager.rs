@@ -1094,6 +1094,13 @@ impl NscManager {
                     &channel_id[..8.min(channel_id.len())]);
                 channel_members[idx].peer_id = peer_id_hex.to_string();
             }
+            // Upgrade is_owner flag if the new call marks them as owner
+            if is_owner && !channel_members[idx].is_owner {
+                log::info!("[ADD_MEMBER] Upgrading is_owner for {} in channel {}",
+                    &peer_id_hex[..16.min(peer_id_hex.len())],
+                    &channel_id[..8.min(channel_id.len())]);
+                channel_members[idx].is_owner = true;
+            }
             return;
         }
         
@@ -1559,6 +1566,45 @@ impl NscManager {
                                     }
                                     MessageType::Heartbeat => {
                                         log::debug!("[OUTGOING_READER] Received heartbeat from {}", &sender_hex[..16.min(sender_hex.len())]);
+                                    }
+                                    MessageType::MemberJoin => {
+                                        // Peer is requesting to join / requesting key resync.
+                                        // If we have epoch secrets for this channel, respond with Welcome.
+                                        log::info!("[OUTGOING_READER] Received MemberJoin from {} for channel {}",
+                                            &sender_hex[..16.min(sender_hex.len())],
+                                            &channel_hex[..8.min(channel_hex.len())]);
+                                        {
+                                            let manager = get_nsc_manager_async().await;
+                                            let mgr = manager.read().await;
+                                            mgr.add_channel_member(&channel_hex, &sender_hex, false).await;
+
+                                            let has_secrets = {
+                                                let ch_bytes = hex::decode(&channel_hex).ok();
+                                                if let Some(bytes) = ch_bytes {
+                                                    if bytes.len() == 32 {
+                                                        let mut arr = [0u8; 32];
+                                                        arr.copy_from_slice(&bytes);
+                                                        let cid = crate::nsc_channel::ChannelId::from_bytes(arr);
+                                                        mgr.channel_manager.get_epoch_secrets(&cid).await.is_some()
+                                                    } else { false }
+                                                } else { false }
+                                            };
+                                            if has_secrets {
+                                                match mgr.send_welcome_epoch_secrets(&sender_hex, &channel_hex).await {
+                                                    Ok(_) => log::info!(
+                                                        "[OUTGOING_READER] Sent Welcome epoch secrets to {} for channel {} in response to MemberJoin",
+                                                        &sender_hex[..16.min(sender_hex.len())],
+                                                        &channel_hex[..8.min(channel_hex.len())]
+                                                    ),
+                                                    Err(e) => log::warn!(
+                                                        "[OUTGOING_READER] Failed to send Welcome to {} for channel {}: {}",
+                                                        &sender_hex[..16.min(sender_hex.len())],
+                                                        &channel_hex[..8.min(channel_hex.len())],
+                                                        e
+                                                    ),
+                                                }
+                                            }
+                                        }
                                     }
                                     _ => {
                                         log::debug!("[OUTGOING_READER] Ignored message type {:?}", envelope.message_type);
@@ -2328,6 +2374,58 @@ impl NscManager {
         Ok(())
     }
 
+    /// Send a key sync request to a peer for a specific channel.
+    /// Uses MemberJoin as the signal: "I am (re-)joining this channel and need the epoch secrets."
+    /// The recipient should respond with a Welcome containing the current epoch secrets.
+    async fn send_key_sync_request(&self, peer_id_hex: &str, channel_id: &str) -> Result<(), String> {
+        // Parse channel ID
+        let bytes = hex::decode(channel_id).map_err(|_| "Invalid channel ID")?;
+        if bytes.len() != 32 {
+            return Err("Invalid channel ID length".to_string());
+        }
+        let mut channel_arr = [0u8; 32];
+        channel_arr.copy_from_slice(&bytes);
+        
+        // Create MemberJoin envelope (empty payload — the channel_id is the signal)
+        let seq = {
+            let mut seqs = self.sequence_numbers.write().await;
+            let seq = seqs.entry(channel_id.to_string()).or_insert(0);
+            *seq += 1;
+            *seq
+        };
+        
+        let mut envelope = NscEnvelope::new(
+            MessageType::MemberJoin,
+            self.peer_id.0,
+            channel_arr,
+            seq,
+            Bytes::new(),
+        );
+        envelope.sign(&self.identity);
+        
+        // Parse peer ID
+        let peer_bytes = hex::decode(peer_id_hex).map_err(|_| "Invalid peer ID")?;
+        if peer_bytes.len() != 32 {
+            return Err("Invalid peer ID length".to_string());
+        }
+        let mut peer_arr = [0u8; 32];
+        peer_arr.copy_from_slice(&peer_bytes);
+        let peer_id = PeerId(peer_arr);
+        
+        // Try sending via direct transport first, fall back to relay
+        let transport_lock = self.transport.read().await;
+        if let Some(ref transport) = *transport_lock {
+            if transport.send(&peer_id, &envelope).await.is_ok() {
+                return Ok(());
+            }
+        }
+        drop(transport_lock);
+        
+        // Fall back to relay
+        self.relay_client.send_to_peer(&peer_id, &envelope).await
+            .map_err(|e| format!("Failed to send key sync request: {}", e))
+    }
+
     /// Sync epoch secrets to a peer for all channels we own and they are a member of.
     /// Used after generic ICE connects where no channel context was attached.
     pub async fn sync_epoch_secrets_to_peer(&self, peer_id_hex: &str) -> Result<usize, String> {
@@ -2386,7 +2484,8 @@ impl NscManager {
     }
 
     /// Attempt to heal channel key drift by re-sending Welcome secrets to a peer
-    /// when decryption fails on a locally-owned channel.
+    /// when decryption fails on a locally-owned channel, or by requesting key
+    /// re-sync from the sender when we are not the owner.
     async fn resync_on_decrypt_failure(&self, channel_id: &str, sender_peer_id_hex: &str) {
         // Debug dump channel state to help diagnose key mismatches
         self.debug_dump_channel_key_state(channel_id).await;
@@ -2395,10 +2494,6 @@ impl NscManager {
             let info = self.channel_info.read().await;
             info.get(channel_id).map(|c| c.is_owner).unwrap_or(false)
         };
-
-        if !is_local_owner {
-            return;
-        }
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2423,21 +2518,52 @@ impl NscManager {
         // Ensure membership reflects active traffic from this peer.
         self.add_channel_member(channel_id, sender_peer_id_hex, false).await;
 
-        match self.send_welcome_epoch_secrets(sender_peer_id_hex, channel_id).await {
-            Ok(_) => {
-                log::info!(
-                    "[NSC_HEAL] Re-sent Welcome epoch secrets to {} for channel {} after decrypt failure",
-                    &sender_peer_id_hex[..16.min(sender_peer_id_hex.len())],
-                    &channel_id[..8.min(channel_id.len())]
-                );
+        if is_local_owner {
+            // Owner path: re-send Welcome with our epoch secrets to the sender
+            match self.send_welcome_epoch_secrets(sender_peer_id_hex, channel_id).await {
+                Ok(_) => {
+                    log::info!(
+                        "[NSC_HEAL] Re-sent Welcome epoch secrets to {} for channel {} after decrypt failure",
+                        &sender_peer_id_hex[..16.min(sender_peer_id_hex.len())],
+                        &channel_id[..8.min(channel_id.len())]
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[NSC_HEAL] Failed to re-send Welcome epoch secrets to {} for channel {}: {}",
+                        &sender_peer_id_hex[..16.min(sender_peer_id_hex.len())],
+                        &channel_id[..8.min(channel_id.len())],
+                        e
+                    );
+                }
             }
-            Err(e) => {
-                log::warn!(
-                    "[NSC_HEAL] Failed to re-send Welcome epoch secrets to {} for channel {}: {}",
-                    &sender_peer_id_hex[..16.min(sender_peer_id_hex.len())],
-                    &channel_id[..8.min(channel_id.len())],
-                    e
-                );
+        } else {
+            // Non-owner path: request epoch secrets from the sender (they clearly
+            // have a working key since they successfully encrypted).  We signal
+            // "I need the channel key" by sending a MemberJoin for the channel.
+            // Any peer that receives a MemberJoin for a channel they own (or have
+            // secrets for) will respond with a Welcome containing the epoch secrets.
+            log::info!(
+                "[NSC_HEAL] Non-owner requesting key resync from {} for channel {}",
+                &sender_peer_id_hex[..16.min(sender_peer_id_hex.len())],
+                &channel_id[..8.min(channel_id.len())]
+            );
+            match self.send_key_sync_request(sender_peer_id_hex, channel_id).await {
+                Ok(_) => {
+                    log::info!(
+                        "[NSC_HEAL] Sent key sync request (MemberJoin) to {} for channel {}",
+                        &sender_peer_id_hex[..16.min(sender_peer_id_hex.len())],
+                        &channel_id[..8.min(channel_id.len())]
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[NSC_HEAL] Failed to send key sync request to {} for channel {}: {}",
+                        &sender_peer_id_hex[..16.min(sender_peer_id_hex.len())],
+                        &channel_id[..8.min(channel_id.len())],
+                        e
+                    );
+                }
             }
         }
     }
@@ -4978,6 +5104,45 @@ impl NscManager {
                                                             let manager = get_nsc_manager_async().await;
                                                             let mgr = manager.read().await;
                                                             mgr.add_channel_member(&channel_hex, &sender_hex, false).await;
+                                                        }
+                                                        
+                                                        // If we have epoch secrets for this channel, respond
+                                                        // with a Welcome so the joining peer gets the key.
+                                                        // This handles both fresh joins and key-sync requests
+                                                        // from peers that lost their epoch secrets.
+                                                        {
+                                                            let manager = get_nsc_manager_async().await;
+                                                            let mgr = manager.read().await;
+                                                            let has_secrets = {
+                                                                let ch_bytes = hex::decode(&channel_hex).ok();
+                                                                if let Some(bytes) = ch_bytes {
+                                                                    if bytes.len() == 32 {
+                                                                        let mut arr = [0u8; 32];
+                                                                        arr.copy_from_slice(&bytes);
+                                                                        let cid = crate::nsc_channel::ChannelId::from_bytes(arr);
+                                                                        mgr.channel_manager.get_epoch_secrets(&cid).await.is_some()
+                                                                    } else { false }
+                                                                } else { false }
+                                                            };
+                                                            if has_secrets {
+                                                                match mgr.send_welcome_epoch_secrets(&sender_hex, &channel_hex).await {
+                                                                    Ok(_) => {
+                                                                        log::info!(
+                                                                            "[KEY_SYNC] Sent Welcome epoch secrets to {} for channel {} in response to MemberJoin",
+                                                                            &sender_hex[..16.min(sender_hex.len())],
+                                                                            &channel_hex[..8.min(channel_hex.len())]
+                                                                        );
+                                                                    }
+                                                                    Err(e) => {
+                                                                        log::warn!(
+                                                                            "[KEY_SYNC] Failed to send Welcome to {} for channel {}: {}",
+                                                                            &sender_hex[..16.min(sender_hex.len())],
+                                                                            &channel_hex[..8.min(channel_hex.len())],
+                                                                            e
+                                                                        );
+                                                                    }
+                                                                }
+                                                            }
                                                         }
                                                         
                                                         if let Some(ref tx) = event_tx {

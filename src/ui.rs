@@ -6374,6 +6374,8 @@ fn app() -> Element {
                                                         onclick: move |evt| {
                                                             evt.stop_propagation();
                                                             let cid = channel_id_for_button.clone();
+                                                            let irc_chan = irc_channel_display.clone();
+                                                            let network = network_display.clone();
                                                             log::info!("Leave button clicked for channel: {}", cid);
                                                             spawn(async move {
                                                                 log::info!("Attempting to leave channel: {}", cid);
@@ -6392,6 +6394,24 @@ fn app() -> Element {
                                                                 log::info!("Refreshed channel list, {} channels remaining", channels.len());
                                                                 drop(mgr);
                                                                 nsc_channels.set(channels);
+
+                                                                // Part the corresponding IRC channel
+                                                                if !irc_chan.is_empty() && !network.is_empty() {
+                                                                    if let Some(core) = cores.read().get(&network).cloned() {
+                                                                        log::info!("Parting IRC channel {} on network {}", irc_chan, network);
+                                                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Part {
+                                                                            channel: irc_chan.clone(),
+                                                                            reason: Some("Leaving secure channel".to_string()),
+                                                                        });
+                                                                        apply_event_with_config(
+                                                                            &mut state.write(),
+                                                                            &profiles.read(),
+                                                                            &network,
+                                                                            IrcEvent::Parted { channel: irc_chan },
+                                                                        );
+                                                                    }
+                                                                }
+
                                                                 // Close the modal to give visual feedback
                                                                 show_new_nsc_modal.set(false);
                                                             });
