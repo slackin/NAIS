@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NAIS — Modern IRC Client</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="bg-grid"></div>
+
+    <header>
+        <nav>
+            <div class="logo">NAIS</div>
+            <div class="nav-links">
+                <a href="#features">Features</a>
+                <a href="#download">Download</a>
+                <a href="https://github.com/slackin/NAIS" target="_blank" rel="noopener">GitHub</a>
+            </div>
+        </nav>
+    </header>
+
+    <main>
+        <section class="hero">
+            <div class="hero-content">
+                <h1>NAIS</h1>
+                <p class="tagline">A modern, lightweight IRC client built in Rust — with end-to-end encrypted secure channels.</p>
+                <div class="hero-buttons">
+                    <a href="#download" class="btn btn-primary">Download</a>
+                    <a href="https://github.com/slackin/NAIS" class="btn btn-secondary" target="_blank" rel="noopener">View Source</a>
+                </div>
+            </div>
+        </section>
+
+        <section id="features" class="features">
+            <h2>What is NAIS?</h2>
+            <p class="section-desc">
+                NAIS is an ultra-modern IRC client written in Rust with a native desktop GUI.
+                Beyond standard IRC, it introduces <strong>Nais Secure Channels (NSC)</strong> — an
+                end-to-end encrypted overlay that uses IRC only for peer discovery while routing
+                all message content through direct P2P connections or encrypted relay hubs.
+            </p>
+
+            <div class="feature-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">&#128274;</div>
+                    <h3>End-to-End Encryption</h3>
+                    <p>Secure channels with forward secrecy powered by X3DH key exchange, Double Ratchet, and MLS group protocol. Zero trust — relay hubs only ever see ciphertext.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#127897;</div>
+                    <h3>Encrypted Voice Chat</h3>
+                    <p>Peer-to-peer voice communication with Opus codec, noise filtering, and full encryption — all routed through the same secure transport layer.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#9889;</div>
+                    <h3>Built in Rust</h3>
+                    <p>Async from top to bottom with Tokio. Native desktop UI via Dioxus. Fast, safe, and lightweight with minimal resource usage.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#128433;</div>
+                    <h3>NAT Traversal</h3>
+                    <p>ICE, STUN, and TURN support with QUIC/UDP direct P2P connections. Graceful fallback to encrypted relay when direct connectivity isn't possible.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#128187;</div>
+                    <h3>Cross-Platform</h3>
+                    <p>First-class Windows and Linux support. Native look and feel on every platform with a single codebase.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#128220;</div>
+                    <h3>Open Source</h3>
+                    <p>Licensed under Apache 2.0. Full source code available, auditable cryptography, and community-driven development.</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="download" class="download">
+            <h2>Download</h2>
+            <p class="section-desc">Grab the latest release for your platform.</p>
+
+            <div class="download-grid">
+                <a href="https://github.com/slackin/NAIS/releases/latest/download/nais_client-windows-x86_64.exe" class="download-card">
+                    <div class="download-icon">&#128187;</div>
+                    <h3>Windows</h3>
+                    <p>x86_64 — .exe</p>
+                    <span class="btn btn-primary btn-sm">Download</span>
+                </a>
+                <a href="https://github.com/slackin/NAIS/releases/latest/download/nais_client-linux-x86_64" class="download-card">
+                    <div class="download-icon">&#128039;</div>
+                    <h3>Linux</h3>
+                    <p>x86_64 — binary</p>
+                    <span class="btn btn-primary btn-sm">Download</span>
+                </a>
+            </div>
+
+            <p class="download-note">
+                Or browse all releases on <a href="https://github.com/slackin/NAIS/releases" target="_blank" rel="noopener">GitHub Releases</a>.
+            </p>
+        </section>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 NAIS Project &middot; <a href="https://github.com/slackin/NAIS" target="_blank" rel="noopener">GitHub</a> &middot; Licensed under Apache 2.0</p>
+    </footer>
+</body>
+</html>
