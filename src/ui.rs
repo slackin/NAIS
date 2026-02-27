@@ -1523,6 +1523,20 @@ fn app() -> Element {
                             if matches!(event, IrcEvent::Connected { .. }) {
                                 status_handle.write().insert(profile_name.clone(), ConnectionStatus::Connected);
                                 
+                                // Set our display name on the NSC manager from the IRC nickname
+                                let our_nick_for_nsc = state_mut
+                                    .servers.get(&profile_name)
+                                    .map(|s| s.nickname.clone())
+                                    .unwrap_or_default();
+                                if !our_nick_for_nsc.is_empty() {
+                                    let nick_clone = our_nick_for_nsc.clone();
+                                    spawn(async move {
+                                        let manager = crate::nsc_manager::get_nsc_manager_async().await;
+                                        let mgr = manager.read().await;
+                                        mgr.set_display_name(nick_clone).await;
+                                    });
+                                }
+                                
                                 // Auto-rejoin NSC discovery channels when IRC connects
                                 let profile_for_nsc = profile_name.clone();
                                 spawn(async move {

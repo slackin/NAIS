@@ -356,6 +356,8 @@ pub struct NscPeer {
     pub peer_id: String,
     pub nat_type: Option<String>,
     pub last_seen: u64,
+    /// Display name / username reported by the peer via probe
+    pub display_name: Option<String>,
 }
 
 /// A pending message awaiting delivery acknowledgment
@@ -480,6 +482,8 @@ pub struct NscManager {
     /// These should NOT be reconnected by the heartbeat loop - the initiator will connect to us.
     /// Maps peer_id_hex -> timestamp when we started waiting
     awaiting_incoming_connections: Arc<RwLock<HashMap<String, std::time::Instant>>>,
+    /// Our display name / username (set from IRC profile nick or user preference)
+    our_display_name: Arc<RwLock<Option<String>>>,
 }
 
 /// Pending ICE session info
@@ -741,6 +745,7 @@ impl NscManager {
             decrypt_resync_backoff_until: Arc::new(RwLock::new(HashMap::new())),
             message_tx: Arc::new(RwLock::new(None)),
             awaiting_incoming_connections: Arc::new(RwLock::new(HashMap::new())),
+            our_display_name: Arc::new(RwLock::new(None)),
         };
         
         // Save identity if newly generated
@@ -1074,6 +1079,11 @@ impl NscManager {
     
     /// Add a member to a channel (internal use)
     pub async fn add_channel_member(&self, channel_id: &str, peer_id_hex: &str, is_owner: bool) {
+        self.add_channel_member_with_name(channel_id, peer_id_hex, is_owner, None).await;
+    }
+
+    /// Add a member to a channel with an optional display name
+    pub async fn add_channel_member_with_name(&self, channel_id: &str, peer_id_hex: &str, is_owner: bool, display_name: Option<&str>) {
         let mut members = self.channel_members.write().await;
         let channel_members = members.entry(channel_id.to_string()).or_insert_with(Vec::new);
         
@@ -1101,6 +1111,17 @@ impl NscManager {
                     &channel_id[..8.min(channel_id.len())]);
                 channel_members[idx].is_owner = true;
             }
+            // Upgrade display_name if we have a real name and current is just a fingerprint stub
+            if let Some(name) = display_name {
+                let current = &channel_members[idx].display_name;
+                if current.ends_with("...") || current == "Unknown" {
+                    log::info!("[ADD_MEMBER] Upgrading display_name '{}' -> '{}' for {} in channel {}",
+                        current, name,
+                        &peer_id_hex[..16.min(peer_id_hex.len())],
+                        &channel_id[..8.min(channel_id.len())]);
+                    channel_members[idx].display_name = name.to_string();
+                }
+            }
             return;
         }
         
@@ -1110,11 +1131,14 @@ impl NscManager {
             .as_secs();
         
         let our_peer_id = hex::encode(self.peer_id.0);
-        let display_name = format!("{}...", &peer_id_hex[..8.min(peer_id_hex.len())]);
+        let resolved_display_name = match display_name {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => format!("{}...", &peer_id_hex[..8.min(peer_id_hex.len())]),
+        };
         
         let member = NscChannelMember {
             peer_id: peer_id_hex.to_string(),
-            display_name,
+            display_name: resolved_display_name,
             is_self: peer_id_hex == our_peer_id,
             is_owner,
             joined_at: now,
@@ -1152,6 +1176,27 @@ impl NscManager {
             if let Some(channel) = info.get_mut(channel_id) {
                 channel.member_count = channel_members.len() as u32;
             }
+        }
+    }
+    
+    /// Set our display name (typically the IRC nickname from the active profile)
+    pub async fn set_display_name(&self, name: String) {
+        log::info!("[NSC_MANAGER] Display name set to: {}", name);
+        *self.our_display_name.write().await = Some(name);
+    }
+    
+    /// Get our display name (async version, for use in async contexts)
+    pub async fn get_our_display_name(&self) -> Option<String> {
+        self.our_display_name.read().await.clone()
+    }
+    
+    /// Get our display name (sync version, for use in non-async contexts like create_probe_ctcp)
+    /// Falls back to a short peer_id prefix if no display name has been set.
+    pub fn get_our_display_name_sync(&self) -> Option<String> {
+        // Try to read without blocking; if the lock is held, return None
+        match self.our_display_name.try_read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
         }
     }
     
@@ -3157,8 +3202,9 @@ impl NscManager {
         
         match cmd {
             NscCtcpCommand::Probe => {
-                // Respond with our capabilities
-                let response = ProbeMessage::new(&self.peer_id, None);
+                // Respond with our capabilities and display name
+                let our_display_name = self.get_our_display_name().await;
+                let response = ProbeMessage::with_display_name(&self.peer_id, None, our_display_name);
                 match encode_ctcp(NscCtcpCommand::ProbeResponse, &response) {
                     Ok(ctcp) => Some(ctcp),
                     Err(e) => {
@@ -3172,6 +3218,7 @@ impl NscManager {
                 if let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, args) {
                     if let Ok(probe) = serde_json::from_slice::<ProbeMessage>(&decoded) {
                         let peer_id_hex = probe.peer_id.clone();
+                        let peer_display_name = probe.display_name.clone();
                         let peer = NscPeer {
                             nick: from_nick.to_string(),
                             fingerprint: probe.peer_id.clone(),
@@ -3181,6 +3228,7 @@ impl NscManager {
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs(),
+                            display_name: peer_display_name.clone(),
                         };
                         
                         // Add to known peers
@@ -3238,9 +3286,13 @@ impl NscManager {
                         };
                         
                         // Now add the peer to each matching channel
+                        // Resolve display name: prefer probe display_name, fall back to IRC nick
+                        let resolved_name = peer_display_name.as_deref()
+                            .unwrap_or(from_nick);
+                        
                         for (nais_channel_id, mapped_irc_channel) in channels_to_add {
-                            log::info!("Adding peer {} to NSC channel {} (IRC channel: {})", 
-                                from_nick, &nais_channel_id[..8.min(nais_channel_id.len())], mapped_irc_channel);
+                            log::info!("Adding peer {} ({}) to NSC channel {} (IRC channel: {})", 
+                                from_nick, resolved_name, &nais_channel_id[..8.min(nais_channel_id.len())], mapped_irc_channel);
                             
                             // Also add to peers_by_irc_channel if not already there
                             {
@@ -3251,8 +3303,8 @@ impl NscManager {
                                 }
                             }
                             
-                            // Add peer to NSC channel members
-                            self.add_channel_member(&nais_channel_id, &peer_id_hex, false).await;
+                            // Add peer to NSC channel members with their display name
+                            self.add_channel_member_with_name(&nais_channel_id, &peer_id_hex, false, Some(resolved_name)).await;
                             
                             // Send MemberJoined event to UI
                             if let Some(ref tx) = self.event_tx {
@@ -3611,11 +3663,13 @@ impl NscManager {
         }
     }
     
-    /// Create a probe CTCP message to discover NSC peers
+    /// Create a probe CTCP message to discover NSC peers (includes our display name)
     pub fn create_probe_ctcp(&self) -> String {
         use crate::nsc_irc::{NscCtcpCommand, ProbeMessage, encode_ctcp};
         
-        let probe = ProbeMessage::new(&self.peer_id, None);
+        // Include our display name from stored identity so other peers can learn our username
+        let display_name = self.get_our_display_name_sync();
+        let probe = ProbeMessage::with_display_name(&self.peer_id, None, display_name);
         match encode_ctcp(NscCtcpCommand::Probe, &probe) {
             Ok(ctcp) => ctcp,
             Err(_) => String::new(),

@@ -165,6 +165,9 @@ pub struct ProbeMessage {
     pub nat_type: Option<String>,
     /// Supported features
     pub features: Vec<String>,
+    /// Display name / username of the peer (if set)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 impl ProbeMessage {
@@ -178,7 +181,15 @@ impl ProbeMessage {
                 "e2e".to_string(),
                 "mls".to_string(),
             ],
+            display_name: None,
         }
+    }
+
+    /// Create a probe message with a display name
+    pub fn with_display_name(peer_id: &PeerId, nat_type: Option<NatType>, display_name: Option<String>) -> Self {
+        let mut msg = Self::new(peer_id, nat_type);
+        msg.display_name = display_name;
+        msg
     }
 }
 
@@ -711,6 +722,8 @@ pub struct PeerPresence {
     pub fingerprint: Option<String>,
     /// Online status
     pub status: PresenceStatus,
+    /// Display name / username reported by the peer
+    pub display_name: Option<String>,
 }
 
 /// Peer online status
@@ -739,6 +752,7 @@ impl Default for PeerPresence {
             channel_hashes: Vec::new(),
             fingerprint: None,
             status: PresenceStatus::Unknown,
+            display_name: None,
         }
     }
 }
@@ -780,6 +794,11 @@ impl PresenceTracker {
 
         if let Some(nat_str) = &probe.nat_type {
             presence.nat_type = parse_nat_type(nat_str);
+        }
+
+        // Update display name if provided in probe
+        if let Some(ref name) = probe.display_name {
+            presence.display_name = Some(name.clone());
         }
 
         // Update reverse lookup
