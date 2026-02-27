@@ -89,6 +89,9 @@ pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// ALPN protocol identifier
 pub const ALPN_PROTOCOL: &[u8] = b"nais-secure-channel/2";
 
+/// Legacy ALPN protocol identifier (for backward compatibility with older relay hubs)
+pub const ALPN_PROTOCOL_LEGACY: &[u8] = b"nsc-relay";
+
 // =============================================================================
 // Wire Protocol - Message Types
 // =============================================================================
@@ -609,7 +612,7 @@ impl QuicTransport {
             .with_single_cert(vec![cert], key)
             .map_err(|e| TransportError::TlsError(e.to_string()))?;
 
-        crypto.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
+        crypto.alpn_protocols = vec![ALPN_PROTOCOL.to_vec(), ALPN_PROTOCOL_LEGACY.to_vec()];
 
         let mut transport_config = TransportConfig::default();
         transport_config.keep_alive_interval(Some(KEEPALIVE_INTERVAL));
@@ -635,8 +638,8 @@ impl QuicTransport {
             .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
             .with_no_client_auth();
 
-        // Must match server's ALPN protocol
-        crypto.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
+        // Propose both current and legacy ALPN for backward compatibility
+        crypto.alpn_protocols = vec![ALPN_PROTOCOL.to_vec(), ALPN_PROTOCOL_LEGACY.to_vec()];
 
         let mut client_config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
@@ -1857,8 +1860,8 @@ impl RelayClient {
             .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
             .with_no_client_auth();
         
-        // Must match relay-hub's ALPN protocol
-        crypto.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
+        // Propose both current and legacy ALPN for backward compatibility with older relay hubs
+        crypto.alpn_protocols = vec![ALPN_PROTOCOL.to_vec(), ALPN_PROTOCOL_LEGACY.to_vec()];
         
         let mut config = ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)

@@ -1254,8 +1254,11 @@ fn app() -> Element {
                                                 // Refresh pending invites signal
                                                 let invites = mgr.get_pending_invites().await;
                                                 log::info!("[UI NSC] Refreshed pending invites: {} invites", invites.len());
+                                                // Refresh channel list (metadata updates may have changed friendly names)
+                                                let channels = mgr.list_channels().await;
                                                 drop(mgr);
                                                 nsc_pending_invites.set(invites);
+                                                nsc_channels.set(channels);
                                             });
                                             
                                             log::debug!("NSC CTCP {} from {}: {:?}", command, from, args);
@@ -2445,8 +2448,52 @@ fn app() -> Element {
                                     .cloned()
                                     .unwrap_or_default();
                                 
+                                // Build a sender fingerprint -> display name map from channel members
+                                // This is reactive: when nsc_channel_members updates (after probes),
+                                // the chat will automatically re-render with proper names.
+                                let members = nsc_channel_members.read();
+                                let sender_names: HashMap<String, String> = {
+                                    let mut map = HashMap::new();
+                                    for member in members.iter() {
+                                        // Only use names that aren't fingerprint stubs
+                                        if !member.display_name.ends_with("...") && member.display_name != "Unknown" {
+                                            // Map both the full peer_id and common prefixes
+                                            map.insert(member.peer_id.clone(), member.display_name.clone());
+                                            // Also map short prefixes (8 and 16 char) since sender can be either
+                                            if member.peer_id.len() >= 16 {
+                                                map.insert(member.peer_id[..16].to_string(), member.display_name.clone());
+                                            }
+                                            if member.peer_id.len() >= 8 {
+                                                map.insert(member.peer_id[..8].to_string(), member.display_name.clone());
+                                            }
+                                        }
+                                    }
+                                    map
+                                };
+                                drop(members);
+                                
+                                // Pre-resolve all sender names for the messages
+                                let resolved_messages: Vec<(u64, String, String)> = messages.iter().map(|(ts, sender, text)| {
+                                    let display_name = if let Some(name) = sender_names.get(sender) {
+                                        name.clone()
+                                    } else {
+                                        // Try prefix matching as fallback
+                                        sender_names.iter()
+                                            .find(|(k, _)| k.starts_with(sender.as_str()) || sender.starts_with(k.as_str()))
+                                            .map(|(_, v)| v.clone())
+                                            .unwrap_or_else(|| {
+                                                if sender.len() > 8 {
+                                                    format!("{}…", &sender[..8])
+                                                } else {
+                                                    sender.clone()
+                                                }
+                                            })
+                                    };
+                                    (*ts, display_name, text.clone())
+                                }).collect();
+                                
                                 rsx! {
-                                    if messages.is_empty() {
+                                    if resolved_messages.is_empty() {
                                         div {
                                             class: "message system",
                                             div {
@@ -2478,14 +2525,14 @@ fn app() -> Element {
                                             }
                                         }
                                     } else {
-                                        for (i, (_timestamp, sender, text)) in messages.iter().enumerate() {
+                                        for (i, (_timestamp, display_sender, text)) in resolved_messages.iter().enumerate() {
                                             div {
                                                 key: "{i}",
                                                 class: "message",
                                                 span {
                                                     class: "username",
                                                     style: "color: var(--accent);",
-                                                    "{sender}"
+                                                    "{display_sender}"
                                                 }
                                                 span {
                                                     class: "text",
@@ -7144,11 +7191,14 @@ fn handle_send_message(
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
-                        let sender = nsc_fingerprint.read().clone();
-                        let sender_short = if sender.len() > 8 { sender[..8].to_string() } else { sender };
+                        let sender = mgr.get_our_display_name().await
+                            .unwrap_or_else(|| {
+                                let fp = nsc_fingerprint.read().clone();
+                                if fp.len() > 8 { fp[..8].to_string() } else { fp }
+                            });
                         let mut msgs = nsc_messages.write();
                         let channel_msgs = msgs.entry(channel_id_clone).or_insert_with(Vec::new);
-                        channel_msgs.push((timestamp, sender_short, text_clone));
+                        channel_msgs.push((timestamp, sender, text_clone));
                     }
                 }
                 

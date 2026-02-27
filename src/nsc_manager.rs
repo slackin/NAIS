@@ -843,7 +843,8 @@ impl NscManager {
         
         // Add ourselves as a member
         let our_peer_id = hex::encode(self.peer_id.0);
-        let our_display_name = format!("{}...", &our_peer_id[..8]);
+        let our_display_name = self.get_our_display_name().await
+            .unwrap_or_else(|| format!("{}...", &our_peer_id[..8]));
         let self_member = NscChannelMember {
             peer_id: our_peer_id,
             display_name: our_display_name,
@@ -913,8 +914,8 @@ impl NscManager {
             .unwrap_or_default()
             .as_secs();
 
-        // Derive a display name from the IRC channel
-        let name = irc_channel.to_string();
+        // Use a placeholder display name; the real friendly name will arrive via metadata sync
+        let name = format!("Secure Channel ({})", &irc_channel[1..].to_uppercase());
 
         let info = ChannelInfo {
             channel_id: channel_id_hex.to_string(),
@@ -935,7 +936,8 @@ impl NscManager {
 
         // Initialize members list with ourselves
         let our_peer_id = hex::encode(self.peer_id.0);
-        let our_display_name = format!("{}...", &our_peer_id[..8]);
+        let our_display_name = self.get_our_display_name().await
+            .unwrap_or_else(|| format!("{}...", &our_peer_id[..8]));
         let self_member = NscChannelMember {
             peer_id: our_peer_id,
             display_name: our_display_name,
@@ -1182,7 +1184,18 @@ impl NscManager {
     /// Set our display name (typically the IRC nickname from the active profile)
     pub async fn set_display_name(&self, name: String) {
         log::info!("[NSC_MANAGER] Display name set to: {}", name);
-        *self.our_display_name.write().await = Some(name);
+        *self.our_display_name.write().await = Some(name.clone());
+        
+        // Update all self-member entries in channel_members so the user list shows our name
+        let our_peer_id = hex::encode(self.peer_id.0);
+        let mut members = self.channel_members.write().await;
+        for (_channel_id, channel_members) in members.iter_mut() {
+            for member in channel_members.iter_mut() {
+                if member.is_self || member.peer_id == our_peer_id {
+                    member.display_name = name.clone();
+                }
+            }
+        }
     }
     
     /// Get our display name (async version, for use in async contexts)
@@ -1198,6 +1211,76 @@ impl NscManager {
             Ok(guard) => guard.clone(),
             Err(_) => None,
         }
+    }
+    
+    /// Resolve a peer ID (full hex or short prefix) to a human-readable display name.
+    /// Checks channel members first, then known peers (by peer_id and IRC nick).
+    /// Falls back to the original sender string if nothing better is found.
+    pub async fn resolve_peer_display_name(&self, sender: &str, channel_id: Option<&str>) -> String {
+        // 1. Check if this is us
+        let our_peer_id = hex::encode(self.peer_id.0);
+        if our_peer_id.starts_with(sender) || sender.starts_with(&our_peer_id) {
+            if let Some(name) = self.get_our_display_name().await {
+                return name;
+            }
+        }
+        
+        // 2. Check channel members (most reliable - already has resolved display names)
+        if let Some(ch_id) = channel_id {
+            let members = self.channel_members.read().await;
+            if let Some(channel_members) = members.get(ch_id) {
+                for member in channel_members {
+                    if member.peer_id.starts_with(sender) || sender.starts_with(&member.peer_id) {
+                        // Only return if it's a proper name (not a fingerprint stub)
+                        if !member.display_name.ends_with("...") && member.display_name != "Unknown" {
+                            return member.display_name.clone();
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 3. Check all channel members if no specific channel given
+        if channel_id.is_none() {
+            let members = self.channel_members.read().await;
+            for channel_members in members.values() {
+                for member in channel_members {
+                    if member.peer_id.starts_with(sender) || sender.starts_with(&member.peer_id) {
+                        if !member.display_name.ends_with("...") && member.display_name != "Unknown" {
+                            return member.display_name.clone();
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 4. Check known peers (from probe responses - has IRC nick and display_name)
+        let known = self.known_peers.read().await;
+        for peer in known.values() {
+            if peer.peer_id.starts_with(sender) || sender.starts_with(&peer.peer_id) {
+                // Prefer the display_name from probe, fall back to IRC nick
+                if let Some(ref name) = peer.display_name {
+                    return name.clone();
+                }
+                return peer.nick.clone();
+            }
+        }
+        
+        // 5. Fallback: return the sender as-is (truncated fingerprint)
+        sender.to_string()
+    }
+    
+    /// Synchronous batch resolver: resolve multiple senders for a channel at once.
+    /// Returns a map of sender -> display_name for use when the async context is limited.
+    pub async fn resolve_sender_names(&self, senders: &[String], channel_id: &str) -> HashMap<String, String> {
+        let mut result = HashMap::new();
+        for sender in senders {
+            if !result.contains_key(sender.as_str()) {
+                let name = self.resolve_peer_display_name(sender, Some(channel_id)).await;
+                result.insert(sender.clone(), name);
+            }
+        }
+        result
     }
     
     /// Get the IRC channel mapping
@@ -1814,11 +1897,11 @@ impl NscManager {
             .unwrap_or_default()
             .as_secs();
         
-        let sender_short = self.fingerprint();
-        let sender_short = if sender_short.len() > 8 { 
-            sender_short[..8].to_string() 
-        } else { 
-            sender_short 
+        let sender_short = if let Some(name) = self.get_our_display_name().await {
+            name
+        } else {
+            let fp = self.fingerprint();
+            if fp.len() > 8 { fp[..8].to_string() } else { fp }
         };
         
         // Parse channel ID
@@ -3625,10 +3708,15 @@ impl NscManager {
                         
                         if let Some(info) = channel_info.get_mut(&metadata.channel_id) {
                             // Update if newer version
+                            let name_changed = info.name != metadata.name;
                             info.name = metadata.name;
                             info.topic = metadata.topic;
                             info.member_count = metadata.member_count;
                             log::info!("Updated channel {} metadata from {}", metadata.channel_id, from_nick);
+                            if name_changed {
+                                drop(channel_info);
+                                self.save_storage_async().await;
+                            }
                         } else {
                             // New channel we didn't know about - generate IRC channel
                             let irc_channel = IrcChannelMapping::generate_irc_channel(&metadata.channel_id);
@@ -4115,7 +4203,8 @@ impl NscManager {
         
         // Initialize members list with ourselves and the inviter (channel owner)
         let our_peer_id = hex::encode(self.peer_id.0);
-        let our_display_name = format!("{}...", &our_peer_id[..8]);
+        let our_display_name = self.get_our_display_name().await
+            .unwrap_or_else(|| format!("{}...", &our_peer_id[..8]));
         let self_member = NscChannelMember {
             peer_id: our_peer_id,
             display_name: our_display_name,

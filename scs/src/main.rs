@@ -2102,7 +2102,10 @@ fn create_server_config() -> Result<ServerConfig, String> {
         .with_single_cert(certs, key.into())
         .map_err(|e| format!("TLS config error: {}", e))?;
 
-    server_crypto.alpn_protocols = vec![b"nais-secure-channel/2".to_vec()];
+    server_crypto.alpn_protocols = vec![
+        b"nais-secure-channel/2".to_vec(),
+        b"nsc-relay".to_vec(),
+    ];
 
     let server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
