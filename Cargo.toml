@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "relay-hub", "chanserv"]
+members = [".", "relay-hub", "scs"]
 resolver = "2"
 
 [package]

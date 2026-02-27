@@ -1,16 +1,16 @@
 #!/bin/bash
-# NAIS ChanServ Remote Install Script
+# NAIS SCS Remote Install Script
 # This script runs on the remote server with sudo
 
 set -e
 
-SERVICE_NAME="nais-chanserv"
-BIN_PATH="/usr/local/bin/nais-chanserv"
-CONFIG_DIR="/etc/nais-chanserv"
-DATA_DIR="/var/lib/nais-chanserv"
-STAGING_DIR="/tmp/nais-chanserv-deploy"
+SERVICE_NAME="nais-scs"
+BIN_PATH="/usr/local/bin/nais-scs"
+CONFIG_DIR="/etc/nais-scs"
+DATA_DIR="/var/lib/nais-scs"
+STAGING_DIR="/tmp/nais-scs-deploy"
 
-echo "=== NAIS ChanServ Remote Install ==="
+echo "=== NAIS SCS Remote Install ==="
 
 # Check we have the staging files
 if [[ ! -d "$STAGING_DIR" ]]; then
@@ -20,7 +20,7 @@ fi
 
 # Determine if first install (check both binary AND service file)
 FIRST_INSTALL=false
-if [[ ! -f "$BIN_PATH" ]] || [[ ! -f "/etc/systemd/system/nais-chanserv.service" ]]; then
+if [[ ! -f "$BIN_PATH" ]] || [[ ! -f "/etc/systemd/system/nais-scs.service" ]]; then
     FIRST_INSTALL=true
     echo "First time installation"
 else
@@ -35,7 +35,7 @@ fi
 
 # Install binary
 echo "Installing binary..."
-cp "$STAGING_DIR/nais-chanserv" "$BIN_PATH"
+cp "$STAGING_DIR/nais-scs" "$BIN_PATH"
 chmod 755 "$BIN_PATH"
 
 # First time setup
@@ -64,10 +64,10 @@ if $FIRST_INSTALL; then
     fi
     
     # Install systemd service
-    if [[ -f "$STAGING_DIR/nais-chanserv.service" ]]; then
+    if [[ -f "$STAGING_DIR/nais-scs.service" ]]; then
         echo "Installing systemd service..."
-        cp "$STAGING_DIR/nais-chanserv.service" /etc/systemd/system/
-        chmod 644 /etc/systemd/system/nais-chanserv.service
+        cp "$STAGING_DIR/nais-scs.service" /etc/systemd/system/
+        chmod 644 /etc/systemd/system/nais-scs.service
         systemctl daemon-reload
         systemctl enable "$SERVICE_NAME"
     fi

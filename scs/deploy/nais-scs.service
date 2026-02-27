@@ -1,14 +1,14 @@
 [Unit]
-Description=NAIS Channel Services Bot
+Description=NAIS Secure Channel Services (SCS)
 Documentation=https://github.com/your-org/nais-client
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=nais-chanserv
-Group=nais-chanserv
-ExecStart=/usr/local/bin/nais-chanserv --config /etc/nais-chanserv/config.toml
+User=nais-scs
+Group=nais-scs
+ExecStart=/usr/local/bin/nais-scs --config /etc/nais-scs/config.toml
 Restart=always
 RestartSec=5
 TimeoutStopSec=10
@@ -26,15 +26,15 @@ RestrictSUIDSGID=yes
 RestrictNamespaces=yes
 
 # Allow write to data directory
-ReadWritePaths=/var/lib/nais-chanserv
+ReadWritePaths=/var/lib/nais-scs
 
 # Working directory
-WorkingDirectory=/var/lib/nais-chanserv
+WorkingDirectory=/var/lib/nais-scs
 
 # Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=nais-chanserv
+SyslogIdentifier=nais-scs
 
 # Environment
 Environment=RUST_LOG=info

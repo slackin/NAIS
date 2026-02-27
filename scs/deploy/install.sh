@@ -1,16 +1,16 @@
 #!/bin/bash
-# NAIS ChanServ Installation Script
+# NAIS SCS Installation Script
 # Run as root or with sudo
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="/usr/local/bin"
-CONFIG_DIR="/etc/nais-chanserv"
-DATA_DIR="/var/lib/nais-chanserv"
-SERVICE_USER="nais-chanserv"
+CONFIG_DIR="/etc/nais-scs"
+DATA_DIR="/var/lib/nais-scs"
+SERVICE_USER="nais-scs"
 
-echo "=== NAIS ChanServ Installer ==="
+echo "=== NAIS SCS Installer ==="
 echo ""
 
 # Check if running as root
@@ -32,8 +32,8 @@ mkdir -p "$DATA_DIR"
 
 # Install binary
 echo "Installing binary to $INSTALL_DIR..."
-cp "$SCRIPT_DIR/nais-chanserv" "$INSTALL_DIR/"
-chmod 755 "$INSTALL_DIR/nais-chanserv"
+cp "$SCRIPT_DIR/nais-scs" "$INSTALL_DIR/"
+chmod 755 "$INSTALL_DIR/nais-scs"
 
 # Install config if it doesn't exist
 if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
@@ -54,8 +54,8 @@ chmod 750 "$DATA_DIR"
 
 # Install systemd service
 echo "Installing systemd service..."
-cp "$SCRIPT_DIR/nais-chanserv.service" /etc/systemd/system/
-chmod 644 /etc/systemd/system/nais-chanserv.service
+cp "$SCRIPT_DIR/nais-scs.service" /etc/systemd/system/
+chmod 644 /etc/systemd/system/nais-scs.service
 
 # Reload systemd
 systemctl daemon-reload
@@ -65,10 +65,10 @@ echo "=== Installation Complete ==="
 echo ""
 echo "Next steps:"
 echo "  1. Edit config:     sudo nano $CONFIG_DIR/config.toml"
-echo "  2. Start service:   sudo systemctl start nais-chanserv"
-echo "  3. Enable on boot:  sudo systemctl enable nais-chanserv"
-echo "  4. Check status:    sudo systemctl status nais-chanserv"
-echo "  5. View logs:       sudo journalctl -u nais-chanserv -f"
+echo "  2. Start service:   sudo systemctl start nais-scs"
+echo "  3. Enable on boot:  sudo systemctl enable nais-scs"
+echo "  4. Check status:    sudo systemctl status nais-scs"
+echo "  5. View logs:       sudo journalctl -u nais-scs -f"
 echo ""
 echo "Data directory: $DATA_DIR"
 echo ""

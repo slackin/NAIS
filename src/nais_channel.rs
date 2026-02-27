@@ -66,7 +66,7 @@ pub const CTCP_NAIS_MSG: &str = "NAIS_MSG";
 pub const CTCP_NAIS_CHANNEL_INVITE: &str = "NAIS_CHANNEL_INVITE";
 
 /// CTCP command to query a user for their list of secure channels
-/// Sent by client A to client B (or chanserv) to request channel list
+/// Sent by client A to client B (or SCS) to request channel list
 pub const CTCP_NAIS_QUERY_CHANNELS: &str = "NAIS_QUERY_CHANNELS";
 
 /// CTCP response to a channel query with the result

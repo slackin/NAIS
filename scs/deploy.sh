@@ -1,5 +1,5 @@
 #!/bin/bash
-# NAIS ChanServ Deployment Script
+# NAIS SCS Deployment Script
 # Builds and deploys to remote server - uses single remote script for efficiency
 
 set -e
@@ -8,7 +8,7 @@ set -e
 REMOTE_USER="nais@convey.pugbot.net"
 REMOTE_HOST="t3d"
 REMOTE_ALIAS="T3D"
-STAGING_DIR="/tmp/nais-chanserv-deploy"
+STAGING_DIR="/tmp/nais-scs-deploy"
 
 # Colors for output
 RED='\033[0;31m'
@@ -20,7 +20,7 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
-echo -e "${GREEN}=== NAIS ChanServ Deployment ===${NC}"
+echo -e "${GREEN}=== NAIS SCS Deployment ===${NC}"
 echo "Target: $REMOTE_USER @ $REMOTE_HOST ($REMOTE_ALIAS)"
 echo ""
 
@@ -76,7 +76,7 @@ scp_cmd() {
 # Restart only mode
 if $RESTART_ONLY; then
     echo -e "${YELLOW}Restarting service...${NC}"
-    ssh_tty "sudo systemctl restart nais-chanserv && sudo systemctl status nais-chanserv --no-pager"
+    ssh_tty "sudo systemctl restart nais-scs && sudo systemctl status nais-scs --no-pager"
     exit 0
 fi
 
@@ -84,14 +84,14 @@ fi
 if ! $SKIP_BUILD; then
     echo -e "${YELLOW}Building release binary (musl static)...${NC}"
     cd "$PROJECT_ROOT"
-    cargo build --release --target x86_64-unknown-linux-musl -p nais-chanserv
+    cargo build --release --target x86_64-unknown-linux-musl -p nais-scs
     echo -e "${GREEN}Build complete${NC}"
 else
     echo -e "${YELLOW}Skipping build (--skip-build)${NC}"
 fi
 
 # Check binary exists
-BINARY_PATH="$PROJECT_ROOT/target/x86_64-unknown-linux-musl/release/nais-chanserv"
+BINARY_PATH="$PROJECT_ROOT/target/x86_64-unknown-linux-musl/release/nais-scs"
 if [[ ! -f "$BINARY_PATH" ]]; then
     echo -e "${RED}Binary not found at $BINARY_PATH${NC}"
     exit 1
@@ -114,10 +114,10 @@ echo -e "${YELLOW}Preparing deployment package...${NC}"
 LOCAL_STAGING=$(mktemp -d)
 trap "rm -rf $LOCAL_STAGING" EXIT
 
-cp "$BINARY_PATH" "$LOCAL_STAGING/nais-chanserv"
+cp "$BINARY_PATH" "$LOCAL_STAGING/nais-scs"
 cp "$SCRIPT_DIR/deploy/remote-install.sh" "$LOCAL_STAGING/"
 cp "$SCRIPT_DIR/deploy/config.toml" "$LOCAL_STAGING/"
-cp "$SCRIPT_DIR/deploy/nais-chanserv.service" "$LOCAL_STAGING/"
+cp "$SCRIPT_DIR/deploy/nais-scs.service" "$LOCAL_STAGING/"
 
 if $UPDATE_CONFIG; then
     touch "$LOCAL_STAGING/.update-config"
@@ -135,4 +135,4 @@ ssh_tty "sudo bash $STAGING_DIR/remote-install.sh"
 echo ""
 echo -e "${GREEN}=== Deployment Complete ===${NC}"
 echo ""
-echo "View logs: ssh -l '$REMOTE_USER' $REMOTE_HOST 'sudo journalctl -u nais-chanserv -f'"
+echo "View logs: ssh -l '$REMOTE_USER' $REMOTE_HOST 'sudo journalctl -u nais-scs -f'"

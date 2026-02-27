@@ -1,6 +1,6 @@
-# NAIS ChanServ - Channel Services Bot
+# NAIS Secure Channel Services (SCS)
 
-A standalone bot that acts as a persistent host for NAIS Secure Channels, similar to traditional IRC 'ChanServ' services.
+A standalone bot that acts as a persistent host for NAIS Secure Channels. Named "SCS" (Secure Channel Services) to distinguish it from traditional IRC ChanServ bots — this is **Convey-SCS**.
 
 ## Features
 
@@ -16,7 +16,7 @@ A standalone bot that acts as a persistent host for NAIS Secure Channels, simila
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                      NAIS ChanServ Bot                          │
+│               NAIS Secure Channel Services (SCS)                │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
@@ -37,23 +37,23 @@ A standalone bot that acts as a persistent host for NAIS Secure Channels, simila
 
 ```bash
 # Start with default config
-nais-chanserv
+nais-scs
 
 # Start with custom config file
-nais-chanserv --config /path/to/chanserv.toml
+nais-scs --config /path/to/scs.toml
 
 # Start with specific bind address and relay hub
-nais-chanserv --bind 0.0.0.0:4434 --relay-hub hub.example.com:4433
+nais-scs --bind 0.0.0.0:4434 --relay-hub hub.example.com:4433
 ```
 
 ## Configuration
 
-Create `chanserv.toml`:
+Create `scs.toml`:
 
 ```toml
 # Server identity
-nickname = "ChanServ"
-display_name = "NAIS Channel Services"
+nickname = "SCS"
+display_name = "NAIS Secure Channel Services"
 
 # Network binding
 bind_address = "0.0.0.0:4434"
@@ -66,12 +66,12 @@ relay_hub = "hub.pugbot.net:4433"
 server = "irc.pugbot.net"
 port = 6697
 use_tls = true
-nick = "NAIS-ChanServ"
-channels = ["#nais-chanserv"]
+nick = "Convey-SCS"
+channels = ["#convey-scs"]
 
 # Storage settings
 [storage]
-data_dir = "~/.nais-chanserv"
+data_dir = "~/.nais-scs"
 message_ttl_days = 7
 max_messages_per_channel = 10000
 
@@ -89,17 +89,17 @@ auto_register = true
 
 ## Channel Registration
 
-Users can register channels for ChanServ hosting:
+Users can register channels for SCS hosting:
 
-1. **Via CTCP**: Send `REGISTER <channel_id>` command to ChanServ
-2. **Via Config**: Add channel to `chanserv.toml`
+1. **Via CTCP**: Send `REGISTER <channel_id>` command to Convey-SCS
+2. **Via Config**: Add channel to `scs.toml`
 3. **Via API** (future): REST API for channel management
 
 ## Security
 
-- ChanServ maintains its own identity key pair
+- SCS maintains its own identity key pair
 - All communications are end-to-end encrypted
-- ChanServ stores only encrypted epoch secrets
+- SCS stores only encrypted epoch secrets
 - Private keys never leave the server
 
 ## Running as a Service
@@ -108,13 +108,13 @@ Users can register channels for ChanServ hosting:
 
 ```ini
 [Unit]
-Description=NAIS Channel Services Bot
+Description=NAIS Secure Channel Services (SCS)
 After=network.target
 
 [Service]
 Type=simple
 User=nais
-ExecStart=/usr/local/bin/nais-chanserv --config /etc/nais-chanserv/config.toml
+ExecStart=/usr/local/bin/nais-scs --config /etc/nais-scs/config.toml
 Restart=always
 RestartSec=5
 
@@ -128,10 +128,10 @@ WantedBy=multi-user.target
 FROM rust:1.75 as builder
 WORKDIR /build
 COPY . .
-RUN cargo build --release -p nais-chanserv
+RUN cargo build --release -p nais-scs
 
 FROM debian:bookworm-slim
-COPY --from=builder /build/target/release/nais-chanserv /usr/local/bin/
+COPY --from=builder /build/target/release/nais-scs /usr/local/bin/
 EXPOSE 4434
-CMD ["nais-chanserv"]
+CMD ["nais-scs"]
 ```

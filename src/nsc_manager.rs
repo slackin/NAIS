@@ -871,7 +871,7 @@ impl NscManager {
     
     /// Join an existing NAIS secure channel discovered via its IRC topic.
     /// This is called when the client joins an IRC channel and discovers a NAIS topic
-    /// (e.g., from chanserv query results or /naisjoin). It registers the channel in
+    /// (e.g., from SCS query results or /naisjoin). It registers the channel in
     /// the manager so that subsequent probe responses can be associated with it.
     ///
     /// Returns the channel_id if newly registered, or None if already known.
