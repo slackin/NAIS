@@ -4844,7 +4844,24 @@ impl NscManager {
                     // Try relay fallback when ICE fails
                     let manager = get_nsc_manager_async().await;
                     let mgr = manager.read().await;
-                    if let Err(relay_err) = mgr.connect_via_relay(&peer_id, channel_id.as_deref()).await {
+                    
+                    // Resolve truncated peer_id prefix to full peer_id (same as success branch)
+                    let full_peer_id = {
+                        let known = mgr.known_peers.read().await;
+                        known.values()
+                            .find(|p| p.peer_id.starts_with(&peer_id))
+                            .map(|p| p.peer_id.clone())
+                    };
+                    let peer_id_to_use = match full_peer_id {
+                        Some(full_id) => full_id,
+                        None => {
+                            log::warn!("[NSC_ICE] No full peer_id found matching prefix {}, cannot relay", peer_id);
+                            mgr.active_ice_agents.write().await.remove(&session_id_for_cleanup);
+                            return;
+                        }
+                    };
+                    
+                    if let Err(relay_err) = mgr.connect_via_relay(&peer_id_to_use, channel_id.as_deref()).await {
                         log::error!("Relay fallback also failed: {}", relay_err);
                     }
                     
