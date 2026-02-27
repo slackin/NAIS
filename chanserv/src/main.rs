@@ -1742,6 +1742,19 @@ impl ChanServ {
                     log::info!("Sent NAIS_QUERY_CHANNELS_RESPONSE to {} with {} channels", source, channel_entries.len());
                 }
             }
+            "NSC_PROBE" => {
+                // Respond to NSC probe with our probe response (capabilities + peer ID)
+                log::info!("Received NSC_PROBE from {}", source);
+                let response = self.create_nsc_probe_response_ctcp();
+                if let Some(sender) = self.irc_sender.read().await.as_ref() {
+                    let _ = sender.send(Command::PRIVMSG(source.to_string(), response));
+                    log::info!("Sent NSC_PROBE_RESPONSE to {}", source);
+                }
+            }
+            "NSC_PROBE_RESPONSE" => {
+                // A peer responded to our probe - they are NSC-capable
+                log::info!("Received NSC_PROBE_RESPONSE from {}: {}", source, &args[..args.len().min(40)]);
+            }
             _ => {}
         }
     }
@@ -1886,6 +1899,19 @@ impl ChanServ {
                 log::info!("Joining NAIS IRC channel: {}", irc_chan);
                 if let Err(e) = sender.send_join(&irc_chan) {
                     log::warn!("Failed to join {}: {}", irc_chan, e);
+                } else {
+                    // Set the NAIS topic so clients can auto-discover this as a secure channel
+                    // Format: NAIS:v1:<channel_id>:<creator_fingerprint>
+                    let nais_topic = format!(
+                        "NAIS:v1:{}:{}",
+                        channel.channel_id.to_hex(),
+                        self.identity.peer_id.to_hex()
+                    );
+                    if let Err(e) = sender.send(Command::TOPIC(irc_chan.clone(), Some(nais_topic.clone()))) {
+                        log::warn!("Failed to set NAIS topic on {}: {}", irc_chan, e);
+                    } else {
+                        log::info!("Set NAIS topic on {}: {}", irc_chan, nais_topic);
+                    }
                 }
             }
         }
@@ -1895,10 +1921,45 @@ impl ChanServ {
     async fn handle_irc_join(&self, nick: &str, channel: &str) {
         // Check if this is a NAIS discovery channel
         let irc_channels = self.irc_channels.read().await;
-        if let Some(_channel_id) = irc_channels.get(channel) {
-            log::debug!("User {} joined NAIS channel {}", nick, channel);
-            // Could announce ChanServ presence here
+        if let Some(channel_id) = irc_channels.get(channel) {
+            log::info!("User {} joined NAIS channel {} ({}), sending NSC probe", nick, channel, channel_id);
+            drop(irc_channels);
+
+            // Send NSC_PROBE to the joining user to discover if they're an NSC-capable client
+            // This triggers the secure channel handshake on their end
+            let probe = self.create_nsc_probe_ctcp();
+            if let Some(sender) = self.irc_sender.read().await.as_ref() {
+                let _ = sender.send(Command::PRIVMSG(nick.to_string(), probe));
+                log::info!("Sent NSC_PROBE to {} in channel {}", nick, channel);
+            }
         }
+    }
+
+    /// Create an NSC_PROBE CTCP message
+    fn create_nsc_probe_ctcp(&self) -> String {
+        // ProbeMessage format matching the client's nsc_irc::ProbeMessage
+        let probe = serde_json::json!({
+            "version": 2,
+            "peer_id": self.identity.peer_id.to_hex(),
+            "nat_type": null,
+            "features": ["ice", "e2e", "mls", "chanserv"]
+        });
+        let json = serde_json::to_string(&probe).unwrap_or_default();
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &json);
+        format!("\x01NSC_PROBE {}\x01", encoded)
+    }
+
+    /// Create an NSC_PROBE_RESPONSE CTCP message
+    fn create_nsc_probe_response_ctcp(&self) -> String {
+        let probe = serde_json::json!({
+            "version": 2,
+            "peer_id": self.identity.peer_id.to_hex(),
+            "nat_type": null,
+            "features": ["ice", "e2e", "mls", "chanserv"]
+        });
+        let json = serde_json::to_string(&probe).unwrap_or_default();
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &json);
+        format!("\x01NSC_PROBE_RESPONSE {}\x01", encoded)
     }
 
     /// Handle IRC part
