@@ -1,0 +1,46 @@
+# NAIS ChanServ Configuration
+# Long-term host for NAIS Secure Channels
+
+# Bot identity
+nickname = "NAIS-Services"
+display_name = "NAIS Channel Services"
+
+# QUIC server binding
+bind_address = "0.0.0.0:4434"
+
+# Relay hub for NAT traversal fallback (optional)
+# relay_hub = "hub.pugbot.net:4433"
+
+# IRC connection for peer discovery
+[irc]
+server = "irc.libera.chat"
+port = 6697
+use_tls = true
+nick = "NAIS-ChanServ"
+channels = ["#nais-chanserv"]
+
+# Storage settings
+[storage]
+data_dir = "~/.nais-chanserv"
+message_ttl_days = 7
+max_messages_per_channel = 10000
+
+# Hosted channels
+# These channels will be automatically created and hosted if they don't exist
+
+[[channels]]
+name = "general"
+topic = "General NAIS discussion"
+auto_register = true
+
+[[channels]]
+name = "development"
+topic = "NAIS development and testing"
+auto_register = true
+
+# Example of a channel with a specific ID
+# [[channels]]
+# name = "private-team"
+# topic = "Private team channel"
+# auto_register = true
+# channel_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

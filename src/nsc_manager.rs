@@ -869,6 +869,130 @@ impl NscManager {
         Ok(info)
     }
     
+    /// Join an existing NAIS secure channel discovered via its IRC topic.
+    /// This is called when the client joins an IRC channel and discovers a NAIS topic
+    /// (e.g., from chanserv query results or /naisjoin). It registers the channel in
+    /// the manager so that subsequent probe responses can be associated with it.
+    ///
+    /// Returns the channel_id if newly registered, or None if already known.
+    pub async fn join_existing_channel(
+        &self,
+        channel_id_hex: &str,
+        irc_channel: &str,
+        network: &str,
+    ) -> Result<Option<String>, String> {
+        // Don't re-join channels the user explicitly left
+        if self.left_channels.read().await.contains(channel_id_hex) {
+            log::info!("[JOIN_EXISTING] Channel {} was previously left, skipping", &channel_id_hex[..8.min(channel_id_hex.len())]);
+            return Ok(None);
+        }
+
+        // Check if already registered
+        if self.channel_info.read().await.contains_key(channel_id_hex) {
+            log::info!("[JOIN_EXISTING] Channel {} already registered", &channel_id_hex[..8.min(channel_id_hex.len())]);
+            // Ensure IRC mapping exists (it may have been lost)
+            let mapping = self.irc_channel_mapping.read().await;
+            if mapping.get_nais_channel(irc_channel).is_none() {
+                drop(mapping);
+                self.irc_channel_mapping.write().await.register(
+                    channel_id_hex.to_string(),
+                    irc_channel.to_string(),
+                );
+                log::info!("[JOIN_EXISTING] Re-registered IRC mapping for existing channel {} -> {}", &channel_id_hex[..8.min(channel_id_hex.len())], irc_channel);
+            }
+            return Ok(None);
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Derive a display name from the IRC channel
+        let name = irc_channel.to_string();
+
+        let info = ChannelInfo {
+            channel_id: channel_id_hex.to_string(),
+            name,
+            topic: String::new(),
+            member_count: 1,
+            is_owner: false,
+            created_at: now,
+            irc_channel: irc_channel.to_string(),
+            network: network.to_string(),
+        };
+
+        // Register the IRC channel mapping so probe responses can find this channel
+        self.irc_channel_mapping.write().await.register(
+            channel_id_hex.to_string(),
+            irc_channel.to_string(),
+        );
+
+        // Initialize members list with ourselves
+        let our_peer_id = hex::encode(self.peer_id.0);
+        let our_display_name = format!("{}...", &our_peer_id[..8]);
+        let self_member = NscChannelMember {
+            peer_id: our_peer_id,
+            display_name: our_display_name,
+            is_self: true,
+            is_owner: false,
+            joined_at: now,
+        };
+        self.channel_members.write().await.insert(channel_id_hex.to_string(), vec![self_member]);
+
+        // Cache the channel info
+        self.channel_info.write().await.insert(channel_id_hex.to_string(), info);
+
+        // Initialize crypto state with temporary epoch secrets
+        // These will be replaced when we receive a Welcome message from an existing member
+        let channel_bytes = hex::decode(channel_id_hex)
+            .map_err(|_| "Invalid channel ID hex")?;
+        if channel_bytes.len() != 32 {
+            return Err("Invalid channel ID length".to_string());
+        }
+        let mut channel_arr = [0u8; 32];
+        channel_arr.copy_from_slice(&channel_bytes);
+        let channel_id_typed = ChannelId::from_bytes(channel_arr);
+
+        let mut secret_bytes = [0u8; 32];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut secret_bytes);
+        let epoch_secrets = crate::nsc_channel::EpochSecrets::initial(&secret_bytes);
+
+        log::info!(
+            "[JOIN_EXISTING] Created temporary epoch secrets for channel {}: epoch={}, key_fp={}",
+            &channel_id_hex[..8.min(channel_id_hex.len())],
+            epoch_secrets.epoch,
+            hex::encode(&epoch_secrets.encryption_key[..4])
+        );
+
+        self.channel_manager
+            .join_channel_with_secrets(&channel_id_typed, irc_channel.to_string(), epoch_secrets)
+            .await
+            .map_err(|e| format!("Failed to initialize channel crypto: {:?}", e))?;
+
+        // Save to storage
+        self.save_storage_async().await;
+
+        // Request peer discovery for this channel
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(NscEvent::RequestPeerDiscovery {
+                nsc_channel_id: channel_id_hex.to_string(),
+                irc_channel: irc_channel.to_string(),
+                network: network.to_string(),
+            }).await;
+        }
+
+        log::info!(
+            "[JOIN_EXISTING] Registered secure channel {} with IRC discovery channel: {} on network {}",
+            &channel_id_hex[..8.min(channel_id_hex.len())],
+            irc_channel,
+            network
+        );
+
+        Ok(Some(channel_id_hex.to_string()))
+    }
+
     /// Leave a channel
     pub async fn leave_channel(&self, channel_id: &str) -> Result<(), String> {
         log::info!("leave_channel called for: {} (len: {})", channel_id, channel_id.len());

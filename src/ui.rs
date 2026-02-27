@@ -124,6 +124,37 @@ struct InviteChannelOption {
     is_nais: bool,
 }
 
+/// A secure channel entry returned from a query response
+#[derive(Clone, Debug)]
+struct QueryChannelEntry {
+    /// Channel name
+    channel: String,
+    /// Server address
+    server: String,
+    /// Channel type: "nais" or "irc"
+    channel_type: String,
+}
+
+/// Result of querying a user for their secure channels
+#[derive(Clone, Debug)]
+enum QueryChannelsResult {
+    /// Target is not a NAIS client (timeout/no response)
+    NotNaisClient { target_nick: String },
+    /// Target user rejected the request
+    Rejected { target_nick: String },
+    /// Target responded with a list of channels
+    ChannelList { target_nick: String, channels: Vec<QueryChannelEntry> },
+}
+
+/// Information for an incoming channel query request (shown on client B)
+#[derive(Clone, Debug)]
+struct IncomingChannelQueryInfo {
+    /// User who is asking for our channel list
+    from_nick: String,
+    /// Profile where the request was received
+    profile: String,
+}
+
 pub fn run() {
     #[cfg(feature = "desktop")]
     {
@@ -358,6 +389,14 @@ fn app() -> Element {
     
     // Incoming IRC invite popup state (standard IRC INVITE command)
     let mut incoming_irc_invite: Signal<Option<IncomingIrcInviteInfo>> = use_signal(|| None);
+
+    // Query channels state
+    // Popup showing the result of querying a user for their secure channels (shown on client A)
+    let mut query_channels_result: Signal<Option<QueryChannelsResult>> = use_signal(|| None);
+    // Popup for incoming channel query request (shown on client B)
+    let mut incoming_channel_query: Signal<Option<IncomingChannelQueryInfo>> = use_signal(|| None);
+    // Track pending outgoing queries (nick_lowercase -> true) for timeout detection
+    let mut pending_channel_queries: Signal<HashMap<String, bool>> = use_signal(HashMap::new);
 
     // Voice chat state
     let mut voice_state: Signal<crate::voice_chat::VoiceState> = use_signal(|| crate::voice_chat::VoiceState::Idle);
@@ -706,6 +745,9 @@ fn app() -> Element {
         let mut pending_invite_probes_handle = pending_invite_probes;
         let mut cross_network_invite_handle = cross_network_invite;
         let mut incoming_irc_invite_handle = incoming_irc_invite;
+        let mut query_channels_result_handle = query_channels_result;
+        let mut incoming_channel_query_handle = incoming_channel_query;
+        let mut pending_channel_queries_handle = pending_channel_queries;
         spawn(async move {
             let mut channel_buffer: Vec<(String, u32, String)> = Vec::new();
             const BATCH_SIZE: usize = 200;
@@ -1109,6 +1151,69 @@ fn app() -> Element {
                                                     from, channel, server, channel_type);
                                             }
                                         }
+                                        crate::nais_channel::CTCP_NAIS_QUERY_CHANNELS => {
+                                            // Someone is querying us for our secure channels
+                                            log::info!("Received NAIS_QUERY_CHANNELS from {}", from);
+                                            
+                                            // Show popup asking if we want to share our channels
+                                            incoming_channel_query_handle.set(Some(IncomingChannelQueryInfo {
+                                                from_nick: from.clone(),
+                                                profile: profile_name.clone(),
+                                            }));
+                                        }
+                                        crate::nais_channel::CTCP_NAIS_QUERY_CHANNELS_RESPONSE => {
+                                            // We received a response to our channel query
+                                            let from_lower = from.to_lowercase();
+                                            
+                                            // Only process if we have a pending query for this user
+                                            let is_pending = pending_channel_queries_handle.read().contains_key(&from_lower);
+                                            
+                                            if is_pending {
+                                                // Remove from pending
+                                                pending_channel_queries_handle.write().remove(&from_lower);
+                                                
+                                                if let Some(response_type) = args.first() {
+                                                    match response_type.as_str() {
+                                                        "REJECT" => {
+                                                            log::info!("NAIS_QUERY_CHANNELS_RESPONSE REJECT from {}", from);
+                                                            query_channels_result_handle.set(Some(QueryChannelsResult::Rejected {
+                                                                target_nick: from.clone(),
+                                                            }));
+                                                        }
+                                                        "ACCEPT" => {
+                                                            // Parse channel list: channel|server|type,channel|server|type,...
+                                                            let channel_data = args.get(1).map(|s| s.as_str()).unwrap_or("");
+                                                            let channels: Vec<QueryChannelEntry> = channel_data.split(',')
+                                                                .filter(|s| !s.is_empty())
+                                                                .filter_map(|entry| {
+                                                                    let parts: Vec<&str> = entry.split('|').collect();
+                                                                    if parts.len() >= 3 {
+                                                                        Some(QueryChannelEntry {
+                                                                            channel: parts[0].to_string(),
+                                                                            server: parts[1].to_string(),
+                                                                            channel_type: parts[2].to_string(),
+                                                                        })
+                                                                    } else {
+                                                                        None
+                                                                    }
+                                                                })
+                                                                .collect();
+                                                            
+                                                            log::info!("NAIS_QUERY_CHANNELS_RESPONSE ACCEPT from {} with {} channels", from, channels.len());
+                                                            query_channels_result_handle.set(Some(QueryChannelsResult::ChannelList {
+                                                                target_nick: from.clone(),
+                                                                channels,
+                                                            }));
+                                                        }
+                                                        _ => {
+                                                            log::warn!("Unknown NAIS_QUERY_CHANNELS_RESPONSE type from {}: {:?}", from, args);
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                log::debug!("Received NAIS_QUERY_CHANNELS_RESPONSE from {} but no pending query", from);
+                                            }
+                                        }
                                         cmd if cmd.starts_with("NSC_") => {
                                             // Handle NSC (Nais Secure Channels) CTCP commands
                                             log::info!("[UI NSC] Handling {} from {}", cmd, from);
@@ -1161,6 +1266,33 @@ fn app() -> Element {
                                     // Check if this is a NAIS channel topic
                                     if crate::nais_channel::is_nais_topic(topic) {
                                         if let Some((_version, channel_id, _fingerprint)) = crate::nais_channel::parse_nais_topic(topic) {
+                                            // This is a NAIS channel - register it in the NSC manager
+                                            // (if not already known) so probe responses can be associated with it
+                                            let channel_id_for_register = channel_id.clone();
+                                            let irc_channel_for_register = channel.clone();
+                                            let pname_for_register = profile_name.clone();
+                                            
+                                            spawn({
+                                                let ch_id = channel_id_for_register.clone();
+                                                let irc_ch = irc_channel_for_register.clone();
+                                                let pname = pname_for_register.clone();
+                                                async move {
+                                                    let manager = crate::nsc_manager::get_nsc_manager_async().await;
+                                                    let mgr = manager.read().await;
+                                                    match mgr.join_existing_channel(&ch_id, &irc_ch, &pname).await {
+                                                        Ok(Some(id)) => {
+                                                            log::info!("[NAIS TOPIC] Registered new secure channel {} from topic in {}", &id[..8.min(id.len())], irc_ch);
+                                                        }
+                                                        Ok(None) => {
+                                                            log::debug!("[NAIS TOPIC] Channel {} already registered or previously left", &ch_id[..8.min(ch_id.len())]);
+                                                        }
+                                                        Err(e) => {
+                                                            log::error!("[NAIS TOPIC] Failed to register channel from topic: {}", e);
+                                                        }
+                                                    }
+                                                }
+                                            });
+
                                             // This is a NAIS channel - auto-probe users
                                             let state_read = state_handle.read();
                                             if let Some(server) = state_read.servers.get(&profile_name) {
@@ -1190,10 +1322,17 @@ fn app() -> Element {
                                                         .collect();
                                                     let cores_clone = cores.clone();
                                                     let pname = profile_name.clone();
+                                                    let irc_ch = channel.clone();
                                                     
                                                     spawn(async move {
                                                         let manager = crate::nsc_manager::get_nsc_manager_async().await;
                                                         let mgr = manager.read().await;
+                                                        
+                                                        // Record pending probes so responses are associated with this IRC channel
+                                                        for user in &users_to_probe {
+                                                            mgr.record_pending_probe(user, &irc_ch).await;
+                                                        }
+                                                        
                                                         let nsc_probe = mgr.create_probe_ctcp();
                                                         drop(mgr);
                                                         
@@ -1334,9 +1473,45 @@ fn app() -> Element {
                                 _ => {}
                             }
                             
+                            // For UserQuit, find which channels the user was in BEFORE removing them,
+                            // so we can emit system messages in those channels.
+                            let quit_channels: Vec<String> = if let IrcEvent::UserQuit { ref user } = event {
+                                let state_read = state_handle.read();
+                                state_read.servers.get(&profile_name)
+                                    .map(|s| {
+                                        s.users_by_channel.iter()
+                                            .filter(|(_, users)| {
+                                                users.iter().any(|u| {
+                                                    let bare = u.trim_start_matches(|c: char| c == '@' || c == '+' || c == '%' || c == '!' || c == '~');
+                                                    bare.eq_ignore_ascii_case(user)
+                                                })
+                                            })
+                                            .map(|(ch, _)| ch.clone())
+                                            .collect()
+                                    })
+                                    .unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            };
+                            
                             let mut state_mut = state_handle.write();
                             let profiles_read = profiles.read();
                             apply_event_with_config(&mut state_mut, &profiles_read, &profile_name, event.clone());
+                            
+                            // Emit quit system messages into each channel the user was in
+                            if let IrcEvent::UserQuit { ref user } = event {
+                                for ch in &quit_channels {
+                                    apply_event_with_config(
+                                        &mut state_mut,
+                                        &profiles_read,
+                                        &profile_name,
+                                        IrcEvent::System {
+                                            channel: ch.clone(),
+                                            text: format!("{} quit.", user),
+                                        },
+                                    );
+                                }
+                            }
                             
                             // Update profile_status signal based on the event
                             if matches!(event, IrcEvent::Connected { .. }) {
@@ -2624,7 +2799,7 @@ fn app() -> Element {
                             // Check if we need to re-sort (compare with cached)
                             let cached = cached_sorted_users.read();
                             let need_resort = cached.get(&cache_key)
-                                .map(|sorted| sorted.len() != raw_users.len())
+                                .map(|sorted| *sorted != raw_users)
                                 .unwrap_or(true);
                             drop(cached);
                             
@@ -2902,6 +3077,49 @@ fn app() -> Element {
                                                                             }
                                                                         },
                                                                         "🔒 Invite to Secure Channel"
+                                                                    }
+                                                                    // Query Secure Channels option
+                                                                    button {
+                                                                        class: "menu-item",
+                                                                        title: "Ask this user for their list of secure channels to join",
+                                                                        onclick: {
+                                                                            let nick = user_nick.clone();
+                                                                            let profile_for_query = user_profile.clone();
+                                                                            move |_| {
+                                                                                user_menu_open.set(None);
+                                                                                ctcp_submenu_open.set(false);
+                                                                                
+                                                                                log::info!("Query Secure Channels clicked for user: {}", nick);
+                                                                                
+                                                                                // Add to pending queries (lowercase for case-insensitive matching)
+                                                                                pending_channel_queries.write().insert(nick.to_lowercase(), true);
+                                                                                
+                                                                                // Send NAIS_QUERY_CHANNELS CTCP
+                                                                                if let Some(core) = cores.read().get(&profile_for_query) {
+                                                                                    let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                                                        target: nick.clone(),
+                                                                                        message: format!("\x01{}\x01", crate::nais_channel::CTCP_NAIS_QUERY_CHANNELS),
+                                                                                    });
+                                                                                }
+                                                                                
+                                                                                // Set timeout: if no response in 10 seconds, show "Not a NAIS client"
+                                                                                let nick_clone = nick.clone();
+                                                                                let nick_lower = nick.to_lowercase();
+                                                                                let mut pending_handle = pending_channel_queries.clone();
+                                                                                let mut result_handle = query_channels_result.clone();
+                                                                                spawn(async move {
+                                                                                    Delay::new(Duration::from_secs(10)).await;
+                                                                                    // If still pending after timeout, show as not a NAIS client
+                                                                                    if pending_handle.write().remove(&nick_lower).is_some() {
+                                                                                        log::info!("Channel query timeout for '{}', showing as not a NAIS client", nick_clone);
+                                                                                        result_handle.set(Some(QueryChannelsResult::NotNaisClient {
+                                                                                            target_nick: nick_clone,
+                                                                                        }));
+                                                                                    }
+                                                                                });
+                                                                            }
+                                                                        },
+                                                                        "🔍 Query Secure Channels"
                                                                     }
                                                                     // Advanced options (hidden unless advanced mode is enabled)
                                                                     if *settings_show_advanced.read() {
@@ -3985,6 +4203,315 @@ fn app() -> Element {
                                                     }
                                                 }
                                             }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Incoming channel query popup (shown when someone asks us for our secure channels)
+            if let Some(query_info) = incoming_channel_query() {
+                {
+                    // Clone upfront to avoid borrow-after-move issues
+                    let backdrop_info = query_info.clone();
+                    let close_info = query_info.clone();
+                    let reject_info = query_info.clone();
+                    let accept_info = query_info.clone();
+                    rsx! {
+                        div {
+                            class: "modal-backdrop",
+                            style: "position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 999; display: flex; align-items: center; justify-content: center;",
+                            onclick: move |_| {
+                                // Dismiss = reject
+                                incoming_channel_query.set(None);
+                                // Send rejection
+                                let reject_msg = format!("\x01{} REJECT\x01", crate::nais_channel::CTCP_NAIS_QUERY_CHANNELS_RESPONSE);
+                                if let Some(core) = cores.read().get(&backdrop_info.profile) {
+                                    let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                        target: backdrop_info.from_nick.clone(),
+                                        message: reject_msg,
+                                    });
+                                }
+                            },
+                    div {
+                        class: "ctcp-popup",
+                        style: "background: var(--input-bg); border: 2px solid var(--accent-color); border-radius: 12px; padding: 20px; min-width: 350px; max-width: 500px; box-shadow: 0 8px 32px rgba(0,0,0,0.5);",
+                        onclick: move |e: Event<MouseData>| {
+                            e.stop_propagation();
+                        },
+                        // Header
+                        div {
+                            style: "display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;",
+                            h3 {
+                                style: "margin: 0; color: var(--accent-color);",
+                                "🔍 Channel Query Request"
+                            }
+                            button {
+                                style: "background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 18px;",
+                                onclick: move |_| {
+                                    incoming_channel_query.set(None);
+                                    let reject_msg = format!("\x01{} REJECT\x01", crate::nais_channel::CTCP_NAIS_QUERY_CHANNELS_RESPONSE);
+                                    if let Some(core) = cores.read().get(&close_info.profile) {
+                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                            target: close_info.from_nick.clone(),
+                                            message: reject_msg,
+                                        });
+                                    }
+                                },
+                                "✕"
+                            }
+                        }
+                        // Message
+                        div {
+                            style: "margin-bottom: 16px; color: var(--text); line-height: 1.5;",
+                            span {
+                                style: "font-weight: bold; color: var(--accent-color);",
+                                "{query_info.from_nick}"
+                            }
+                            " is asking to see your list of secure channels. Do you want to share?"
+                        }
+                        // Buttons
+                        div {
+                            style: "display: flex; gap: 10px; justify-content: flex-end;",
+                            button {
+                                style: "padding: 8px 16px; background: #d32f2f; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 500;",
+                                onclick: move |_| {
+                                    incoming_channel_query.set(None);
+                                    // Send rejection
+                                    let reject_msg = format!("\x01{} REJECT\x01", crate::nais_channel::CTCP_NAIS_QUERY_CHANNELS_RESPONSE);
+                                    if let Some(core) = cores.read().get(&reject_info.profile) {
+                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                            target: reject_info.from_nick.clone(),
+                                            message: reject_msg,
+                                        });
+                                    }
+                                    log::info!("Rejected channel query from {}", reject_info.from_nick);
+                                },
+                                "Decline"
+                            }
+                            button {
+                                style: "padding: 8px 16px; background: #4CAF50; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 500;",
+                                onclick: move |_| {
+                                    incoming_channel_query.set(None);
+                                    
+                                    // Collect our secure channels (NSC channels + NAIS IRC channels)
+                                    let mut channel_entries: Vec<String> = Vec::new();
+                                    
+                                    // Add NSC secure channels
+                                    for ch in nsc_channels.read().iter() {
+                                        let network = if ch.network.is_empty() { "unknown" } else { &ch.network };
+                                        channel_entries.push(format!("{}|{}|nais", ch.name, network));
+                                    }
+                                    
+                                    // Add NAIS IRC channels (channels with NAIS topics)
+                                    let state_read = state.read();
+                                    for (_profile_name, server_state) in state_read.servers.iter() {
+                                        for channel in server_state.channels.iter() {
+                                            if channel.starts_with('#') {
+                                                let is_nais = server_state.topics_by_channel.get(channel)
+                                                    .map(|t| crate::nais_channel::is_nais_topic(t))
+                                                    .unwrap_or(false);
+                                                if is_nais {
+                                                    channel_entries.push(format!("{}|{}|nais", channel, server_state.server));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    drop(state_read);
+                                    
+                                    let channel_list = channel_entries.join(",");
+                                    let response_msg = format!("\x01{} ACCEPT {}\x01", 
+                                        crate::nais_channel::CTCP_NAIS_QUERY_CHANNELS_RESPONSE,
+                                        channel_list);
+                                    
+                                    if let Some(core) = cores.read().get(&accept_info.profile) {
+                                        let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                            target: accept_info.from_nick.clone(),
+                                            message: response_msg,
+                                        });
+                                    }
+                                    log::info!("Accepted channel query from {}, sent {} channels", accept_info.from_nick, channel_entries.len());
+                                },
+                                "Share Channels"
+                            }
+                        }
+                    }
+                }
+                    }
+                }
+            }
+
+            // Query channels result popup (shown when we receive a response to our query)
+            if let Some(result) = query_channels_result() {
+                div {
+                    class: "modal-backdrop",
+                    style: "position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 999; display: flex; align-items: center; justify-content: center;",
+                    onclick: move |_| {
+                        query_channels_result.set(None);
+                    },
+                    div {
+                        class: "ctcp-popup",
+                        style: "background: var(--input-bg); border: 2px solid var(--accent-color); border-radius: 12px; padding: 20px; min-width: 350px; max-width: 500px; max-height: 70vh; display: flex; flex-direction: column; box-shadow: 0 8px 32px rgba(0,0,0,0.5);",
+                        onclick: move |e: Event<MouseData>| {
+                            e.stop_propagation();
+                        },
+                        match &result {
+                            QueryChannelsResult::NotNaisClient { target_nick } => {
+                                rsx! {
+                                    div {
+                                        style: "display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;",
+                                        h3 {
+                                            style: "margin: 0; color: #FF9800;",
+                                            "⚠ Not a NAIS Client"
+                                        }
+                                        button {
+                                            style: "background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 18px;",
+                                            onclick: move |_| { query_channels_result.set(None); },
+                                            "✕"
+                                        }
+                                    }
+                                    div {
+                                        style: "color: var(--text); line-height: 1.5;",
+                                        span { style: "font-weight: bold;", "{target_nick}" }
+                                        " does not appear to be running a NAIS client, or did not respond in time."
+                                    }
+                                    div {
+                                        style: "display: flex; justify-content: flex-end; margin-top: 16px;",
+                                        button {
+                                            style: "padding: 8px 16px; background: var(--accent-color); color: white; border: none; border-radius: 6px; cursor: pointer;",
+                                            onclick: move |_| { query_channels_result.set(None); },
+                                            "OK"
+                                        }
+                                    }
+                                }
+                            }
+                            QueryChannelsResult::Rejected { target_nick } => {
+                                rsx! {
+                                    div {
+                                        style: "display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;",
+                                        h3 {
+                                            style: "margin: 0; color: #d32f2f;",
+                                            "✗ Request Rejected"
+                                        }
+                                        button {
+                                            style: "background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 18px;",
+                                            onclick: move |_| { query_channels_result.set(None); },
+                                            "✕"
+                                        }
+                                    }
+                                    div {
+                                        style: "color: var(--text); line-height: 1.5;",
+                                        span { style: "font-weight: bold;", "{target_nick}" }
+                                        " declined to share their secure channels."
+                                    }
+                                    div {
+                                        style: "display: flex; justify-content: flex-end; margin-top: 16px;",
+                                        button {
+                                            style: "padding: 8px 16px; background: var(--accent-color); color: white; border: none; border-radius: 6px; cursor: pointer;",
+                                            onclick: move |_| { query_channels_result.set(None); },
+                                            "OK"
+                                        }
+                                    }
+                                }
+                            }
+                            QueryChannelsResult::ChannelList { target_nick, channels } => {
+                                let nick_display = target_nick.clone();
+                                let channel_count = channels.len();
+                                rsx! {
+                                    div {
+                                        style: "display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;",
+                                        h3 {
+                                            style: "margin: 0; color: #4CAF50;",
+                                            "🔒 Secure Channels from {nick_display}"
+                                        }
+                                        button {
+                                            style: "background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 18px;",
+                                            onclick: move |_| { query_channels_result.set(None); },
+                                            "✕"
+                                        }
+                                    }
+                                    div {
+                                        style: "margin-bottom: 12px; padding: 8px 12px; background: var(--bg); border-radius: 6px; font-size: 13px; color: var(--text-muted);",
+                                        "{channel_count} secure channel(s) available. Click to join:"
+                                    }
+                                    div {
+                                        style: "flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px;",
+                                        if channels.is_empty() {
+                                            div {
+                                                style: "color: var(--text-muted); text-align: center; padding: 20px;",
+                                                "No secure channels to show"
+                                            }
+                                        }
+                                        for ch in channels.iter() {
+                                            {
+                                                let channel_name = ch.channel.clone();
+                                                let server_addr = ch.server.clone();
+                                                let ch_type = ch.channel_type.clone();
+                                                rsx! {
+                                                    button {
+                                                        style: "display: flex; align-items: center; gap: 8px; padding: 10px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; text-align: left; width: 100%; transition: background 0.15s; color: var(--text);",
+                                                        onclick: {
+                                                            let ch_name = channel_name.clone();
+                                                            let srv = server_addr.clone();
+                                                            let ctype = ch_type.clone();
+                                                            move |_| {
+                                                                query_channels_result.set(None);
+                                                                log::info!("User wants to join channel '{}' on '{}' (type: {})", ch_name, srv, ctype);
+                                                                
+                                                                // Try to find a profile connected to this server, or join on current profile
+                                                                let state_read = state.read();
+                                                                let target_profile = state_read.servers.iter()
+                                                                    .find(|(_, ss)| ss.server == srv || ss.server.contains(&srv))
+                                                                    .map(|(p, _)| p.clone())
+                                                                    .unwrap_or_else(|| state_read.active_profile.clone());
+                                                                drop(state_read);
+                                                                
+                                                                // Send JOIN command
+                                                                if let Some(core) = cores.read().get(&target_profile) {
+                                                                    let _ = core.cmd_tx.try_send(IrcCommandEvent::Join {
+                                                                        channel: ch_name.clone(),
+                                                                    });
+                                                                    log::info!("Sent JOIN for {} on profile {}", ch_name, target_profile);
+                                                                } else {
+                                                                    log::warn!("No core found for profile '{}' to join channel '{}'", target_profile, ch_name);
+                                                                }
+                                                            }
+                                                        },
+                                                        span {
+                                                            style: "font-size: 14px;",
+                                                            if ch_type == "nais" { "🔒" } else { "#" }
+                                                        }
+                                                        div {
+                                                            style: "flex: 1; display: flex; flex-direction: column;",
+                                                            span {
+                                                                style: "font-weight: 500;",
+                                                                "{channel_name}"
+                                                            }
+                                                            span {
+                                                                style: "font-size: 11px; color: var(--text-muted);",
+                                                                "{server_addr}"
+                                                            }
+                                                        }
+                                                        if ch_type == "nais" {
+                                                            span {
+                                                                style: "font-size: 11px; color: #4CAF50; background: rgba(76,175,80,0.1); padding: 2px 6px; border-radius: 4px;",
+                                                                "NAIS"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    div {
+                                        style: "display: flex; justify-content: flex-end; margin-top: 16px;",
+                                        button {
+                                            style: "padding: 8px 16px; background: var(--accent-color); color: white; border: none; border-radius: 6px; cursor: pointer;",
+                                            onclick: move |_| { query_channels_result.set(None); },
+                                            "Close"
                                         }
                                     }
                                 }
@@ -9433,7 +9960,7 @@ fn unique_profile_label(
 // (label, server, channel, use_tls)
 const IMPORT_NETWORKS: &[(&str, &str, &str, bool)] = &[
     ("Support", "irc.quakenet.org", "#nais", false),
-    ("Libera.Chat", "irc.libera.chat", "", true),
+    ("Libera.Chat", "irc.libera.chat", "#convey,#convey-dev", true),
     ("freenode", "irc.freenode.net", "", true),
     ("OFTC", "irc.oftc.net", "", true),
     ("Undernet", "irc.undernet.org", "", true),

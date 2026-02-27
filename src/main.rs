@@ -19,6 +19,11 @@ mod ui;
 mod voice_chat;
 
 fn main() {
+    // Install ring crypto provider for rustls (required before any TLS connections)
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     // Initialize logging - use RUST_LOG env var to control level
     // e.g., RUST_LOG=debug or RUST_LOG=nais_client=debug
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))

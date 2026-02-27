@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "relay-hub"]
+members = [".", "relay-hub", "chanserv"]
 resolver = "2"
 
 [package]
@@ -15,7 +15,7 @@ mobile = ["dioxus/mobile"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "net"] }
-irc = { version = "1.1", default-features = false, features = ["ctcp", "tls-native", "toml_config"] }
+irc = { version = "1.1", default-features = false, features = ["ctcp", "tls-rust", "toml_config"] }
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"
@@ -27,7 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
 chrono = "0.4"
-reqwest = { version = "0.12", features = ["multipart", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["multipart", "json", "rustls-tls"] }
 scraper = "0.25"
 lazy_static = "1.5"
 url = "2"
@@ -72,5 +72,5 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rcgen = "0.13"
 bytes = "1"
 
-# Socket options for NAT traversal (SO_REUSEADDR)
-socket2 = "0.5"
+# Socket options for NAT traversal (SO_REUSEADDR, SO_REUSEPORT)
+socket2 = { version = "0.5", features = ["all"] }

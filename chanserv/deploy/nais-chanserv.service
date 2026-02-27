@@ -1,0 +1,43 @@
+[Unit]
+Description=NAIS Channel Services Bot
+Documentation=https://github.com/your-org/nais-client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nais-chanserv
+Group=nais-chanserv
+ExecStart=/usr/local/bin/nais-chanserv --config /etc/nais-chanserv/config.toml
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+
+# Allow write to data directory
+ReadWritePaths=/var/lib/nais-chanserv
+
+# Working directory
+WorkingDirectory=/var/lib/nais-chanserv
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nais-chanserv
+
+# Environment
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

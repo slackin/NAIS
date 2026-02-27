@@ -65,6 +65,15 @@ pub const CTCP_NAIS_MSG: &str = "NAIS_MSG";
 /// Format: NAIS_CHANNEL_INVITE <channel> <server> <type:nais|irc>
 pub const CTCP_NAIS_CHANNEL_INVITE: &str = "NAIS_CHANNEL_INVITE";
 
+/// CTCP command to query a user for their list of secure channels
+/// Sent by client A to client B (or chanserv) to request channel list
+pub const CTCP_NAIS_QUERY_CHANNELS: &str = "NAIS_QUERY_CHANNELS";
+
+/// CTCP response to a channel query with the result
+/// Format: NAIS_QUERY_CHANNELS_RESPONSE ACCEPT <channel1>|<server1>|<type1>,<channel2>|<server2>|<type2>,...
+/// or: NAIS_QUERY_CHANNELS_RESPONSE REJECT
+pub const CTCP_NAIS_QUERY_CHANNELS_RESPONSE: &str = "NAIS_QUERY_CHANNELS_RESPONSE";
+
 /// Default port range for P2P listeners
 pub const DEFAULT_PORT_RANGE_START: u16 = 45000;
 pub const DEFAULT_PORT_RANGE_END: u16 = 45100;
@@ -412,7 +421,7 @@ pub fn is_nais_ctcp(command: &str) -> bool {
     matches!(command, 
         CTCP_NAIS_PROBE | CTCP_NAIS_INFO | CTCP_NAIS_JOIN | 
         CTCP_NAIS_ACCEPT | CTCP_NAIS_CONNECT | CTCP_NAIS_LEAVE | CTCP_NAIS_MSG |
-        CTCP_NAIS_CHANNEL_INVITE
+        CTCP_NAIS_CHANNEL_INVITE | CTCP_NAIS_QUERY_CHANNELS | CTCP_NAIS_QUERY_CHANNELS_RESPONSE
     )
 }
 
