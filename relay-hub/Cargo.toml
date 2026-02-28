@@ -1,6 +1,6 @@
 [package]
 name = "nais-relay-hub"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "NSC Relay Hub - Federation hub for Nais Secure Channels"
