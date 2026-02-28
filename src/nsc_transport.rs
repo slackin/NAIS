@@ -1870,6 +1870,9 @@ impl RelayClient {
         
         let mut transport = TransportConfig::default();
         transport.keep_alive_interval(Some(KEEPALIVE_INTERVAL));
+        transport.max_idle_timeout(Some(
+            Duration::from_secs(120).try_into().unwrap(),
+        ));
         config.transport_config(Arc::new(transport));
         
         Ok(config)

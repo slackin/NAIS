@@ -737,10 +737,17 @@ fn create_server_config() -> Result<ServerConfig, String> {
         b"nsc-relay".to_vec(),
     ];
     
-    let server_config = ServerConfig::with_crypto(Arc::new(
+    let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
             .map_err(|e| format!("QUIC config error: {}", e))?
     ));
+    
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(30)));
+    transport_config.max_idle_timeout(Some(
+        std::time::Duration::from_secs(120).try_into().unwrap(),
+    ));
+    server_config.transport_config(std::sync::Arc::new(transport_config));
     
     Ok(server_config)
 }
