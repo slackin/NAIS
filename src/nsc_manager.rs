@@ -2127,6 +2127,42 @@ impl NscManager {
             log::error!("[NSC_SEND] Transport is NOT initialized! Cannot send messages.");
         }
         
+        // Relay fallback: send to channel members not reached via direct QUIC
+        {
+            let sent_hex: std::collections::HashSet<String> = target_peers
+                .iter()
+                .map(|p| hex::encode(p.0))
+                .collect();
+            
+            let unreached: Vec<String> = target_peer_hex
+                .iter()
+                .filter(|m| !sent_hex.contains(*m))
+                .cloned()
+                .collect();
+            
+            if !unreached.is_empty() && self.relay_client.is_connected().await {
+                log::info!("[NSC_SEND] Attempting relay delivery for {} unreached peer(s)", unreached.len());
+                for member_hex in &unreached {
+                    if let Ok(peer_bytes) = hex::decode(member_hex) {
+                        if peer_bytes.len() == 32 {
+                            let mut arr = [0u8; 32];
+                            arr.copy_from_slice(&peer_bytes);
+                            let peer_id = PeerId(arr);
+                            match self.relay_client.send_to_peer(&peer_id, &envelope).await {
+                                Ok(()) => {
+                                    log::info!("[NSC_SEND] Sent to {} via relay", &member_hex[..16.min(member_hex.len())]);
+                                    target_peers.push(peer_id);
+                                }
+                                Err(e) => {
+                                    log::warn!("[NSC_SEND] Relay send to {} failed: {}", &member_hex[..16.min(member_hex.len())], e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
         // Add to retry queue if we have target peers
         if !target_peers.is_empty() {
             let pending_key = format!("{}:{}", channel_id, seq);
