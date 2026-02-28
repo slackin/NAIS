@@ -2070,12 +2070,24 @@ fn app() -> Element {
 
             // Body: 3-column grid
             {
-                let grid_cols = if channels_collapsed() { "60px" } else { "200px" };
+                let grid_cols = if channels_collapsed() { "0px" } else { "200px" };
                 let userlist_cols = if userlist_collapsed() { "40px" } else { "200px" };
                 rsx! {
                     div {
                         class: "body",
-                        style: "display:grid; grid-template-columns:{grid_cols} 1fr {userlist_cols}; gap:12px; flex:1; overflow:hidden;",
+                        style: "display:grid; grid-template-columns:{grid_cols} 1fr {userlist_cols}; gap:0px 12px; flex:1; overflow:hidden; position:relative;",
+
+                        // Floating expand button when channels are collapsed
+                        if channels_collapsed() {
+                            button {
+                                class: "channels-expand-fab",
+                                onclick: move |_| {
+                                    channels_collapsed.set(false);
+                                },
+                                title: "Show channels",
+                                "☰"
+                            }
+                        }
 
                         // Channels sidebar
                         div {
@@ -2086,12 +2098,14 @@ fn app() -> Element {
                         if !channels_collapsed() {
                             "Channels"
                         }
-                        button {
-                            class: "collapse-btn",
-                            onclick: move |_| {
-                                channels_collapsed.set(!channels_collapsed());
-                            },
-                            if channels_collapsed() { "»" } else { "«" }
+                        if !channels_collapsed() {
+                            button {
+                                class: "collapse-btn",
+                                onclick: move |_| {
+                                    channels_collapsed.set(true);
+                                },
+                                "«"
+                            }
                         }
                     }
                     ul {
@@ -10712,39 +10726,35 @@ body {
 }
 
 .channels.collapsed {
-    padding: 8px 4px;
-    align-items: center;
-}
-
-.channels.collapsed .section-title {
-    flex-direction: column;
-    align-items: center;
-    margin-bottom: 12px;
-}
-
-.channels.collapsed ul {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 8px;
-}
-
-.channels.collapsed li {
-    margin-bottom: 0;
-}
-
-.channels.collapsed .row {
+    display: none;
+    width: 0;
     padding: 0;
-    background: transparent;
-    border: none;
-    width: auto;
-    display: flex;
-    justify-content: center;
-    align-items: center;
+    overflow: hidden;
 }
 
-.channels.collapsed .row:hover {
-    background: transparent;
+.channels-expand-fab {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    z-index: 100;
+    background: rgba(99, 102, 241, 0.15);
+    border: 1px solid var(--border);
+    color: var(--text);
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+    backdrop-filter: blur(8px);
+}
+
+.channels-expand-fab:hover {
+    background: rgba(99, 102, 241, 0.3);
+    transform: scale(1.1);
 }
 
 .channel-icon {
