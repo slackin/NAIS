@@ -1823,6 +1823,7 @@ fn app() -> Element {
                                 {
                                     let prof_name = prof.name.clone();
                                     let prof_name_for_menu = prof.name.clone();
+                                    let prof_name_for_context = prof.name.clone();
                                     let prof_name_for_connect = prof.name.clone();
                                     let prof_name_for_edit = prof.name.clone();
                                     let prof_name_for_log_toggle = prof.name.clone();
@@ -1845,6 +1846,15 @@ fn app() -> Element {
                                             style: "position:relative;",
                                             button {
                                                 class: if is_active { "pill active" } else { "pill" },
+                                                oncontextmenu: move |evt| {
+                                                    evt.prevent_default();
+                                                    evt.stop_propagation();
+                                                    if menu_open {
+                                                        profile_menu_open.set(None);
+                                                    } else {
+                                                        profile_menu_open.set(Some(prof_name_for_context.clone()));
+                                                    }
+                                                },
                                                 onclick: move |_| {
                                                     state.write().active_profile = prof_name.clone();
                                                     profile_menu_open.set(None);
@@ -2941,6 +2951,20 @@ fn app() -> Element {
                                                     div {
                                                         class: "row user-row",
                                                         style: "display: flex; align-items: center; justify-content: space-between; position: relative;",
+                                                        oncontextmenu: {
+                                                            let key = menu_key.clone();
+                                                            move |evt: Event<MouseData>| {
+                                                                evt.prevent_default();
+                                                                evt.stop_propagation();
+                                                                if user_menu_open.read().as_ref() == Some(&key) {
+                                                                    user_menu_open.set(None);
+                                                                    ctcp_submenu_open.set(false);
+                                                                } else {
+                                                                    user_menu_open.set(Some(key.clone()));
+                                                                    ctcp_submenu_open.set(false);
+                                                                }
+                                                            }
+                                                        },
                                                         div {
                                                             style: "display: flex; align-items: center;",
                                                             if !symbol.is_empty() {

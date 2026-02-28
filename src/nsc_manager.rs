@@ -3134,6 +3134,48 @@ impl NscManager {
                                 Err(e) => log::error!("[NSC_RELAY_LISTENER] Failed to parse Commit: {}", e),
                             }
                         }
+                        MessageType::MemberJoin => {
+                            // Peer is requesting to join / requesting key resync via relay.
+                            // If we have epoch secrets for this channel, respond with Welcome.
+                            log::info!("[NSC_RELAY_LISTENER] Received MemberJoin from {} for channel {}",
+                                &sender_hex[..16.min(sender_hex.len())],
+                                &channel_hex[..8.min(channel_hex.len())]);
+                            {
+                                let manager = get_nsc_manager_async().await;
+                                let mgr = manager.read().await;
+                                mgr.add_channel_member(&channel_hex, &sender_hex, false).await;
+
+                                let has_secrets = {
+                                    let ch_bytes = hex::decode(&channel_hex).ok();
+                                    if let Some(bytes) = ch_bytes {
+                                        if bytes.len() == 32 {
+                                            let mut arr = [0u8; 32];
+                                            arr.copy_from_slice(&bytes);
+                                            let cid = crate::nsc_channel::ChannelId::from_bytes(arr);
+                                            mgr.channel_manager.get_epoch_secrets(&cid).await.is_some()
+                                        } else { false }
+                                    } else { false }
+                                };
+                                if has_secrets {
+                                    match mgr.send_welcome_epoch_secrets(&sender_hex, &channel_hex).await {
+                                        Ok(_) => log::info!(
+                                            "[NSC_RELAY_LISTENER] Sent Welcome epoch secrets to {} for channel {} in response to MemberJoin",
+                                            &sender_hex[..16.min(sender_hex.len())],
+                                            &channel_hex[..8.min(channel_hex.len())]
+                                        ),
+                                        Err(e) => log::warn!(
+                                            "[NSC_RELAY_LISTENER] Failed to send Welcome to {} for channel {}: {}",
+                                            &sender_hex[..16.min(sender_hex.len())],
+                                            &channel_hex[..8.min(channel_hex.len())],
+                                            e
+                                        ),
+                                    }
+                                }
+                            }
+                        }
+                        MessageType::Heartbeat => {
+                            log::debug!("[NSC_RELAY_LISTENER] Received heartbeat from {}", &sender_hex[..16.min(sender_hex.len())]);
+                        }
                         _ => {
                             log::debug!("[NSC_RELAY_LISTENER] Ignoring relay message type {:?}", envelope.message_type);
                         }
@@ -3435,6 +3477,45 @@ impl NscManager {
                                                             break;
                                                         }
                                                         log::debug!("[NSC_LISTENER] Message delivered successfully");
+                                                    }
+                                                    MessageType::MemberJoin => {
+                                                        // Peer is requesting to join / requesting key resync.
+                                                        // If we have epoch secrets for this channel, respond with Welcome.
+                                                        log::info!("[NSC_LISTENER] Received MemberJoin from {} for channel {}",
+                                                            &sender_hex[..16.min(sender_hex.len())],
+                                                            &channel_hex[..8.min(channel_hex.len())]);
+                                                        {
+                                                            let manager = get_nsc_manager_async().await;
+                                                            let mgr = manager.read().await;
+                                                            mgr.add_channel_member(&channel_hex, &sender_hex, false).await;
+
+                                                            let has_secrets = {
+                                                                let ch_bytes = hex::decode(&channel_hex).ok();
+                                                                if let Some(bytes) = ch_bytes {
+                                                                    if bytes.len() == 32 {
+                                                                        let mut arr = [0u8; 32];
+                                                                        arr.copy_from_slice(&bytes);
+                                                                        let cid = crate::nsc_channel::ChannelId::from_bytes(arr);
+                                                                        mgr.channel_manager.get_epoch_secrets(&cid).await.is_some()
+                                                                    } else { false }
+                                                                } else { false }
+                                                            };
+                                                            if has_secrets {
+                                                                match mgr.send_welcome_epoch_secrets(&sender_hex, &channel_hex).await {
+                                                                    Ok(_) => log::info!(
+                                                                        "[NSC_LISTENER] Sent Welcome epoch secrets to {} for channel {} in response to MemberJoin",
+                                                                        &sender_hex[..16.min(sender_hex.len())],
+                                                                        &channel_hex[..8.min(channel_hex.len())]
+                                                                    ),
+                                                                    Err(e) => log::warn!(
+                                                                        "[NSC_LISTENER] Failed to send Welcome to {} for channel {}: {}",
+                                                                        &sender_hex[..16.min(sender_hex.len())],
+                                                                        &channel_hex[..8.min(channel_hex.len())],
+                                                                        e
+                                                                    ),
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                     _ => {
                                                         log::debug!("[NSC_LISTENER] Ignoring envelope type {:?}", envelope.message_type);
