@@ -83,8 +83,11 @@ pub const PAYLOAD_LENGTH_OFFSET: usize = 84;
 /// Connection timeout
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Keepalive interval
+/// Keepalive interval for P2P connections
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Keepalive interval for relay connections (shorter to survive servers with low idle timeouts)
+pub const RELAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// ALPN protocol identifier
 pub const ALPN_PROTOCOL: &[u8] = b"nais-secure-channel/2";
@@ -1869,7 +1872,7 @@ impl RelayClient {
         ));
         
         let mut transport = TransportConfig::default();
-        transport.keep_alive_interval(Some(KEEPALIVE_INTERVAL));
+        transport.keep_alive_interval(Some(RELAY_KEEPALIVE_INTERVAL));
         transport.max_idle_timeout(Some(
             Duration::from_secs(120).try_into().unwrap(),
         ));
