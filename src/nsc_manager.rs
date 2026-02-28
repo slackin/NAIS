@@ -3018,6 +3018,167 @@ impl NscManager {
         // Start heartbeat loop to keep QUIC connections alive (every 25 seconds)
         self.start_heartbeat_loop(25);
         
+        // --- Set up relay message handler ---
+        // Create a channel for inbound relay messages and wire it to the relay client.
+        // This ensures messages forwarded through the relay hub are actually delivered
+        // to our processing pipeline instead of being silently dropped.
+        let (relay_tx, mut relay_rx) = mpsc::channel::<(crate::nsc_transport::PeerId, crate::nsc_transport::NscEnvelope)>(100);
+        self.relay_client.set_message_handler(relay_tx).await;
+        
+        // Spawn task to process inbound relay messages (same logic as QUIC listener)
+        {
+            let tx_relay = tx.clone();
+            let our_peer_id_relay = our_peer_id.clone();
+            tokio::spawn(async move {
+                log::info!("[NSC_RELAY_LISTENER] Started, waiting for relay messages...");
+                while let Some((_sender_peer, envelope)) = relay_rx.recv().await {
+                    let sender_hex = hex::encode(&envelope.sender_id);
+                    let channel_hex = hex::encode(&envelope.channel_id);
+                    log::info!("[NSC_RELAY_LISTENER] Received envelope via relay: type={:?}, sender={}, channel={}",
+                        envelope.message_type, &sender_hex[..16.min(sender_hex.len())], &channel_hex[..8.min(channel_hex.len())]);
+                    
+                    match envelope.message_type {
+                        MessageType::ChannelMessage | MessageType::ChannelAction => {
+                            let channel_id = ChannelId::from_bytes(envelope.channel_id);
+                            let text = {
+                                let manager = get_nsc_manager_async().await;
+                                let mgr = manager.read().await;
+                                match mgr.channel_manager.decrypt_for_channel(&channel_id, &envelope.payload).await {
+                                    Ok(plaintext) => String::from_utf8_lossy(&plaintext).to_string(),
+                                    Err(e) => {
+                                        log::warn!("[NSC_RELAY_LISTENER] Decryption failed for channel {}: {}", channel_hex, e);
+                                        let manager2 = get_nsc_manager_async().await;
+                                        let mgr2 = manager2.read().await;
+                                        mgr2.resync_on_decrypt_failure(&channel_hex, &sender_hex).await;
+                                        continue;
+                                    }
+                                }
+                            };
+                            let timestamp = envelope.timestamp / 1000;
+                            let sender_short = if sender_hex.len() >= 16 {
+                                sender_hex[..16].to_string()
+                            } else {
+                                sender_hex.clone()
+                            };
+                            let is_own = sender_hex == our_peer_id_relay;
+                            let msg = NscMessage {
+                                timestamp,
+                                sender: sender_short.clone(),
+                                text: text.clone(),
+                                is_own,
+                            };
+                            let stored = StoredMessage { timestamp, sender: sender_short, text, is_own };
+                            if let Err(e) = save_message(&channel_hex, &stored) {
+                                log::warn!("[NSC_RELAY_LISTENER] Failed to persist message: {}", e);
+                            }
+                            log::info!("[NSC_RELAY_LISTENER] Delivering message to UI: channel={}, len={}",
+                                &channel_hex[..8.min(channel_hex.len())], msg.text.len());
+                            if tx_relay.send((channel_hex, msg)).await.is_err() {
+                                log::warn!("[NSC_RELAY_LISTENER] Message receiver dropped");
+                                break;
+                            }
+                        }
+                        MessageType::Welcome => {
+                            use crate::nsc_channel::EpochSecrets;
+                            log::info!("[NSC_RELAY_LISTENER] Processing Welcome for channel {} from {}",
+                                &channel_hex[..8.min(channel_hex.len())], &sender_hex[..16.min(sender_hex.len())]);
+                            let is_local_owner = {
+                                let manager = get_nsc_manager_async().await;
+                                let mgr = manager.read().await;
+                                let info = mgr.channel_info.read().await;
+                                info.get(&channel_hex).map(|c| c.is_owner).unwrap_or(false)
+                            };
+                            if is_local_owner {
+                                log::warn!("[NSC_RELAY_LISTENER] Ignoring Welcome for owned channel {}", &channel_hex[..8.min(channel_hex.len())]);
+                                continue;
+                            }
+                            match serde_json::from_slice::<EpochSecrets>(&envelope.payload) {
+                                Ok(secrets) => {
+                                    let channel_id = ChannelId::from_bytes(envelope.channel_id);
+                                    let manager = get_nsc_manager_async().await;
+                                    let mgr = manager.read().await;
+                                    let name = {
+                                        let info = mgr.channel_info.read().await;
+                                        info.get(&channel_hex).map(|i| i.name.clone()).unwrap_or_else(|| "Unknown".to_string())
+                                    };
+                                    match mgr.channel_manager.join_channel_with_secrets(&channel_id, name, secrets).await {
+                                        Ok(_) => {
+                                            log::info!("[NSC_RELAY_LISTENER] Stored Welcome secrets for channel {}", &channel_hex[..8.min(channel_hex.len())]);
+                                            mgr.add_channel_member(&channel_hex, &sender_hex, true).await;
+                                            let our_full = hex::encode(mgr.peer_id.0);
+                                            mgr.add_channel_member(&channel_hex, &our_full, false).await;
+                                            mgr.save_storage_async().await;
+                                        }
+                                        Err(e) => log::error!("[NSC_RELAY_LISTENER] Failed to store Welcome secrets: {:?}", e),
+                                    }
+                                }
+                                Err(e) => log::error!("[NSC_RELAY_LISTENER] Failed to parse Welcome: {}", e),
+                            }
+                        }
+                        MessageType::Commit => {
+                            use crate::nsc_channel::EpochSecrets;
+                            log::info!("[NSC_RELAY_LISTENER] Processing Commit for channel {}", &channel_hex[..8.min(channel_hex.len())]);
+                            match serde_json::from_slice::<EpochSecrets>(&envelope.payload) {
+                                Ok(new_secrets) => {
+                                    let channel_id = ChannelId::from_bytes(envelope.channel_id);
+                                    let manager = get_nsc_manager_async().await;
+                                    let mgr = manager.read().await;
+                                    match mgr.channel_manager.process_commit(&channel_id, new_secrets).await {
+                                        Ok(_) => {
+                                            log::info!("[NSC_RELAY_LISTENER] Applied Commit for channel {}", &channel_hex[..8.min(channel_hex.len())]);
+                                            mgr.save_storage_async().await;
+                                        }
+                                        Err(e) => log::warn!("[NSC_RELAY_LISTENER] Failed to apply Commit: {:?}", e),
+                                    }
+                                }
+                                Err(e) => log::error!("[NSC_RELAY_LISTENER] Failed to parse Commit: {}", e),
+                            }
+                        }
+                        _ => {
+                            log::debug!("[NSC_RELAY_LISTENER] Ignoring relay message type {:?}", envelope.message_type);
+                        }
+                    }
+                }
+                log::info!("[NSC_RELAY_LISTENER] Handler exiting");
+            });
+        }
+        
+        // Proactively connect to relay hub so we can receive relayed messages
+        // from peers that failed ICE (they may already be sending via relay)
+        {
+            let relay_client = self.relay_client.clone();
+            let channel_info = self.channel_info.clone();
+            tokio::spawn(async move {
+                // Small delay to let the system settle
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                
+                let channel_ids: Vec<[u8; 32]> = {
+                    let info = channel_info.read().await;
+                    info.keys()
+                        .filter_map(|id| {
+                            let bytes = hex::decode(id).ok()?;
+                            if bytes.len() == 32 {
+                                let mut arr = [0u8; 32];
+                                arr.copy_from_slice(&bytes);
+                                Some(arr)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                };
+                
+                if !channel_ids.is_empty() {
+                    relay_client.register_channels(channel_ids).await;
+                    match relay_client.connect_any().await {
+                        Ok(()) => log::info!("[NSC_RELAY] Proactively connected to relay hub for {} channels",
+                            relay_client.relay_address().await.unwrap_or_default()),
+                        Err(e) => log::debug!("[NSC_RELAY] Proactive relay connection deferred: {}", e),
+                    }
+                }
+            });
+        }
+        
         // Spawn background task to accept connections and read messages
         tokio::spawn(async move {
             log::info!("[NSC_LISTENER] Started, waiting for connections...");
@@ -4630,12 +4791,30 @@ impl NscManager {
             log::info!("[NSC_ICE] (answerer) Starting connectivity check for {}", target);
             // Try connectivity check to verify the ICE path works
             if let Err(e) = ice_agent.check_connectivity().await {
-                log::warn!("[NSC_ICE] (answerer) Connectivity check failed for {}: {}", target, e);
-                // Clean up ICE agent and pending session on failure
+                log::warn!("[NSC_ICE] (answerer) Connectivity check failed for {}: {}, trying relay fallback", target, e);
+                // Clean up ICE agent and pending session
                 let manager = get_nsc_manager_async().await;
                 let mgr = manager.read().await;
                 mgr.active_ice_agents.write().await.remove(&session_id_for_cleanup);
                 mgr.pending_ice_sessions.write().await.remove(&session_id_for_cleanup);
+                
+                // Resolve full peer_id from prefix and connect via relay
+                let full_peer_id = {
+                    let known = mgr.known_peers.read().await;
+                    known.values()
+                        .find(|p| p.peer_id.starts_with(&peer_id))
+                        .map(|p| p.peer_id.clone())
+                };
+                if let Some(full_id) = full_peer_id {
+                    log::info!("[NSC_ICE] (answerer) Attempting relay fallback for {}", target);
+                    if let Err(relay_err) = mgr.connect_via_relay(&full_id, None).await {
+                        log::error!("[NSC_ICE] (answerer) Relay fallback also failed for {}: {}", target, relay_err);
+                    } else {
+                        log::info!("[NSC_ICE] (answerer) Relay fallback succeeded for {}", target);
+                    }
+                } else {
+                    log::warn!("[NSC_ICE] (answerer) No full peer_id found for prefix {}, cannot relay", peer_id);
+                }
                 return;
             }
             
