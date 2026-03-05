@@ -192,7 +192,7 @@ pub fn run() {
         static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
         
         // Load the window icon from embedded PNG
-        let window_icon = {
+        let make_icon = || {
             let img = image::load_from_memory(ICON_256_PNG)
                 .expect("Failed to decode embedded icon")
                 .into_rgba8();
@@ -201,6 +201,8 @@ pub fn run() {
             tao::window::Icon::from_rgba(rgba, width, height)
                 .expect("Failed to create window icon")
         };
+        let window_icon = make_icon();
+        let window_icon2 = make_icon();
         
         // Configure desktop with a custom event handler to intercept close
         let config = Config::new()
@@ -209,6 +211,8 @@ pub fn run() {
                     .with_title("Convey")
                     .with_window_icon(Some(window_icon))
             )
+            // Also set icon via Config (Dioxus checks this to avoid applying default gear icon)
+            .with_icon(window_icon2)
             .with_menu(None)
             .with_custom_event_handler(move |event, _target| {
                 if let Event::WindowEvent { event: WindowEvent::CloseRequested, .. } = event {
@@ -10235,16 +10239,20 @@ body {
 .app-logo-icon {
     width: 28px;
     height: 28px;
-    border-radius: 6px;
+    border-radius: 4px;
     object-fit: contain;
+    flex-shrink: 0;
+    overflow: visible;
 }
 
 .welcome-logo {
-    max-width: 220px;
+    max-width: 280px;
+    width: 100%;
     height: auto;
-    margin: 0 auto 4px auto;
+    margin: 0 auto 8px auto;
     display: block;
-    border-radius: 8px;
+    border-radius: 0;
+    object-fit: contain;
 }
 
 .status-indicator {
