@@ -74,3 +74,6 @@ bytes = "1"
 
 # Socket options for NAT traversal (SO_REUSEADDR, SO_REUSEPORT)
 socket2 = { version = "0.5", features = ["all"] }
+
+# Console/TUI interface
+crossterm = "0.28"

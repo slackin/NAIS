@@ -155,6 +155,32 @@ struct IncomingChannelQueryInfo {
     profile: String,
 }
 
+/// Embedded app icon (256x256 RGBA PNG) for window icon
+const ICON_256_PNG: &[u8] = include_bytes!("../images/convey_icon_256.png");
+
+/// Embedded small icon (32x32) for in-app use, as base64 data URI
+const ICON_32_PNG: &[u8] = include_bytes!("../images/convey_icon_32.png");
+
+/// Embedded logo with name for welcome modal, as base64 data URI
+const LOGO_NAME_PNG: &[u8] = include_bytes!("../images/convey_logo_name.png");
+
+/// Embedded favicon ICO
+const FAVICON_ICO: &[u8] = include_bytes!("../images/favicon.ico");
+
+/// Build a base64 data URI from PNG bytes
+fn png_data_uri(png_bytes: &[u8]) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(png_bytes);
+    format!("data:image/png;base64,{}", b64)
+}
+
+/// Build a base64 data URI from ICO bytes
+fn ico_data_uri(ico_bytes: &[u8]) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(ico_bytes);
+    format!("data:image/x-icon;base64,{}", b64)
+}
+
 pub fn run() {
     #[cfg(feature = "desktop")]
     {
@@ -165,9 +191,24 @@ pub fn run() {
         // Track whether we've already initiated shutdown
         static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
         
+        // Load the window icon from embedded PNG
+        let window_icon = {
+            let img = image::load_from_memory(ICON_256_PNG)
+                .expect("Failed to decode embedded icon")
+                .into_rgba8();
+            let (width, height) = img.dimensions();
+            let rgba = img.into_raw();
+            tao::window::Icon::from_rgba(rgba, width, height)
+                .expect("Failed to create window icon")
+        };
+        
         // Configure desktop with a custom event handler to intercept close
         let config = Config::new()
-            .with_window(tao::window::WindowBuilder::new().with_title("Convey"))
+            .with_window(
+                tao::window::WindowBuilder::new()
+                    .with_title("Convey")
+                    .with_window_icon(Some(window_icon))
+            )
             .with_menu(None)
             .with_custom_event_handler(move |event, _target| {
                 if let Event::WindowEvent { event: WindowEvent::CloseRequested, .. } = event {
@@ -1656,8 +1697,20 @@ fn app() -> Element {
         });
     }
 
+    // Pre-compute data URIs for images
+    let icon_32_uri = png_data_uri(ICON_32_PNG);
+    let logo_name_uri = png_data_uri(LOGO_NAME_PNG);
+    let favicon_uri = ico_data_uri(FAVICON_ICO);
+
     rsx! {
         style { "{APP_STYLES}" }
+
+        // Set favicon
+        document::Link {
+            rel: "icon",
+            r#type: "image/x-icon",
+            href: "{favicon_uri}",
+        }
 
         div {
             style: "display:flex; flex-direction:column; height:100vh; background:var(--bg); color:var(--text); font-family:var(--font); gap:12px; padding:12px;",
@@ -1667,8 +1720,13 @@ fn app() -> Element {
                 class: "top-bar",
                 div {
                     class: "top-bar-left",
-                    h1 { 
+                    div {
                         class: "app-title",
+                        img {
+                            src: "{icon_32_uri}",
+                            class: "app-logo-icon",
+                            alt: "Convey",
+                        }
                         "Convey" 
                     }
                     input {
@@ -5257,6 +5315,14 @@ fn app() -> Element {
                     onclick: move |evt| {
                         evt.stop_propagation();
                     },
+                    div {
+                        style: "text-align: center; margin-bottom: 8px;",
+                        img {
+                            src: "{logo_name_uri}",
+                            class: "welcome-logo",
+                            alt: "Convey",
+                        }
+                    }
                     div {
                         class: "modal-title",
                         "Welcome to Convey"
@@ -10161,6 +10227,24 @@ body {
     font-weight: 700;
     color: var(--accent);
     white-space: nowrap;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.app-logo-icon {
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    object-fit: contain;
+}
+
+.welcome-logo {
+    max-width: 220px;
+    height: auto;
+    margin: 0 auto 4px auto;
+    display: block;
+    border-radius: 8px;
 }
 
 .status-indicator {
