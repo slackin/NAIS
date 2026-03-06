@@ -1255,6 +1255,29 @@ fn dispatch_command(state: &mut ConsoleState, command: &str, arg: &str) {
             }
         }
 
+        // ── NAIS Secure Channel Commands ────────────────────────────
+        "/createchannel" => {
+            if arg.is_empty() {
+                print_error(state, "Usage: /createchannel <scs_bot_nick> <channel_name>");
+                return;
+            }
+            let mut parts = arg.splitn(2, ' ');
+            let target_bot = parts.next().unwrap_or("").to_string();
+            let channel_name = parts.next().unwrap_or("").trim().to_string();
+            if target_bot.is_empty() || channel_name.is_empty() {
+                print_error(state, "Usage: /createchannel <scs_bot_nick> <channel_name>");
+                return;
+            }
+            let ctcp_msg = format!("\x01NAIS_CREATE_CHANNEL {}\x01", channel_name);
+            if let Some(handle) = state.active_handle() {
+                let _ = handle.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                    target: target_bot.clone(),
+                    message: ctcp_msg,
+                });
+            }
+            print_system(state, "", &format!("Requesting SCS bot '{}' to create channel '{}'…", target_bot, channel_name));
+        }
+
         // ── Help ─────────────────────────────────────────────────
         "/help" => {
             if arg.is_empty() {
@@ -1264,6 +1287,7 @@ fn dispatch_command(state: &mut ConsoleState, command: &str, arg: &str) {
                 print_system(state, "", "  Messages:    /msg /query /notice /me /ctcp /ping /version /time");
                 print_system(state, "", "  Users:       /nick /whois /who /invite /away /users");
                 print_system(state, "", "  Moderation:  /kick /mode /op /deop /devoice /ban /unban /kickban");
+                print_system(state, "", "  NAIS:        /createchannel");
                 print_system(state, "", "  Other:       /raw /help");
                 print_system(state, "", "");
                 print_system(state, "", "  Tab/Shift+Tab to cycle channels  •  Ctrl+C to quit");
@@ -1305,6 +1329,7 @@ fn dispatch_command(state: &mut ConsoleState, command: &str, arg: &str) {
                     "profile" | "server" => "/profile [name] — List or switch profiles",
                     "profiles" => "/profiles — List all profiles",
                     "help" => "/help [command] — Show help",
+                    "createchannel" => "/createchannel <scs_bot_nick> <channel_name> — Ask an SCS bot to create a new secure channel and invite you",
                     _ => "Unknown command. Use /help for a list.",
                 };
                 print_system(state, "", help);
@@ -1528,11 +1553,51 @@ fn handle_irc_event(state: &mut ConsoleState, profile: &str, event: IrcEvent) {
         }
         IrcEvent::NaisCtcp { from, command, args } => {
             if is_active {
-                print_system(
-                    state,
-                    "",
-                    &format!("NAIS from {}: {} {}", from, command, args.join(" ")),
-                );
+                // Handle NAIS_CREATE_CHANNEL_RESPONSE specially for user-friendly output
+                if command == "NAIS_CREATE_CHANNEL_RESPONSE" {
+                    if args.first().map(|s| s.as_str()) == Some("OK") {
+                        let chan_name = args.get(1).map(|s| s.as_str()).unwrap_or("?");
+                        let irc_chan = args.get(2).map(|s| s.as_str()).unwrap_or("?");
+                        let chan_id = args.get(3).map(|s| s.as_str()).unwrap_or("?");
+                        print_system(
+                            state,
+                            "",
+                            &format!("SCS bot '{}' created channel '{}' (IRC: {}, ID: {})", from, chan_name, irc_chan, chan_id),
+                        );
+                        print_system(
+                            state,
+                            "",
+                            &format!("You should receive an invite to {} shortly.", irc_chan),
+                        );
+                    } else if args.first().map(|s| s.as_str()) == Some("ERROR") {
+                        let reason = args[1..].join(" ");
+                        print_system(
+                            state,
+                            "",
+                            &format!("SCS bot '{}' failed to create channel: {}", from, reason),
+                        );
+                    } else {
+                        print_system(
+                            state,
+                            "",
+                            &format!("NAIS from {}: {} {}", from, command, args.join(" ")),
+                        );
+                    }
+                } else if command == "NAIS_CHANNEL_INVITE" {
+                    // A NAIS channel invite received (e.g. from SCS bot after channel creation)
+                    let irc_chan = args.first().map(|s| s.as_str()).unwrap_or("?");
+                    print_system(
+                        state,
+                        "",
+                        &format!("{} invited you to NAIS channel {} — /join {} to accept", from, irc_chan, irc_chan),
+                    );
+                } else {
+                    print_system(
+                        state,
+                        "",
+                        &format!("NAIS from {}: {} {}", from, command, args.join(" ")),
+                    );
+                }
             }
         }
     }

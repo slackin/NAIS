@@ -771,7 +771,7 @@ fn handle_ctcp_query(command: &str, args: &str) -> Option<String> {
             Some(create_ctcp_response("VERSION", "Convey v0.1.0 (Rust)"))
         }
         "CLIENTINFO" => {
-            Some(create_ctcp_response("CLIENTINFO", "ACTION VERSION CLIENTINFO TIME PING FINGER SOURCE USERINFO VOICE_CALL VOICE_ACCEPT VOICE_REJECT VOICE_CANCEL NAIS_PROBE NAIS_INFO NAIS_JOIN NAIS_ACCEPT NAIS_CONNECT NAIS_LEAVE NAIS_QUERY_CHANNELS NAIS_QUERY_CHANNELS_RESPONSE"))
+            Some(create_ctcp_response("CLIENTINFO", "ACTION VERSION CLIENTINFO TIME PING FINGER SOURCE USERINFO VOICE_CALL VOICE_ACCEPT VOICE_REJECT VOICE_CANCEL NAIS_PROBE NAIS_INFO NAIS_JOIN NAIS_ACCEPT NAIS_CONNECT NAIS_LEAVE NAIS_QUERY_CHANNELS NAIS_QUERY_CHANNELS_RESPONSE NAIS_CREATE_CHANNEL NAIS_CREATE_CHANNEL_RESPONSE"))
         }
         "TIME" => {
             let now = chrono::Local::now();
@@ -793,7 +793,7 @@ fn handle_ctcp_query(command: &str, args: &str) -> Option<String> {
         // Voice CTCP commands are handled separately - return None to let them be forwarded to voice system
         "VOICE_CALL" | "VOICE_ACCEPT" | "VOICE_REJECT" | "VOICE_CANCEL" => None,
         // NAIS channel CTCP commands are handled separately
-        "NAIS_PROBE" | "NAIS_INFO" | "NAIS_JOIN" | "NAIS_ACCEPT" | "NAIS_CONNECT" | "NAIS_LEAVE" | "NAIS_QUERY_CHANNELS" | "NAIS_QUERY_CHANNELS_RESPONSE" => None,
+        "NAIS_PROBE" | "NAIS_INFO" | "NAIS_JOIN" | "NAIS_ACCEPT" | "NAIS_CONNECT" | "NAIS_LEAVE" | "NAIS_QUERY_CHANNELS" | "NAIS_QUERY_CHANNELS_RESPONSE" | "NAIS_CREATE_CHANNEL" | "NAIS_CREATE_CHANNEL_RESPONSE" => None,
         _ => None,
     }
 }
@@ -805,7 +805,7 @@ fn is_voice_ctcp(command: &str) -> bool {
 
 /// Check if a CTCP command is NAIS channel-related (NSC = Nais Secure Channels)
 fn is_nais_ctcp(command: &str) -> bool {
-    command.starts_with("NSC_") || matches!(command, "NAIS_PROBE" | "NAIS_INFO" | "NAIS_JOIN" | "NAIS_ACCEPT" | "NAIS_CONNECT" | "NAIS_LEAVE" | "NAIS_CHANNEL_INVITE" | "NAIS_MSG" | "NAIS_QUERY_CHANNELS" | "NAIS_QUERY_CHANNELS_RESPONSE")
+    command.starts_with("NSC_") || matches!(command, "NAIS_PROBE" | "NAIS_INFO" | "NAIS_JOIN" | "NAIS_ACCEPT" | "NAIS_CONNECT" | "NAIS_LEAVE" | "NAIS_CHANNEL_INVITE" | "NAIS_MSG" | "NAIS_QUERY_CHANNELS" | "NAIS_QUERY_CHANNELS_RESPONSE" | "NAIS_CREATE_CHANNEL" | "NAIS_CREATE_CHANNEL_RESPONSE")
 }
 
 async fn handle_connection(

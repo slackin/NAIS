@@ -74,6 +74,16 @@ pub const CTCP_NAIS_QUERY_CHANNELS: &str = "NAIS_QUERY_CHANNELS";
 /// or: NAIS_QUERY_CHANNELS_RESPONSE REJECT
 pub const CTCP_NAIS_QUERY_CHANNELS_RESPONSE: &str = "NAIS_QUERY_CHANNELS_RESPONSE";
 
+/// CTCP command to request SCS bot to create a new secure channel
+/// Sent by a client to the SCS bot to request channel creation
+/// Format: NAIS_CREATE_CHANNEL <channel_name>
+pub const CTCP_NAIS_CREATE_CHANNEL: &str = "NAIS_CREATE_CHANNEL";
+
+/// CTCP response from SCS bot after creating a channel
+/// Format: NAIS_CREATE_CHANNEL_RESPONSE OK <channel_name> <irc_channel> <channel_id>
+/// or: NAIS_CREATE_CHANNEL_RESPONSE ERROR <reason>
+pub const CTCP_NAIS_CREATE_CHANNEL_RESPONSE: &str = "NAIS_CREATE_CHANNEL_RESPONSE";
+
 /// Default port range for P2P listeners
 pub const DEFAULT_PORT_RANGE_START: u16 = 45000;
 pub const DEFAULT_PORT_RANGE_END: u16 = 45100;
@@ -421,7 +431,8 @@ pub fn is_nais_ctcp(command: &str) -> bool {
     matches!(command, 
         CTCP_NAIS_PROBE | CTCP_NAIS_INFO | CTCP_NAIS_JOIN | 
         CTCP_NAIS_ACCEPT | CTCP_NAIS_CONNECT | CTCP_NAIS_LEAVE | CTCP_NAIS_MSG |
-        CTCP_NAIS_CHANNEL_INVITE | CTCP_NAIS_QUERY_CHANNELS | CTCP_NAIS_QUERY_CHANNELS_RESPONSE
+        CTCP_NAIS_CHANNEL_INVITE | CTCP_NAIS_QUERY_CHANNELS | CTCP_NAIS_QUERY_CHANNELS_RESPONSE |
+        CTCP_NAIS_CREATE_CHANNEL | CTCP_NAIS_CREATE_CHANNEL_RESPONSE
     )
 }
 

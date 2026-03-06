@@ -1817,6 +1817,20 @@ impl Scs {
                     log::info!("Sent NSC_PROBE_RESPONSE to {}", source);
                 }
             }
+            "NAIS_CREATE_CHANNEL" => {
+                // A client is requesting us to create a new secure channel
+                let channel_name = args.trim().to_string();
+                if channel_name.is_empty() {
+                    log::warn!("Received NAIS_CREATE_CHANNEL from {} with empty name", source);
+                    if let Some(sender) = self.irc_sender.read().await.as_ref() {
+                        let response = "\x01NAIS_CREATE_CHANNEL_RESPONSE ERROR Channel name is required\x01";
+                        let _ = sender.send_notice(source, response);
+                    }
+                } else {
+                    log::info!("Received NAIS_CREATE_CHANNEL from {} for '{}'", source, channel_name);
+                    self.handle_create_channel_request(source, &channel_name).await;
+                }
+            }
             "NSC_PROBE_RESPONSE" => {
                 // A peer responded to our probe - they are NSC-capable
                 log::info!("Received NSC_PROBE_RESPONSE from {}: {}", source, &args[..args.len().min(40)]);
@@ -1899,7 +1913,7 @@ impl Scs {
         match command.as_str() {
             "HELP" => {
                 let _ = sender.send_privmsg(source, "NAIS Secure Channel Services (SCS)");
-                let _ = sender.send_privmsg(source, "Commands: HELP, INFO, CHANNELS, REGISTER <name>");
+                let _ = sender.send_privmsg(source, "Commands: HELP, INFO, CHANNELS, REGISTER <name>, CREATECHANNEL <name>");
             }
             "INFO" => {
                 let stats = self.stats.read().await;
@@ -1945,8 +1959,137 @@ impl Scs {
                     let _ = sender.send_privmsg(source, "Usage: REGISTER <channel_name>");
                 }
             }
+            "CREATECHANNEL" | "CREATE" => {
+                if !args.is_empty() {
+                    log::info!("Channel creation request via IRC PM from {}: {}", source, args);
+                    drop(sender_guard);
+                    self.handle_create_channel_request(source, args).await;
+                } else {
+                    let _ = sender.send_privmsg(source, "Usage: CREATECHANNEL <channel_name>");
+                }
+            }
             _ => {
                 let _ = sender.send_privmsg(source, "Unknown command. Type HELP for available commands.");
+            }
+        }
+    }
+
+    /// Handle a request to create a new secure channel (from CTCP or IRC PM)
+    async fn handle_create_channel_request(&self, source: &str, channel_name: &str) {
+        // Check if a channel with this name already exists
+        {
+            let channels = self.channels.read().await;
+            if channels.values().any(|c| c.metadata.name == channel_name) {
+                log::warn!("Channel creation request from {} for existing name '{}'", source, channel_name);
+                if let Some(sender) = self.irc_sender.read().await.as_ref() {
+                    let response = format!(
+                        "\x01NAIS_CREATE_CHANNEL_RESPONSE ERROR Channel '{}' already exists\x01",
+                        channel_name
+                    );
+                    let _ = sender.send_notice(source, &response);
+                    let _ = sender.send_privmsg(
+                        source,
+                        &format!("Channel '{}' already exists.", channel_name),
+                    );
+                }
+                return;
+            }
+        }
+
+        // Generate channel ID and create the channel
+        let channel_id = generate_channel_id(channel_name, &self.identity.peer_id);
+        let irc_channel = channel_id.to_irc_channel();
+
+        let metadata = ChannelMetadata {
+            channel_id: channel_id.to_hex(),
+            name: channel_name.to_string(),
+            topic: format!("Created by request from {}", source),
+            creator: self.identity.peer_id.to_hex(),
+            created_at: now_millis(),
+            version: 1,
+            admins: vec![self.identity.peer_id.to_hex()],
+            irc_channel: irc_channel.clone(),
+        };
+
+        let channel = HostedChannel::new(channel_id, metadata, &self.config.storage);
+
+        log::info!(
+            "Creating new channel '{}' ({}) requested by {}",
+            channel_name,
+            channel_id,
+            source
+        );
+
+        // Register the channel
+        {
+            let mut channels = self.channels.write().await;
+            channels.insert(channel_id, channel);
+        }
+        {
+            let mut irc_channels = self.irc_channels.write().await;
+            irc_channels.insert(irc_channel.clone(), channel_id);
+        }
+
+        // Update stats
+        self.stats.write().await.hosted_channels = self.channels.read().await.len() as u64;
+
+        // Save state
+        if let Err(e) = self.save_state().await {
+            log::warn!("Failed to save state after channel creation: {}", e);
+        }
+
+        // Join the IRC channel and set the NAIS topic
+        if let Some(sender) = self.irc_sender.read().await.as_ref() {
+            // Join the new IRC channel
+            if let Err(e) = sender.send_join(&irc_channel) {
+                log::warn!("Failed to join new IRC channel {}: {}", irc_channel, e);
+            } else {
+                log::info!("Joined new IRC channel {}", irc_channel);
+
+                // Set the NAIS topic for discovery
+                let nais_topic = format!(
+                    "NAIS:v1:{}:{}",
+                    channel_id.to_hex(),
+                    self.identity.peer_id.to_hex()
+                );
+                if let Err(e) = sender.send(Command::TOPIC(irc_channel.clone(), Some(nais_topic.clone()))) {
+                    log::warn!("Failed to set NAIS topic on {}: {}", irc_channel, e);
+                } else {
+                    log::info!("Set NAIS topic on {}: {}", irc_channel, nais_topic);
+                }
+            }
+
+            // Send success response via CTCP
+            let response = format!(
+                "\x01NAIS_CREATE_CHANNEL_RESPONSE OK {} {} {}\x01",
+                channel_name,
+                irc_channel,
+                channel_id.to_hex()
+            );
+            let _ = sender.send_notice(source, &response);
+
+            // Send a human-readable PM confirmation
+            let _ = sender.send_privmsg(
+                source,
+                &format!(
+                    "Channel '{}' created! IRC channel: {} — Sending invite now.",
+                    channel_name, irc_channel
+                ),
+            );
+
+            // Send NAIS_CHANNEL_INVITE CTCP to the requester
+            let invite_ctcp = format!(
+                "\x01NAIS_CHANNEL_INVITE {} {} nais\x01",
+                irc_channel, self.config.irc.server
+            );
+            let _ = sender.send(Command::PRIVMSG(source.to_string(), invite_ctcp));
+            log::info!("Sent NAIS_CHANNEL_INVITE to {} for {}", source, irc_channel);
+
+            // Also send a standard IRC INVITE so their client auto-joins the discovery channel
+            if let Err(e) = sender.send(Command::INVITE(source.to_string(), irc_channel.clone())) {
+                log::warn!("Failed to send IRC INVITE to {}: {}", source, e);
+            } else {
+                log::info!("Sent IRC INVITE to {} for {}", source, irc_channel);
             }
         }
     }
