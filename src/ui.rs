@@ -494,6 +494,9 @@ fn app() -> Element {
     let mut nsc_pending_invites: Signal<Vec<crate::nsc_manager::PendingInvite>> = use_signal(Vec::new);
     // NSC invite modal state: (nick, profile) when showing channel selection
     let mut nsc_invite_modal: Signal<Option<(String, String)>> = use_signal(|| None);
+    // SCS create channel modal state: (bot_nick, profile) when showing the dialog
+    let mut scs_create_channel_modal: Signal<Option<(String, String)>> = use_signal(|| None);
+    let mut scs_create_channel_name_input: Signal<String> = use_signal(|| String::new());
     // NSC channel members for the sidebar
     let mut nsc_channel_members: Signal<Vec<crate::nsc_manager::NscChannelMember>> = use_signal(Vec::new);
     
@@ -625,50 +628,136 @@ fn app() -> Element {
     let mut force_scroll_to_bottom = use_signal(|| false);
     let mut last_channel_key = use_signal(|| String::new());
 
-    // Smart auto-scroll: only scroll if at bottom or forced
+    // Install a JavaScript MutationObserver on mount that auto-scrolls
+    // the .messages div when new content arrives (if user hasn't scrolled up).
+    // This is more reliable than Rust-side effects because it runs synchronously
+    // in the browser after DOM mutations, avoiding race conditions.
     use_effect(move || {
-        // Track state changes to re-run this effect when messages update
+        let _ = document::eval(
+            r#"
+            (function() {
+                const messagesDiv = document.querySelector('.messages');
+                if (!messagesDiv || messagesDiv._naisObserver) return;
+
+                // Track whether user has deliberately scrolled away from bottom
+                messagesDiv._naisUserScrolledUp = false;
+                messagesDiv._naisProgrammaticScroll = false;
+
+                messagesDiv.addEventListener('scroll', function() {
+                    if (messagesDiv._naisProgrammaticScroll) return;
+                    const threshold = 150;
+                    const atBottom = messagesDiv.scrollHeight - messagesDiv.scrollTop <= messagesDiv.clientHeight + threshold;
+                    messagesDiv._naisUserScrolledUp = !atBottom;
+                });
+
+                // Watch for child additions (new messages rendered)
+                const observer = new MutationObserver(function() {
+                    if (!messagesDiv._naisUserScrolledUp) {
+                        messagesDiv._naisProgrammaticScroll = true;
+                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                        // Use rAF to clear the flag after the scroll event fires
+                        requestAnimationFrame(function() {
+                            requestAnimationFrame(function() {
+                                messagesDiv._naisProgrammaticScroll = false;
+                            });
+                        });
+                    }
+                });
+                observer.observe(messagesDiv, { childList: true, subtree: true, characterData: true });
+                messagesDiv._naisObserver = observer;
+
+                // Initial scroll to bottom
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            })();
+            "#
+        );
+    });
+
+    // Re-install observer and force scroll to bottom when channel changes
+    use_effect(move || {
         let state_read = state.read();
         let active_profile = state_read.active_profile.clone();
         let current_channel = state_read.servers
             .get(&active_profile)
             .map(|s| s.current_channel.clone())
             .unwrap_or_default();
+        // Read message count to subscribe to message changes for re-render
         let _message_count = state_read.servers
             .get(&active_profile)
             .map(|s| s.messages.len())
             .unwrap_or(0);
         drop(state_read);
-        
-        // Create a unique key for the current channel
+
         let channel_key = format!("{}:{}", active_profile, current_channel);
         let channel_changed = channel_key != last_channel_key();
-        
+
         if channel_changed {
             last_channel_key.set(channel_key);
-            force_scroll_to_bottom.set(true);
-        }
-        
-        // Only scroll if: forced, or at bottom
-        let should_scroll = force_scroll_to_bottom() || is_at_bottom();
-        
-        if should_scroll {
+            is_at_bottom.set(true);
+            // Force scroll to bottom and reset observer state on channel switch
+            spawn(async move {
+                Delay::new(Duration::from_millis(20)).await;
+                let _ = document::eval(
+                    r#"
+                    const messagesDiv = document.querySelector('.messages');
+                    if (messagesDiv) {
+                        messagesDiv._naisUserScrolledUp = false;
+                        messagesDiv._naisProgrammaticScroll = true;
+                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                        requestAnimationFrame(function() {
+                            requestAnimationFrame(function() {
+                                messagesDiv._naisProgrammaticScroll = false;
+                            });
+                        });
+                    }
+                    "#
+                );
+            });
+        } else if is_at_bottom() {
+            // New messages in same channel - nudge scroll if at bottom
             spawn(async move {
                 Delay::new(Duration::from_millis(10)).await;
                 let _ = document::eval(
                     r#"
                     const messagesDiv = document.querySelector('.messages');
-                    if (messagesDiv) {
+                    if (messagesDiv && !messagesDiv._naisUserScrolledUp) {
+                        messagesDiv._naisProgrammaticScroll = true;
                         messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                        requestAnimationFrame(function() {
+                            requestAnimationFrame(function() {
+                                messagesDiv._naisProgrammaticScroll = false;
+                            });
+                        });
                     }
                     "#
                 );
             });
-            
-            if force_scroll_to_bottom() {
-                force_scroll_to_bottom.set(false);
-                is_at_bottom.set(true);
-            }
+        }
+    });
+
+    // Watch for force_scroll_to_bottom from other components (e.g., sending a message)
+    use_effect(move || {
+        if force_scroll_to_bottom() {
+            force_scroll_to_bottom.set(false);
+            is_at_bottom.set(true);
+            spawn(async move {
+                Delay::new(Duration::from_millis(20)).await;
+                let _ = document::eval(
+                    r#"
+                    const messagesDiv = document.querySelector('.messages');
+                    if (messagesDiv) {
+                        messagesDiv._naisUserScrolledUp = false;
+                        messagesDiv._naisProgrammaticScroll = true;
+                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                        requestAnimationFrame(function() {
+                            requestAnimationFrame(function() {
+                                messagesDiv._naisProgrammaticScroll = false;
+                            });
+                        });
+                    }
+                    "#
+                );
+            });
         }
     });
 
@@ -1260,6 +1349,51 @@ fn app() -> Element {
                                                 }
                                             } else {
                                                 log::debug!("Received NAIS_QUERY_CHANNELS_RESPONSE from {} but no pending query", from);
+                                            }
+                                        }
+                                        crate::nais_channel::CTCP_NAIS_CREATE_CHANNEL_RESPONSE => {
+                                            // Response from SCS bot after we requested channel creation
+                                            let current_channel = state_handle.read().servers.get(&profile_name)
+                                                .map(|s| s.current_channel.clone())
+                                                .unwrap_or_default();
+                                            
+                                            if args.first().map(|s| s.as_str()) == Some("OK") {
+                                                let chan_name = args.get(1).map(|s| s.as_str()).unwrap_or("?");
+                                                let irc_chan = args.get(2).map(|s| s.as_str()).unwrap_or("?");
+                                                let chan_id = args.get(3).map(|s| s.as_str()).unwrap_or("?");
+                                                
+                                                let mut state_mut = state_handle.write();
+                                                let profiles_read = profiles.read();
+                                                apply_event_with_config(
+                                                    &mut state_mut,
+                                                    &profiles_read,
+                                                    &profile_name,
+                                                    IrcEvent::System {
+                                                        channel: current_channel,
+                                                        text: format!("[SCS] Bot '{}' created channel '{}' (IRC: {}, ID: {}). You should receive an invite shortly.",
+                                                            from, chan_name, irc_chan, &chan_id[..16.min(chan_id.len())]),
+                                                    },
+                                                );
+                                                drop(state_mut);
+                                                
+                                                log::info!("SCS channel created by {}: name={}, irc={}, id={}", from, chan_name, irc_chan, chan_id);
+                                            } else if args.first().map(|s| s.as_str()) == Some("ERROR") {
+                                                let reason = args[1..].join(" ");
+                                                
+                                                let mut state_mut = state_handle.write();
+                                                let profiles_read = profiles.read();
+                                                apply_event_with_config(
+                                                    &mut state_mut,
+                                                    &profiles_read,
+                                                    &profile_name,
+                                                    IrcEvent::System {
+                                                        channel: current_channel,
+                                                        text: format!("[SCS] Bot '{}' failed to create channel: {}", from, reason),
+                                                    },
+                                                );
+                                                drop(state_mut);
+                                                
+                                                log::warn!("SCS channel creation failed from {}: {}", from, reason);
                                             }
                                         }
                                         cmd if cmd.starts_with("NSC_") => {
@@ -2503,14 +2637,14 @@ fn app() -> Element {
                         // CSS optimization: hint that content will scroll for GPU acceleration
                         style: "will-change: scroll-position; contain: content;",
                         onscroll: move |_evt| {
-                            // Detect if user is at the bottom of scroll
+                            // Sync Rust-side is_at_bottom with JS-side state
                             spawn(async move {
                                 if let Ok(result) = document::eval(
                                     r#"
                                     const messagesDiv = document.querySelector('.messages');
                                     if (messagesDiv) {
-                                        const isAtBottom = messagesDiv.scrollHeight - messagesDiv.scrollTop <= messagesDiv.clientHeight + 5;
-                                        dioxus.send(isAtBottom);
+                                        const atBottom = !messagesDiv._naisUserScrolledUp;
+                                        dioxus.send(atBottom);
                                     }
                                     "#
                                 ).recv::<serde_json::Value>().await {
@@ -3289,6 +3423,23 @@ fn app() -> Element {
                                                                             }
                                                                         },
                                                                         "🔍 Query Secure Channels"
+                                                                    }
+                                                                    // Create Secure Channel via SCS bot
+                                                                    button {
+                                                                        class: "menu-item",
+                                                                        title: "Ask this SCS bot to create a new secure channel and invite you",
+                                                                        onclick: {
+                                                                            let nick = user_nick.clone();
+                                                                            let profile_for_scs = user_profile.clone();
+                                                                            move |_| {
+                                                                                log::info!("Create Secure Channel via SCS clicked for bot: {}", nick);
+                                                                                user_menu_open.set(None);
+                                                                                ctcp_submenu_open.set(false);
+                                                                                scs_create_channel_name_input.set(String::new());
+                                                                                scs_create_channel_modal.set(Some((nick.clone(), profile_for_scs.clone())));
+                                                                            }
+                                                                        },
+                                                                        "✨ Create Secure Channel"
                                                                     }
                                                                     // Advanced options (hidden unless advanced mode is enabled)
                                                                     if *settings_show_advanced.read() {
@@ -6916,6 +7067,100 @@ fn app() -> Element {
                                         }
                                         nsc_loading.set(false);
                                     });
+                                }
+                            },
+                            "Create Channel"
+                        }
+                    }
+                }
+            }
+        }
+
+        // SCS Create Channel Modal
+        if let Some((bot_nick, bot_profile)) = scs_create_channel_modal.read().clone() {
+            div {
+                class: "modal-backdrop",
+                onclick: move |_| {
+                    scs_create_channel_modal.set(None);
+                },
+                div {
+                    class: "modal",
+                    style: "width: min(400px, 90vw);",
+                    onclick: move |evt| {
+                        evt.stop_propagation();
+                    },
+                    div {
+                        class: "modal-title",
+                        "✨ Create Secure Channel via {bot_nick}"
+                    }
+                    div {
+                        class: "modal-body",
+                        p {
+                            style: "color: var(--muted); font-size: 13px; margin-bottom: 16px;",
+                            "Enter a name for the new secure channel. The SCS bot will create and host the channel, then invite you to join."
+                        }
+                        input {
+                            r#type: "text",
+                            class: "input",
+                            style: "width: 100%; padding: 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 14px;",
+                            placeholder: "Channel name...",
+                            value: "{scs_create_channel_name_input}",
+                            autofocus: true,
+                            oninput: move |evt| {
+                                scs_create_channel_name_input.set(evt.value().clone());
+                            },
+                            onkeypress: {
+                                let bot_nick_enter = bot_nick.clone();
+                                let bot_profile_enter = bot_profile.clone();
+                                move |evt: Event<KeyboardData>| {
+                                    if evt.key() == Key::Enter {
+                                        let name = scs_create_channel_name_input.read().trim().to_string();
+                                        if !name.is_empty() {
+                                            let ctcp_msg = format!("\x01NAIS_CREATE_CHANNEL {}\x01", name);
+                                            if let Some(core) = cores.read().get(&bot_profile_enter) {
+                                                let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                    target: bot_nick_enter.clone(),
+                                                    message: ctcp_msg,
+                                                });
+                                            }
+                                            log::info!("Sent NAIS_CREATE_CHANNEL '{}' to SCS bot '{}'", name, bot_nick_enter);
+                                            scs_create_channel_modal.set(None);
+                                        }
+                                    }
+                                }
+                            },
+                        }
+                    }
+                    div {
+                        class: "modal-actions",
+                        style: "display: flex; gap: 8px; justify-content: flex-end;",
+                        button {
+                            class: "send",
+                            style: "background: transparent; border: 1px solid var(--border);",
+                            onclick: move |_| {
+                                scs_create_channel_modal.set(None);
+                            },
+                            "Cancel"
+                        }
+                        button {
+                            class: "send",
+                            disabled: scs_create_channel_name_input.read().trim().is_empty(),
+                            onclick: {
+                                let bot_nick_create = bot_nick.clone();
+                                let bot_profile_create = bot_profile.clone();
+                                move |_| {
+                                    let name = scs_create_channel_name_input.read().trim().to_string();
+                                    if !name.is_empty() {
+                                        let ctcp_msg = format!("\x01NAIS_CREATE_CHANNEL {}\x01", name);
+                                        if let Some(core) = cores.read().get(&bot_profile_create) {
+                                            let _ = core.cmd_tx.try_send(IrcCommandEvent::Ctcp {
+                                                target: bot_nick_create.clone(),
+                                                message: ctcp_msg,
+                                            });
+                                        }
+                                        log::info!("Sent NAIS_CREATE_CHANNEL '{}' to SCS bot '{}'", name, bot_nick_create);
+                                        scs_create_channel_modal.set(None);
+                                    }
                                 }
                             },
                             "Create Channel"
