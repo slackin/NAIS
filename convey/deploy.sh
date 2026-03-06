@@ -119,6 +119,7 @@ cp "$SCRIPT_DIR/deploy/install.sh" "$LOCAL_STAGING/"
 cp "$SCRIPT_DIR/deploy/config.toml" "$LOCAL_STAGING/"
 cp "$SCRIPT_DIR/deploy/convey-images.service" "$LOCAL_STAGING/"
 cp "$SCRIPT_DIR/deploy/nginx-convey.conf" "$LOCAL_STAGING/"
+cp "$SCRIPT_DIR/deploy/apache-convey-proxy.conf" "$LOCAL_STAGING/"
 
 if $UPDATE_CONFIG; then
     touch "$LOCAL_STAGING/.update-config"

@@ -61,6 +61,13 @@ fi
 chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"
 chmod 750 "$DATA_DIR"
 
+# Install Apache proxy config
+if [[ -f "$STAGING_DIR/apache-convey-proxy.conf" ]]; then
+    echo "Installing Apache proxy config..."
+    cp "$STAGING_DIR/apache-convey-proxy.conf" "$CONFIG_DIR/apache-convey-proxy.conf"
+    chmod 644 "$CONFIG_DIR/apache-convey-proxy.conf"
+fi
+
 # Install systemd service
 echo "Installing systemd service..."
 cp "$STAGING_DIR/convey-images.service" /etc/systemd/system/
@@ -91,5 +98,9 @@ echo "  1. Edit config:     sudo nano $CONFIG_DIR/config.toml"
 echo "  2. Check status:    sudo systemctl status convey-images"
 echo "  3. View logs:       sudo journalctl -u convey-images -f"
 echo ""
-echo "Configure Nginx to reverse proxy to 127.0.0.1:8844"
+echo "Apache setup:"
+echo "  1. Enable modules:  sudo a2enmod proxy proxy_http"
+echo "  2. Add to your convey.pugbot.net VirtualHost:"
+echo "       Include $CONFIG_DIR/apache-convey-proxy.conf"
+echo "  3. Reload Apache:   sudo systemctl reload apache2"
 echo ""

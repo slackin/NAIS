@@ -34,22 +34,5 @@ AddType application/javascript .js
 # Disable directory listing
 Options -Indexes
 
-# Reverse proxy Convey Image Paste Board routes to local service
-<IfModule mod_proxy.c>
-    ProxyPreserveHost On
-    ProxyPass /upload http://127.0.0.1:8844/upload
-    ProxyPassReverse /upload http://127.0.0.1:8844/upload
-    ProxyPass /i/ http://127.0.0.1:8844/i/
-    ProxyPassReverse /i/ http://127.0.0.1:8844/i/
-    ProxyPass /v/ http://127.0.0.1:8844/v/
-    ProxyPassReverse /v/ http://127.0.0.1:8844/v/
-    ProxyPass /delete/ http://127.0.0.1:8844/delete/
-    ProxyPassReverse /delete/ http://127.0.0.1:8844/delete/
-    ProxyPass /api/ http://127.0.0.1:8844/api/
-    ProxyPassReverse /api/ http://127.0.0.1:8844/api/
-    ProxyPass /gallery http://127.0.0.1:8844/gallery
-    ProxyPassReverse /gallery http://127.0.0.1:8844/gallery
-</IfModule>
-
 # Custom error page
 ErrorDocument 404 /index.html
