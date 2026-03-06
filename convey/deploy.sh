@@ -127,7 +127,9 @@ fi
 # Copy everything to remote staging in one scp call
 echo -e "${YELLOW}Copying files to server...${NC}"
 ssh_cmd "rm -rf $STAGING_DIR && mkdir -p $STAGING_DIR"
+shopt -s dotglob
 scp_cmd "$LOCAL_STAGING"/* "$REMOTE_HOST:$STAGING_DIR/"
+shopt -u dotglob
 
 # Run remote install script with sudo (single password prompt)
 echo -e "${YELLOW}Running remote install (sudo password required once)...${NC}"

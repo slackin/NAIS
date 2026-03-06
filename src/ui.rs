@@ -859,6 +859,11 @@ fn app() -> Element {
         });
     });
 
+    // Clipboard image paste is handled directly in the chat input's onkeydown
+    // handler (Ctrl+V / Cmd+V) using arboard to read system clipboard images.
+    // The old JS-based paste detection (clipboardData.items polling) was removed
+    // because it was unreliable on webkit2gtk (Linux).
+
     // Main event loop to poll cores for IRC events
     use_effect(move || {
         let mut state_handle = state;
@@ -5402,6 +5407,74 @@ fn app() -> Element {
                                         });
                                     }
                                 }
+                            }
+                            // Ctrl+V / Cmd+V: check clipboard for image data
+                            #[cfg(feature = "desktop")]
+                            Key::Character(ref c) if c == "v" && (evt.modifiers().contains(Modifiers::CONTROL) || evt.modifiers().contains(Modifiers::META)) => {
+                                let mut input_for_paste = input.clone();
+                                spawn(async move {
+                                    // Read image from system clipboard using arboard
+                                    let image_bytes = tokio::task::spawn_blocking(|| {
+                                        let clipboard = arboard::Clipboard::new();
+                                        match clipboard {
+                                            Ok(mut cb) => {
+                                                match cb.get_image() {
+                                                    Ok(img) => {
+                                                        let width = img.width as u32;
+                                                        let height = img.height as u32;
+                                                        let mut png_buf = Vec::new();
+                                                        let mut cursor = std::io::Cursor::new(&mut png_buf);
+                                                        if let Ok(()) = {
+                                                            use image::ImageEncoder;
+                                                            image::codecs::png::PngEncoder::new(&mut cursor)
+                                                                .write_image(
+                                                                    &img.bytes,
+                                                                    width,
+                                                                    height,
+                                                                    image::ExtendedColorType::Rgba8,
+                                                                )
+                                                        } {
+                                                            println!("Clipboard image: {}x{}, {} PNG bytes", width, height, png_buf.len());
+                                                            Some(png_buf)
+                                                        } else {
+                                                            None
+                                                        }
+                                                    }
+                                                    Err(_) => None, // No image in clipboard, normal text paste proceeds
+                                                }
+                                            }
+                                            Err(_) => None,
+                                        }
+                                    }).await.unwrap_or(None);
+
+                                    if let Some(bytes) = image_bytes {
+                                        println!("Uploading clipboard image: {} bytes", bytes.len());
+                                        if let Some(url) = upload_simple_image(bytes).await {
+                                            println!("Clipboard image uploaded: {}", url);
+                                            let escaped = url.replace('\\', "\\\\").replace('\'', "\\'");
+                                            let _ = document::eval(&format!(
+                                                r#"
+                                                const input = document.getElementById('chat-input');
+                                                if (input) {{
+                                                    const current = input.value;
+                                                    input.value = current ? current + ' ' + '{}' : '{}';
+                                                    input.focus();
+                                                }}
+                                                "#,
+                                                escaped, escaped
+                                            ));
+                                            let current = input_for_paste.read().clone();
+                                            let new_text = if current.is_empty() {
+                                                url
+                                            } else {
+                                                format!("{} {}", current, url)
+                                            };
+                                            input_for_paste.set(new_text);
+                                        } else {
+                                            println!("Clipboard image upload failed");
+                                        }
+                                    }
+                                });
                             }
                             _ => {}
                         }

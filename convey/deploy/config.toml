@@ -1,7 +1,7 @@
 # Convey Image Paste Board Configuration
 # Hosted at convey.pugbot.net
 
-# HTTP server binding (Nginx reverse proxies to this)
+# HTTP server binding (Apache reverse proxies to this)
 bind_address = "127.0.0.1:8844"
 
 # Public base URL for generating links

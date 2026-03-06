@@ -25,6 +25,12 @@ mkdir -p "$CONFIG_DIR"
 mkdir -p "$DATA_DIR/images"
 mkdir -p "$DATA_DIR/meta"
 
+# Stop service before replacing binary (avoid "Text file busy")
+if systemctl is-active --quiet convey-images; then
+    echo "Stopping running service..."
+    systemctl stop convey-images
+fi
+
 # Install binary
 echo "Installing binary to $INSTALL_DIR..."
 cp "$STAGING_DIR/convey-images" "$INSTALL_DIR/"
