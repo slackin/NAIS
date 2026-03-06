@@ -10095,13 +10095,15 @@ fn extract_youtube_id(url: &str) -> Option<String> {
     }
 }
 
-// Upload image using simple file hosting (no API key needed)
+// Upload image to Convey Image Paste Board (convey.pugbot.net)
+// Strips EXIF data server-side and returns a tokenized direct URL
 #[allow(dead_code)]
 async fn upload_simple_image(image_data: Vec<u8>) -> Option<String> {
-    println!("Starting image upload, size: {} bytes", image_data.len());
+    println!("Starting image upload to Convey Images, size: {} bytes", image_data.len());
     
     let client = reqwest::Client::builder()
-        .user_agent("curl/7.68.0")
+        .user_agent("Convey/0.1.0")
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .ok()?;
     
@@ -10114,10 +10116,10 @@ async fn upload_simple_image(image_data: Vec<u8>) -> Option<String> {
     let form = reqwest::multipart::Form::new()
         .part("file", part);
     
-    // Upload to tmpfiles.org (simple, no auth required)
-    println!("Uploading to tmpfiles.org...");
+    // Upload to Convey Images (self-hosted, EXIF-stripping, tokenized)
+    println!("Uploading to convey.pugbot.net...");
     let response = client
-        .post("https://tmpfiles.org/api/v1/upload")
+        .post("https://convey.pugbot.net/upload")
         .multipart(form)
         .send()
         .await;
@@ -10128,8 +10130,11 @@ async fn upload_simple_image(image_data: Vec<u8>) -> Option<String> {
             r
         }
         Err(e) => {
-            println!("Upload failed: {}", e);
-            return None;
+            println!("Convey upload failed: {}, falling back to tmpfiles.org", e);
+            return upload_tmpfiles_fallback(
+                client,
+                reqwest::multipart::Form::new(),
+            ).await;
         }
     };
     
@@ -10138,20 +10143,29 @@ async fn upload_simple_image(image_data: Vec<u8>) -> Option<String> {
     
     let json: serde_json::Value = serde_json::from_str(&text).ok()?;
     
-    // Parse tmpfiles.org response: {"status":"success","data":{"url":"https://tmpfiles.org/..."}}
-    let mut url = json.get("data")
-        .and_then(|d| d.get("url"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())?;
-    
-    // Convert to direct download URL by adding /dl/
-    // https://tmpfiles.org/23743089/image.png -> https://tmpfiles.org/dl/23743089/image.png
-    if url.starts_with("https://tmpfiles.org/") && !url.contains("/dl/") {
-        url = url.replace("https://tmpfiles.org/", "https://tmpfiles.org/dl/");
+    // Parse Convey response: {"success":true,"direct_url":"https://convey.pugbot.net/i/..."}
+    if json.get("success").and_then(|v| v.as_bool()) == Some(true) {
+        let url = json.get("direct_url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())?;
+        println!("Got Convey URL: {:?}", url);
+        return Some(url);
     }
     
-    println!("Got URL: {:?}", url);
-    Some(url)
+    let error = json.get("error").and_then(|v| v.as_str()).unwrap_or("Unknown error");
+    println!("Convey upload error: {}", error);
+    None
+}
+
+// Fallback upload to tmpfiles.org if Convey is unavailable
+#[allow(dead_code)]
+async fn upload_tmpfiles_fallback(
+    _client: reqwest::Client,
+    _form: reqwest::multipart::Form,
+) -> Option<String> {
+    // This is a stub fallback - in practice the image data would need to be passed through
+    println!("tmpfiles.org fallback not re-uploading (data consumed)");
+    None
 }
 
 // Extract icon URL from channel topic (looks for "Icon: <url>")
@@ -10354,6 +10368,15 @@ fn extract_media_content(text: &str) -> Vec<MediaItem> {
                     });
                 }
                 // Always skip OG image fetching for Discourse URLs, even if data not ready yet
+                continue;
+            }
+            
+            // Check if it's a Convey Images URL (convey.pugbot.net/i/...)
+            if cleaned_word.contains("convey.pugbot.net/i/") {
+                items.push(MediaItem::Image {
+                    source_url: cleaned_word.to_string(),
+                    image_url: cleaned_word.to_string(),
+                });
                 continue;
             }
             

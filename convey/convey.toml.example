@@ -1,0 +1,23 @@
+# Convey Image Paste Board - Example Configuration
+# Copy to /etc/convey-images/config.toml and customize
+
+# HTTP server binding
+bind_address = "0.0.0.0:8844"
+
+# Public base URL for generating links
+base_url = "https://convey.pugbot.net"
+
+# Image storage directory  
+storage_dir = "/var/lib/convey-images"
+
+# Maximum upload size in bytes (20MB)
+max_upload_size = 20971520
+
+# Maximum number of stored images
+max_images = 50000
+
+# Image retention in days (0 = forever)
+retention_days = 0
+
+# Maximum image dimension (larger images are resized)
+max_dimension = 4096

@@ -1,0 +1,39 @@
+[package]
+name = "convey-images"
+version = "0.1.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Convey Image Paste Board - Web-hosted image hosting with EXIF stripping"
+
+[[bin]]
+name = "convey-images"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime & web framework
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "net", "sync", "signal", "fs"] }
+axum = { version = "0.8", features = ["multipart"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "limit"] }
+
+# Image processing & EXIF stripping
+image = "0.25"
+kamadak-exif = "0.5"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Unique token generation
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+chrono = "0.4"
+
+# Utilities
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+thiserror = "1"
+mime_guess = "2"
