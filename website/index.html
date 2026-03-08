@@ -3,7 +3,26 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Convey — Modern IRC Client</title>
+    <title>Convey — Modern IRC Client with End-to-End Encrypted Secure Channels</title>
+    <meta name="description" content="Convey is a modern, lightweight IRC client built in Rust with end-to-end encrypted secure channels, encrypted voice chat, P2P messaging, and NAT traversal.">
+
+    <!-- Open Graph / Facebook -->
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="Convey — Modern IRC Client with E2E Encryption">
+    <meta property="og:description" content="A modern IRC client built in Rust with end-to-end encrypted secure channels, encrypted voice chat, and peer-to-peer messaging. Open source under Apache 2.0.">
+    <meta property="og:image" content="https://github.com/slackin/NAIS/raw/main/website/og-image.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:image:alt" content="Convey — Modern IRC client with end-to-end encrypted secure channels">
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Convey — Modern IRC Client with E2E Encryption">
+    <meta name="twitter:description" content="A modern IRC client built in Rust with end-to-end encrypted secure channels, encrypted voice chat, and peer-to-peer messaging.">
+    <meta name="twitter:image" content="https://github.com/slackin/NAIS/raw/main/website/og-image.png">
+    <meta name="twitter:image:alt" content="Convey — Modern IRC client with end-to-end encrypted secure channels">
+
+    <link rel="icon" href="../images/favicon.ico" type="image/x-icon">
     <link rel="stylesheet" href="style.css">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -17,7 +36,9 @@
             <div class="logo">Convey</div>
             <div class="nav-links">
                 <a href="#features">Features</a>
+                <a href="#how-it-works">How It Works</a>
                 <a href="#download">Download</a>
+                <a href="#faq">FAQ</a>
                 <a href="https://github.com/slackin/NAIS" target="_blank" rel="noopener">GitHub</a>
             </div>
         </nav>
@@ -27,7 +48,7 @@
         <section class="hero">
             <div class="hero-content">
                 <h1>Convey</h1>
-                <p class="tagline">A modern, lightweight IRC client built in Rust — with end-to-end encrypted secure channels.</p>
+                <p class="tagline">A modern, lightweight IRC client built in Rust — with end-to-end encrypted secure channels, voice chat, and P2P messaging.</p>
                 <div class="hero-buttons">
                     <a href="#download" class="btn btn-primary">Download</a>
                     <a href="https://github.com/slackin/NAIS" class="btn btn-secondary" target="_blank" rel="noopener">View Source</a>
@@ -39,9 +60,10 @@
             <h2>What is Convey?</h2>
             <p class="section-desc">
                 Convey is an ultra-modern IRC client written in Rust with a native desktop GUI.
-                Beyond standard IRC, it introduces <strong>Secure Channels</strong> — an
-                end-to-end encrypted overlay that uses IRC only for peer discovery while routing
-                all message content through direct P2P connections or encrypted relay hubs.
+                Beyond standard IRC, it introduces <strong>NAIS Secure Channels</strong> — an
+                end-to-end encrypted overlay that uses IRC only for peer discovery and presence
+                signaling while routing all message content through direct P2P connections or
+                encrypted relay hubs. No encrypted payloads ever traverse the IRC server.
             </p>
 
             <div class="feature-grid">
@@ -68,12 +90,53 @@
                 <div class="feature-card">
                     <div class="feature-icon">&#128187;</div>
                     <h3>Cross-Platform</h3>
-                    <p>First-class Windows and Linux support. Native look and feel on every platform with a single codebase.</p>
+                    <p>First-class Windows, Linux, and Android support. Native look and feel on every platform with a single Rust codebase.</p>
                 </div>
                 <div class="feature-card">
                     <div class="feature-icon">&#128220;</div>
                     <h3>Open Source</h3>
                     <p>Licensed under Apache 2.0. Full source code available, auditable cryptography, and community-driven development.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#128248;</div>
+                    <h3>Privacy-First Image Sharing</h3>
+                    <p>Built-in Convey image paste board strips EXIF metadata, generates tokenized URLs, and deduplicates uploads — self-hostable and privacy-respecting.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#127760;</div>
+                    <h3>Federated Relay Hubs</h3>
+                    <p>Decentralized relay infrastructure with federated hubs. Run your own hub or use community-operated ones — all traffic remains encrypted end-to-end.</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="how-it-works" class="how-it-works">
+            <h2>How It Works</h2>
+            <p class="section-desc">
+                Convey separates discovery from content delivery. IRC handles presence and peer
+                discovery while all encrypted message content flows through a separate, secure transport layer.
+            </p>
+
+            <div class="steps-grid">
+                <div class="step-card">
+                    <div class="step-number">1</div>
+                    <h3>Connect to IRC</h3>
+                    <p>Join any IRC network as usual. Standard channels and messaging work exactly like any other IRC client.</p>
+                </div>
+                <div class="step-card">
+                    <div class="step-number">2</div>
+                    <h3>Discover Peers</h3>
+                    <p>When you join a secure channel, Convey uses IRC signaling (CTCP) to find other secure channel participants and exchange connection info.</p>
+                </div>
+                <div class="step-card">
+                    <div class="step-number">3</div>
+                    <h3>Establish P2P</h3>
+                    <p>Direct QUIC/UDP connections are negotiated with ICE/STUN/TURN for NAT traversal. If P2P fails, traffic is relayed through an encrypted hub.</p>
+                </div>
+                <div class="step-card">
+                    <div class="step-number">4</div>
+                    <h3>Communicate Securely</h3>
+                    <p>Messages, voice, and files flow through the encrypted transport — never through the IRC server. MLS provides group forward secrecy.</p>
                 </div>
             </div>
         </section>
@@ -95,11 +158,73 @@
                     <p>x86_64 — binary</p>
                     <span class="btn btn-primary btn-sm">Download</span>
                 </a>
+                <a href="https://github.com/slackin/NAIS/releases/latest/download/nais_client-android.apk" class="download-card">
+                    <div class="download-icon">&#128241;</div>
+                    <h3>Android</h3>
+                    <p>ARM64 — .apk</p>
+                    <span class="btn btn-primary btn-sm">Download</span>
+                </a>
             </div>
 
             <p class="download-note">
                 Or browse all releases on <a href="https://github.com/slackin/NAIS/releases" target="_blank" rel="noopener">GitHub Releases</a>.
             </p>
+        </section>
+
+        <section id="faq" class="faq">
+            <h2>Frequently Asked Questions</h2>
+
+            <div class="faq-list">
+                <details class="faq-item">
+                    <summary>What makes Convey different from other IRC clients?</summary>
+                    <p>Convey layers <strong>NAIS Secure Channels</strong> on top of standard IRC. While you can use it as a regular IRC client, enabling a secure channel creates an encrypted overlay — IRC is only used for peer discovery, and all message content flows through direct P2P connections or encrypted relay hubs. No plaintext ever hits the IRC server for secure channels.</p>
+                </details>
+
+                <details class="faq-item">
+                    <summary>What encryption does Convey use?</summary>
+                    <p>Convey uses a layered encryption approach: <strong>X3DH</strong> (Extended Triple Diffie-Hellman) for initial key exchange, <strong>Double Ratchet</strong> for per-peer forward secrecy, and <strong>MLS</strong> (Messaging Layer Security) for group key management. Transport is secured with <strong>QUIC (TLS 1.3)</strong>. All cryptographic primitives use auditable, well-established libraries: X25519, Ed25519, ChaCha20-Poly1305, and HKDF-SHA256.</p>
+                </details>
+
+                <details class="faq-item">
+                    <summary>Can relay hub operators read my messages?</summary>
+                    <p>No. Relay hubs operate on a <strong>zero-trust</strong> model — they only ever see ciphertext. Messages are encrypted end-to-end before leaving your device. Even if a hub is compromised, past and future messages remain safe thanks to forward secrecy.</p>
+                </details>
+
+                <details class="faq-item">
+                    <summary>Do I need to run my own relay hub?</summary>
+                    <p>No. Convey attempts direct P2P connections first using ICE/STUN/TURN for NAT traversal. Relay hubs are only used as a fallback when direct connectivity isn't possible. You can use community-operated hubs, or run your own — the <a href="https://github.com/slackin/NAIS/tree/main/relay-hub" target="_blank" rel="noopener">relay-hub</a> is included in the source.</p>
+                </details>
+
+                <details class="faq-item">
+                    <summary>Does the voice chat work the same way?</summary>
+                    <p>Yes. Voice chat uses the same encrypted transport as text messages — Opus-encoded audio with noise filtering, fully encrypted and routed through the secure P2P or relay layer. Voice is never sent through the IRC server.</p>
+                </details>
+
+                <details class="faq-item">
+                    <summary>What platforms are supported?</summary>
+                    <p>Convey runs on <strong>Windows</strong> (x86_64), <strong>Linux</strong> (x86_64), and <strong>Android</strong> (ARM64). The UI is built with Dioxus, giving native performance on all platforms from a single Rust codebase.</p>
+                </details>
+
+                <details class="faq-item">
+                    <summary>Can I still use regular IRC channels?</summary>
+                    <p>Absolutely. Convey is a fully-featured IRC client first. Standard IRC channels, private messages, and all the usual IRC features work normally. Secure channels are an opt-in addition — you choose when to use them.</p>
+                </details>
+
+                <details class="faq-item">
+                    <summary>How does image sharing work?</summary>
+                    <p>Convey includes an integrated image paste board service (<strong>Convey Images</strong>) that strips EXIF metadata, generates randomized tokenized URLs, and deduplicates uploads. You can self-host it or use a community instance. Shared images go through the paste board service so they're accessible via URL in both regular and secure channels.</p>
+                </details>
+
+                <details class="faq-item">
+                    <summary>Is Convey really free and open source?</summary>
+                    <p>Yes. Convey is licensed under <strong>Apache 2.0</strong>. The full source code — including the client, relay hub, secure channel service, and image paste board — is available on <a href="https://github.com/slackin/NAIS" target="_blank" rel="noopener">GitHub</a>. All cryptography is auditable and uses well-known libraries.</p>
+                </details>
+
+                <details class="faq-item">
+                    <summary>How do I build from source?</summary>
+                    <p>Clone the repository and run <code>cargo build --release</code>. Convey is a standard Rust project with a Cargo workspace. See the <a href="https://github.com/slackin/NAIS" target="_blank" rel="noopener">README</a> for detailed build instructions and dependencies.</p>
+                </details>
+            </div>
         </section>
     </main>
 

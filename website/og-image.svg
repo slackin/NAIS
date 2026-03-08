@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0b0e14"/>
+      <stop offset="100%" style="stop-color:#111620"/>
+    </linearGradient>
+    <linearGradient id="accent-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#4dacff"/>
+      <stop offset="100%" style="stop-color:#7cc4ff"/>
+    </linearGradient>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M 48 0 L 0 0 0 48" fill="none" stroke="rgba(255,255,255,0.03)" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <rect width="1200" height="630" fill="url(#grid)"/>
+
+  <!-- Decorative glow -->
+  <ellipse cx="600" cy="260" rx="400" ry="200" fill="rgba(77,172,255,0.04)"/>
+
+  <!-- Lock icon -->
+  <g transform="translate(554, 100)">
+    <rect x="16" y="40" width="60" height="48" rx="8" fill="none" stroke="url(#accent-grad)" stroke-width="4"/>
+    <path d="M28 40 V28 A18 18 0 0 1 64 28 V40" fill="none" stroke="url(#accent-grad)" stroke-width="4" stroke-linecap="round"/>
+    <circle cx="46" cy="60" r="6" fill="#4dacff"/>
+    <line x1="46" y1="66" x2="46" y2="76" stroke="#4dacff" stroke-width="4" stroke-linecap="round"/>
+  </g>
+
+  <!-- Title -->
+  <text x="600" y="240" text-anchor="middle" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-weight="700" font-size="80" fill="#e6eaf0" letter-spacing="-2">Convey</text>
+
+  <!-- Tagline -->
+  <text x="600" y="300" text-anchor="middle" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-weight="400" font-size="26" fill="#6b7486">Modern IRC Client with End-to-End Encrypted</text>
+  <text x="600" y="338" text-anchor="middle" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-weight="400" font-size="26" fill="#6b7486">Secure Channels &amp; Voice Chat</text>
+
+  <!-- Feature pills -->
+  <g transform="translate(600, 400)" text-anchor="middle">
+    <!-- Pill 1 -->
+    <rect x="-480" y="-18" width="176" height="36" rx="18" fill="rgba(77,172,255,0.1)" stroke="rgba(77,172,255,0.2)" stroke-width="1"/>
+    <text x="-392" y="6" font-family="Inter, sans-serif" font-weight="500" font-size="14" fill="#4dacff">E2E Encryption</text>
+
+    <!-- Pill 2 -->
+    <rect x="-280" y="-18" width="148" height="36" rx="18" fill="rgba(77,172,255,0.1)" stroke="rgba(77,172,255,0.2)" stroke-width="1"/>
+    <text x="-206" y="6" font-family="Inter, sans-serif" font-weight="500" font-size="14" fill="#4dacff">Voice Chat</text>
+
+    <!-- Pill 3 -->
+    <rect x="-108" y="-18" width="128" height="36" rx="18" fill="rgba(77,172,255,0.1)" stroke="rgba(77,172,255,0.2)" stroke-width="1"/>
+    <text x="-44" y="6" font-family="Inter, sans-serif" font-weight="500" font-size="14" fill="#4dacff">P2P Mesh</text>
+
+    <!-- Pill 4 -->
+    <rect x="44" y="-18" width="128" height="36" rx="18" fill="rgba(77,172,255,0.1)" stroke="rgba(77,172,255,0.2)" stroke-width="1"/>
+    <text x="108" y="6" font-family="Inter, sans-serif" font-weight="500" font-size="14" fill="#4dacff">Built in Rust</text>
+
+    <!-- Pill 5 -->
+    <rect x="196" y="-18" width="148" height="36" rx="18" fill="rgba(77,172,255,0.1)" stroke="rgba(77,172,255,0.2)" stroke-width="1"/>
+    <text x="270" y="6" font-family="Inter, sans-serif" font-weight="500" font-size="14" fill="#4dacff">Open Source</text>
+  </g>
+
+  <!-- Divider line -->
+  <line x1="200" y1="460" x2="1000" y2="460" stroke="rgba(77,172,255,0.15)" stroke-width="1"/>
+
+  <!-- Bottom: Architecture hint -->
+  <text x="600" y="510" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="400" font-size="16" fill="#3a4050">IRC Discovery  ·  QUIC Transport  ·  X3DH + Double Ratchet  ·  MLS Groups</text>
+
+  <!-- URL -->
+  <text x="600" y="560" text-anchor="middle" font-family="Inter, sans-serif" font-weight="500" font-size="18" fill="#4dacff">github.com/slackin/NAIS</text>
+
+  <!-- Apache 2.0 badge -->
+  <text x="600" y="590" text-anchor="middle" font-family="Inter, sans-serif" font-weight="400" font-size="13" fill="#3a4050">Apache 2.0  ·  Windows  ·  Linux  ·  Android</text>
+</svg>
