@@ -353,12 +353,16 @@ fn app() -> Element {
     // Display settings
     let mut settings_show_timestamps = use_signal(|| store.show_timestamps);
     let mut settings_show_advanced = use_signal(|| store.show_advanced);
+    let mut show_confirm_reset = use_signal(|| false);
     // Channel users for nick highlighting
     let mut channel_users: Signal<Vec<String>> = use_signal(Vec::new);
+    // Image cache version counter - bumped when any image download completes to trigger re-renders
+    let image_cache_version: Signal<u64> = use_signal(|| 0u64);
     // Provide global access to these settings
     use_context_provider(|| settings_show_timestamps);
     use_context_provider(|| settings_show_advanced);
     use_context_provider(|| channel_users);
+    use_context_provider(|| image_cache_version);
 
     let mut new_server_input = use_signal(String::new);
     let mut new_nick_input = use_signal(String::new);
@@ -1808,9 +1812,13 @@ fn app() -> Element {
         });
     });
 
-    // Auto-connect to profiles on startup
+    // Auto-connect to profiles on startup (deferred until first-run nickname setup is complete)
     {
         use_effect(move || {
+            // Don't connect until the user has chosen a nickname on first run
+            if *show_first_run_setup.read() {
+                return;
+            }
             for profile in profiles.read().iter() {
                 if profile.auto_connect {
                     let prof_name = profile.name.clone();
@@ -2858,13 +2866,13 @@ fn app() -> Element {
                                 drop(state_read);
                                 
                                 let total_count = all_filtered.len();
-                                let (visible_start, _) = *visible_message_range.read();
+                                let (expanded_batches, _) = *visible_message_range.read();
                                 
-                                // Calculate start index: show from visible_start or from (total - MAX) if not expanded
-                                let start_idx = if visible_start > 0 {
-                                    0 // User wants to see older messages
-                                } else if total_count > MAX_VISIBLE_MESSAGES {
-                                    total_count - MAX_VISIBLE_MESSAGES
+                                // Calculate how many messages to show based on batch expansion
+                                // Each batch expands by MAX_VISIBLE_MESSAGES more messages
+                                let visible_count = MAX_VISIBLE_MESSAGES * (expanded_batches + 1);
+                                let start_idx = if total_count > visible_count {
+                                    total_count - visible_count
                                 } else {
                                     0
                                 };
@@ -2881,8 +2889,9 @@ fn app() -> Element {
                                             class: "message system",
                                             style: "text-align: center; cursor: pointer;",
                                             onclick: move |_| {
-                                                // Expand to show all messages
-                                                visible_message_range.set((1, 0));
+                                                // Load next batch of older messages
+                                                let (current_batches, _) = *visible_message_range.read();
+                                                visible_message_range.set((current_batches + 1, 0));
                                             },
                                             div {
                                                 class: "system-text",
@@ -6236,6 +6245,48 @@ fn app() -> Element {
                                 }
                             }
                             
+                            // Reset All Data (advanced only)
+                            if *settings_show_advanced.read() {
+                                div {
+                                    class: "settings-row",
+                                    style: "margin-top: 8px;",
+                                    if *show_confirm_reset.read() {
+                                        span {
+                                            style: "color: #ef4444; font-size: 13px; margin-right: 8px;",
+                                            "This will erase all settings, profiles and cache. Are you sure?"
+                                        }
+                                        button {
+                                            class: "send",
+                                            style: "background: #ef4444; color: white; margin-right: 4px;",
+                                            onclick: move |_| {
+                                                crate::reset_all_data();
+                                                // Exit so the app restarts in a clean state
+                                                std::process::exit(0);
+                                                #[allow(unreachable_code)]
+                                                ()
+                                            },
+                                            "Yes, Reset"
+                                        }
+                                        button {
+                                            class: "send",
+                                            onclick: move |_| {
+                                                show_confirm_reset.set(false);
+                                            },
+                                            "Cancel"
+                                        }
+                                    } else {
+                                        button {
+                                            class: "send",
+                                            style: "background: #ef4444; color: white;",
+                                            onclick: move |_| {
+                                                show_confirm_reset.set(true);
+                                            },
+                                            "Reset All Data"
+                                        }
+                                    }
+                                }
+                            }
+
                             // Scrollback Limit (advanced only)
                             if *settings_show_advanced.read() {
                                 div {
@@ -9252,13 +9303,15 @@ fn message_view(msg: ChatMessage, key: u64) -> Element {
     let always_show_timestamps = use_context::<Signal<bool>>();
     let show_timestamp = move || always_show_timestamps() || show_timestamp_clicked();
     
+    // Read image cache version signal to trigger re-renders when downloads complete
+    let cache_version = use_context::<Signal<u64>>();
+    // Read the signal to establish reactivity dependency
+    let _ = cache_version();
+    
     rsx! {
         div {
             key: "{key}",
             class: format!("message{system_class}{action_class}"),
-            // content-visibility: auto allows the browser to skip rendering off-screen messages
-            // contain-intrinsic-size provides a placeholder size for scroll calculations
-            style: "content-visibility: auto; contain-intrinsic-size: auto 60px;",
             onclick: move |_| {
                 if !msg.is_system && !always_show_timestamps() {
                     show_timestamp_clicked.set(true);
@@ -9298,7 +9351,7 @@ fn message_view(msg: ChatMessage, key: u64) -> Element {
                     div {
                         class: "message-images",
                         for item in media_items {
-                            {render_media_item(item)}
+                            {render_media_item(item, cache_version)}
                         }
                     }
                 }
@@ -9326,7 +9379,7 @@ fn message_view(msg: ChatMessage, key: u64) -> Element {
                     div {
                         class: "message-images",
                         for item in media_items {
-                            {render_media_item(item)}
+                            {render_media_item(item, cache_version)}
                         }
                     }
                 }
@@ -9516,21 +9569,28 @@ struct DiscourseData {
     site_name: String,
 }
 
-fn render_media_item(item: MediaItem) -> Element {
+fn render_media_item(item: MediaItem, cache_version: Signal<u64>) -> Element {
     match item {
         MediaItem::Image { source_url, image_url } => {
             // Get cached image or start downloading it
-            let cached_url = get_or_download_image(&image_url);
+            let cached_url = get_or_download_image(&image_url, cache_version);
             rsx! {
                 a {
                     href: "{source_url}",
                     target: "_blank",
                     rel: "noopener noreferrer",
-                    img {
-                        src: "{cached_url}",
-                        class: "embedded-image clickable",
-                        loading: "lazy",
-                        alt: "Embedded image",
+                    if let Some(data_uri) = cached_url {
+                        img {
+                            src: "{data_uri}",
+                            class: "embedded-image clickable",
+                            loading: "lazy",
+                            alt: "Embedded image",
+                        }
+                    } else {
+                        div {
+                            class: "embedded-image clickable image-loading",
+                            "🖼 Loading image..."
+                        }
                     }
                 }
             }
@@ -9538,18 +9598,25 @@ fn render_media_item(item: MediaItem) -> Element {
         MediaItem::YouTubeVideo { video_id, source_url } => {
             let thumbnail_url = format!("https://img.youtube.com/vi/{}/maxresdefault.jpg", video_id);
             // Cache YouTube thumbnails too
-            let cached_url = get_or_download_image(&thumbnail_url);
+            let cached_url = get_or_download_image(&thumbnail_url, cache_version);
             rsx! {
                 a {
                     href: "{source_url}",
                     target: "_blank",
                     rel: "noopener noreferrer",
                     class: "video-preview",
-                    img {
-                        src: "{cached_url}",
-                        class: "embedded-image clickable",
-                        loading: "lazy",
-                        alt: "YouTube video thumbnail",
+                    if let Some(data_uri) = cached_url {
+                        img {
+                            src: "{data_uri}",
+                            class: "embedded-image clickable",
+                            loading: "lazy",
+                            alt: "YouTube video thumbnail",
+                        }
+                    } else {
+                        div {
+                            class: "embedded-image clickable image-loading",
+                            "▶ Loading thumbnail..."
+                        }
                     }
                 }
             }
@@ -9600,7 +9667,8 @@ struct CacheMetadata {
 // Global cache for resolved pasteboard URLs with update counter
 type UrlCache = Arc<Mutex<(HashMap<String, Option<String>>, u64)>>;
 // Cache for downloaded image data (URL -> base64 data URI)
-type ImageDataCache = Arc<Mutex<HashMap<String, String>>>;
+// Uses Option<String>: Some(data_uri) = success, None = download in progress or failed
+type ImageDataCache = Arc<Mutex<HashMap<String, Option<String>>>>;
 type DiscourseCache = Arc<Mutex<(HashMap<String, Option<DiscourseData>>, u64)>>;
 
 lazy_static::lazy_static! {
@@ -9840,7 +9908,7 @@ fn save_image_data_entry(key: &str, value: &str) {
 }
 
 // Load image data cache from disk
-fn load_image_data_cache() -> HashMap<String, String> {
+fn load_image_data_cache() -> HashMap<String, Option<String>> {
     let cache_dir = get_cache_dir();
     let metadata_path = cache_dir.join("image_data_metadata.json");
     
@@ -9854,7 +9922,7 @@ fn load_image_data_cache() -> HashMap<String, String> {
                 
                 if let Ok(data) = fs::read_to_string(&cache_file) {
                     if let Ok(value) = serde_json::from_str::<String>(&data) {
-                        result.insert(key, value);
+                        result.insert(key, Some(value));
                     }
                 }
             }
@@ -10096,50 +10164,85 @@ fn get_or_fetch_og_image(url: &str) -> Option<String> {
 }
 
 // Download image data and convert to base64 data URI
-async fn download_image_async(url: String) -> Option<String> {
+async fn download_image_async(url: String) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
-        .user_agent("Mozilla/5.0 (compatible; Convey/0.1.0)")
+        .user_agent("Mozilla/5.0 (compatible; NAIS/1.0)")
+        .danger_accept_invalid_certs(true)
         .build()
-        .ok()?;
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
     
-    let response = client.get(&url).send().await.ok()?;
+    let response = client.get(&url).send().await
+        .map_err(|e| format!("HTTP request failed for {}: {}", url, e))?;
+    
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {} for {}", status, url));
+    }
+    
     let content_type = response.headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("image/png")
         .to_string();
     
-    let bytes = response.bytes().await.ok()?;
+    let bytes = response.bytes().await
+        .map_err(|e| format!("Failed to read response body for {}: {}", url, e))?;
+    
+    if bytes.is_empty() {
+        return Err(format!("Empty response body for {}", url));
+    }
     
     // Convert to base64 data URI
     let base64_data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
-    Some(format!("data:{};base64,{}", content_type, base64_data))
+    Ok(format!("data:{};base64,{}", content_type, base64_data))
 }
 
 // Get cached image or download it
-fn get_or_download_image(url: &str) -> String {
-    // Check cache first
+// Returns Some(data_uri) if cached, None if download is in progress or failed
+// Bumps the image_cache_version signal when download completes to trigger re-render
+fn get_or_download_image(url: &str, mut cache_version: Signal<u64>) -> Option<String> {
+    // Check cache first (includes in-flight markers)
     {
         let cache = IMAGE_DATA_CACHE.lock().unwrap();
-        if let Some(cached) = cache.get(url) {
-            return cached.clone();
+        match cache.get(url) {
+            Some(Some(data_uri)) => return Some(data_uri.clone()), // Cached successfully
+            Some(None) => return None, // Download in-flight or failed, don't re-spawn
+            None => {} // Not seen before, proceed to download
         }
     }
     
-    // Not in cache, spawn async download task
+    // Mark as in-flight before spawning (prevents duplicate spawns on re-render)
+    {
+        let mut cache = IMAGE_DATA_CACHE.lock().unwrap();
+        cache.insert(url.to_string(), None);
+    }
+    
+    // Spawn async download task
     let url_clone = url.to_string();
     spawn(async move {
-        if let Some(data_uri) = download_image_async(url_clone.clone()).await {
-            let mut cache = IMAGE_DATA_CACHE.lock().unwrap();
-            cache.insert(url_clone.clone(), data_uri.clone());
-            drop(cache); // Release lock before saving to disk
-            save_image_data_entry(&url_clone, &data_uri);
+        match download_image_async(url_clone.clone()).await {
+            Ok(data_uri) => {
+                log::info!("Image downloaded successfully: {}", url_clone);
+                let mut cache = IMAGE_DATA_CACHE.lock().unwrap();
+                cache.insert(url_clone.clone(), Some(data_uri.clone()));
+                drop(cache); // Release lock before saving to disk
+                save_image_data_entry(&url_clone, &data_uri);
+                // Bump the version counter to trigger a UI re-render
+                cache_version += 1;
+            }
+            Err(e) => {
+                log::warn!("Image download failed: {}", e);
+                // Remove the in-flight marker so it can be retried on a future render
+                // (e.g. if it was a transient network error)
+                let mut cache = IMAGE_DATA_CACHE.lock().unwrap();
+                cache.remove(&url_clone);
+            }
         }
     });
     
-    // Return original URL until downloaded (browser will download it normally)
-    url.to_string()
+    // Return None until downloaded
+    None
 }
 
 
@@ -10177,6 +10280,7 @@ async fn upload_simple_image(image_data: Vec<u8>) -> Option<String> {
     let client = reqwest::Client::builder()
         .user_agent("Convey/0.1.0")
         .timeout(std::time::Duration::from_secs(30))
+        .danger_accept_invalid_certs(true)
         .build()
         .ok()?;
     
@@ -11454,6 +11558,22 @@ body {
 .embedded-image:hover {
     transform: scale(1.02);
     border-color: var(--accent);
+}
+
+.image-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 200px;
+    min-height: 100px;
+    color: var(--text-dim);
+    font-size: 13px;
+    animation: pulse-loading 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-loading {
+    0%, 100% { opacity: 0.5; }
+    50% { opacity: 1.0; }
 }
 
 .video-preview {

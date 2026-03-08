@@ -20,6 +20,9 @@ mod ui;
 mod voice_chat;
 
 use clap::Parser;
+use std::path::PathBuf;
+
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Convey IRC Client
 #[derive(Parser, Debug)]
@@ -28,6 +31,75 @@ struct Cli {
     /// Launch in console/terminal mode instead of the GUI
     #[arg(long, short = 'c')]
     console: bool,
+}
+
+/// Returns the path to the version marker file inside the config directory.
+fn version_marker_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("nais-client").join(".version"))
+}
+
+/// Remove all config and cache directories, returning the application to a
+/// fresh-install state.  After clearing, the version marker is re-written so
+/// the next launch does not trigger another migration.
+pub fn reset_all_data() {
+    log::info!("Resetting all configs and cache to initial state");
+
+    let mut dirs_to_clear: Vec<PathBuf> = Vec::new();
+
+    if let Some(config_base) = dirs::config_dir() {
+        dirs_to_clear.push(config_base.join("nais-client")); // profile.json, logs/
+        dirs_to_clear.push(config_base.join("nais"));         // nsc_data.json
+    }
+    if let Some(cache_base) = dirs::cache_dir() {
+        dirs_to_clear.push(cache_base.join("nais-client"));   // cached data
+    }
+
+    for dir in &dirs_to_clear {
+        if dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(dir) {
+                log::warn!("Failed to remove {}: {}", dir.display(), e);
+            } else {
+                log::info!("Removed {}", dir.display());
+            }
+        }
+    }
+
+    // Re-write the version marker so version-migration doesn't re-trigger
+    if let Some(marker_path) = version_marker_path() {
+        if let Some(parent) = marker_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        if let Err(e) = std::fs::write(&marker_path, APP_VERSION) {
+            log::warn!("Failed to write version marker: {}", e);
+        }
+    }
+}
+
+/// Check if this is the first launch of a new version.
+/// If so, clear all previous config and cache directories so the new version
+/// starts from a clean slate, then write the current version marker.
+fn check_version_migration() {
+    let Some(marker_path) = version_marker_path() else {
+        log::warn!("Could not determine config directory; skipping version migration");
+        return;
+    };
+
+    // Read stored version (if any)
+    let stored_version = std::fs::read_to_string(&marker_path).ok();
+    let stored_version = stored_version.as_deref().map(|s| s.trim());
+
+    if stored_version == Some(APP_VERSION) {
+        // Same version — nothing to do
+        return;
+    }
+
+    log::info!(
+        "Version change detected ({} -> {}). Clearing previous configs and cache.",
+        stored_version.unwrap_or("<none>"),
+        APP_VERSION
+    );
+
+    reset_all_data();
 }
 
 fn main() {
@@ -45,7 +117,10 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter))
         .format_timestamp_millis()
         .init();
-    
+
+    // Clear old configs/cache when version changes
+    check_version_migration();
+
     if cli.console {
         log::info!("NAIS IRC Client starting (console mode)...");
         console::run();
