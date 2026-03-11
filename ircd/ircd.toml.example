@@ -1,0 +1,50 @@
+# NAIS IRC Server Configuration Example
+# Copy to ircd.toml and modify as needed.
+
+[server]
+name = "irc.nais.net"
+bind = "0.0.0.0:6667"
+# tls_bind = "0.0.0.0:6697"
+description = "NAIS IRC Network"
+network = "NAIS"
+# password = "optional-server-password"
+motd = [
+    "Welcome to the NAIS IRC Network!",
+    "",
+    "This server supports Houses — organized channel groups with",
+    "Discord-style permissions, roles, and room management.",
+    "",
+    "Commands:",
+    "  /HOUSE CREATE <name>           - Create a new house",
+    "  /HOUSE LIST                    - List all houses",
+    "  /HOUSE JOIN <name> [invite]    - Join a house",
+    "  /HOUSE ROOM LIST <house>       - List rooms in a house",
+    "  /HOUSE ROOM LOG <h> <r> ON|OFF - Toggle persistent logging",
+    "  /JOIN #house.room              - Join a room in a house",
+    "  /JOIN #channel                 - Join a plain IRC channel",
+    "",
+    "Standard IRC commands work as expected.",
+    "Enjoy your stay!",
+]
+
+# [tls]
+# cert_path = "/etc/nais-ircd/cert.pem"
+# key_path = "/etc/nais-ircd/key.pem"
+
+[limits]
+max_clients = 10000
+max_channels_per_user = 100
+max_houses_per_user = 10
+max_rooms_per_house = 200
+max_roles_per_house = 50
+ping_timeout = 180
+registration_timeout = 30
+# Maximum scrollback lines kept per channel when persistent logging is enabled
+max_scrollback = 500
+
+# IRC Operators
+# Generate password hash: echo -n "password" | argon2 "randomsalt" -id -e
+# [[opers]]
+# name = "admin"
+# password_hash = "$argon2id$v=19$m=65536,t=3,p=4$..."
+# host = "*@*"

@@ -348,6 +348,124 @@ footer {
 footer a { color: var(--text-muted); }
 footer a:hover { color: var(--accent); }
 
+/* ── Active nav link ── */
+.nav-active { color: var(--accent) !important; }
+
+/* ── API Cards ── */
+.api-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 1.25rem;
+}
+
+.api-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.5rem;
+    transition: border-color .25s, transform .25s;
+}
+.api-card:hover {
+    border-color: var(--accent-dim);
+    transform: translateY(-2px);
+}
+
+.api-method {
+    display: inline-block;
+    padding: .2rem .6rem;
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: .75rem;
+    font-weight: 700;
+    letter-spacing: .04em;
+    margin-bottom: .6rem;
+}
+
+.api-method.get {
+    background: rgba(77, 172, 255, .12);
+    color: var(--accent);
+}
+
+.api-method.post {
+    background: rgba(130, 230, 130, .12);
+    color: #82e682;
+}
+
+.api-card h3 {
+    font-size: .95rem;
+    font-weight: 600;
+    font-family: var(--font-mono);
+    color: var(--heading);
+    margin-bottom: .4rem;
+}
+
+.api-card p {
+    font-size: .85rem;
+    color: var(--text-muted);
+    line-height: 1.55;
+}
+
+.api-card p code {
+    background: rgba(77, 172, 255, .08);
+    color: var(--accent);
+    padding: .15em .4em;
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: .85em;
+}
+
+/* ── Config Table ── */
+.config-table-wrap {
+    max-width: 780px;
+    margin: 0 auto;
+    overflow-x: auto;
+}
+
+.config-table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    font-size: .88rem;
+}
+
+.config-table th,
+.config-table td {
+    padding: .75rem 1rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+}
+
+.config-table thead th {
+    background: rgba(77, 172, 255, .06);
+    color: var(--heading);
+    font-weight: 600;
+    font-size: .82rem;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+}
+
+.config-table tbody tr:last-child td {
+    border-bottom: none;
+}
+
+.config-table tbody tr:hover {
+    background: var(--bg-card-hover);
+}
+
+.config-table td { color: var(--text-muted); }
+
+.config-table code {
+    background: rgba(77, 172, 255, .08);
+    color: var(--accent);
+    padding: .15em .4em;
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: .85em;
+}
+
 /* ── Mobile ── */
 @media (max-width: 600px) {
     nav { padding: 0 1rem; }

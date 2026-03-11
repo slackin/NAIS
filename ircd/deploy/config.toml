@@ -1,0 +1,20 @@
+[server]
+name = "irc.nais.net"
+bind = "0.0.0.0:6667"
+description = "NAIS IRC Network"
+network = "NAIS"
+motd = [
+    "Welcome to the NAIS IRC Network!",
+    "",
+    "Houses & Rooms: /HOUSE CREATE <name>",
+    "Standard IRC: /JOIN #channel",
+]
+
+[limits]
+max_clients = 10000
+max_channels_per_user = 100
+max_houses_per_user = 10
+max_rooms_per_house = 200
+max_roles_per_house = 50
+ping_timeout = 180
+registration_timeout = 30

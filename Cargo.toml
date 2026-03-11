@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "relay-hub", "scs", "convey"]
+members = [".", "relay-hub", "scs", "convey", "ircd"]
 resolver = "2"
 
 [package]

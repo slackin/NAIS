@@ -1,0 +1,39 @@
+[package]
+name = "nais-ircd"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "NAIS IRC Server - Full IRC daemon with houses/rooms and advanced permissions"
+
+[[bin]]
+name = "nais-ircd"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "net", "sync", "signal"] }
+
+# TLS
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+rcgen = "0.13"
+
+# Serialization / Config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Crypto (password hashing)
+argon2 = "0.5"
+rand = "0.8"
+
+# Utilities
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+thiserror = "1"
+dashmap = "6"
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+futures = "0.3"

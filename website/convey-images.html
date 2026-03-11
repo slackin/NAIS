@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Convey Images — Privacy-Respecting Image Hosting for Convey Chat</title>
+    <meta name="description" content="Convey Images is a self-hosted, privacy-first image paste board with EXIF stripping, tokenized URLs, duplicate detection, and automatic cleanup.">
+
+    <!-- Open Graph / Facebook -->
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="Convey Images — Privacy-Respecting Image Hosting">
+    <meta property="og:description" content="Self-hosted image paste board with EXIF stripping, tokenized URLs, duplicate detection, and auto cleanup. Built in Rust with Axum.">
+    <meta property="og:image" content="https://github.com/slackin/NAIS/raw/main/website/og-image.png">
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Convey Images — Privacy-Respecting Image Hosting">
+    <meta name="twitter:description" content="Self-hosted image paste board with EXIF stripping, tokenized URLs, duplicate detection, and auto cleanup. Built in Rust with Axum.">
+    <meta name="twitter:image" content="https://github.com/slackin/NAIS/raw/main/website/og-image.png">
+
+    <link rel="icon" href="../images/favicon.ico" type="image/x-icon">
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="bg-grid"></div>
+
+    <header>
+        <nav>
+            <a href="index.html" class="logo">Convey</a>
+            <div class="nav-links">
+                <a href="index.html#features">Features</a>
+                <a href="index.html#how-it-works">How It Works</a>
+                <a href="convey-images.html" class="nav-active">Convey Images</a>
+                <a href="index.html#download">Download</a>
+                <a href="https://github.com/slackin/NAIS" target="_blank" rel="noopener">GitHub</a>
+            </div>
+        </nav>
+    </header>
+
+    <main>
+        <section class="hero">
+            <div class="hero-content">
+                <h1>Convey Images</h1>
+                <p class="tagline">A self-hosted, privacy-respecting image paste board for Convey chat — strip metadata, tokenize URLs, and share images safely.</p>
+                <div class="hero-buttons">
+                    <a href="https://convey.pugbot.net" class="btn btn-primary" target="_blank" rel="noopener">Live Instance</a>
+                    <a href="https://github.com/slackin/NAIS/tree/main/convey" class="btn btn-secondary" target="_blank" rel="noopener">View Source</a>
+                </div>
+            </div>
+        </section>
+
+        <section id="features" class="features">
+            <h2>Features</h2>
+            <p class="section-desc">
+                Convey Images is the companion image hosting service for the Convey chat client.
+                It strips sensitive metadata, generates anonymous URLs, and keeps your image sharing private —
+                whether you're in a regular IRC channel or a secure encrypted channel.
+            </p>
+
+            <div class="feature-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">&#128270;</div>
+                    <h3>EXIF Stripping</h3>
+                    <p>Every uploaded image is re-encoded from scratch, removing all EXIF metadata — GPS coordinates, camera info, timestamps, ICC profiles, and any other embedded data.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#128279;</div>
+                    <h3>Tokenized URLs</h3>
+                    <p>Original filenames are never exposed. Each image gets a random 12-character token as its URL, preventing filename-based tracking or information leakage.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#128200;</div>
+                    <h3>Duplicate Detection</h3>
+                    <p>Content-hash (SHA-256) based deduplication detects identical uploads and returns the existing URL — saving storage without re-uploading.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#128247;</div>
+                    <h3>Image Resizing</h3>
+                    <p>Oversized images are automatically downscaled to a configurable maximum dimension (default 4096px) using high-quality Lanczos3 resampling.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#128421;</div>
+                    <h3>Web Upload Interface</h3>
+                    <p>A built-in drag & drop web interface with clipboard paste support. No client needed — just visit the service URL in any browser and drop your image.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#9889;</div>
+                    <h3>REST API</h3>
+                    <p>Simple multipart POST endpoint for programmatic uploads. Integrated directly into the Convey chat client for seamless in-chat image sharing.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#128444;</div>
+                    <h3>Gallery View</h3>
+                    <p>Browse the 50 most recent uploads at the <code>/gallery</code> endpoint. Quick visual overview of what's been shared.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#128336;</div>
+                    <h3>Auto Cleanup</h3>
+                    <p>Configurable retention period and maximum image count. Old images are automatically purged on an hourly cycle, or the oldest images are removed when limits are reached.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#127760;</div>
+                    <h3>OG Meta Tags</h3>
+                    <p>View pages at <code>/v/</code> include Open Graph and Twitter Card meta tags, so shared links get rich image previews in chat clients and social platforms.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#128274;</div>
+                    <h3>Delete Tokens</h3>
+                    <p>Every upload returns a unique delete URL. Only the uploader can remove their image — no accounts or authentication required.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#128640;</div>
+                    <h3>Built with Rust &amp; Axum</h3>
+                    <p>Async from top to bottom with Tokio and Axum. Minimal resource footprint, fast image processing, and rock-solid reliability.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">&#128230;</div>
+                    <h3>Self-Hostable</h3>
+                    <p>Single static binary with TOML configuration. Deploy anywhere — your server, your rules, your data. Full Nginx and Apache proxy configs included.</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="api" class="how-it-works">
+            <h2>API Reference</h2>
+            <p class="section-desc">
+                Convey Images exposes a straightforward HTTP API for uploading, viewing, and managing images.
+                All responses are JSON unless otherwise noted.
+            </p>
+
+            <div class="api-grid">
+                <div class="api-card">
+                    <div class="api-method post">POST</div>
+                    <h3>/upload</h3>
+                    <p>Upload an image via multipart form data. The file field should be named <code>file</code> or <code>image</code>. Returns a JSON response with the view URL, direct URL, delete URL, dimensions, and file size.</p>
+                </div>
+                <div class="api-card">
+                    <div class="api-method get">GET</div>
+                    <h3>/i/{token}.{ext}</h3>
+                    <p>Serve the raw image with appropriate <code>Content-Type</code>, immutable caching headers, and <code>X-Content-Type-Options: nosniff</code>.</p>
+                </div>
+                <div class="api-card">
+                    <div class="api-method get">GET</div>
+                    <h3>/v/{token}.{ext}</h3>
+                    <p>HTML view page with Open Graph meta tags for link previews. Displays the image in a styled page suitable for sharing.</p>
+                </div>
+                <div class="api-card">
+                    <div class="api-method get">GET</div>
+                    <h3>/api/info/{token}</h3>
+                    <p>Returns JSON metadata about the image: token, extension, content type, dimensions, file size, upload timestamp, and content hash.</p>
+                </div>
+                <div class="api-card">
+                    <div class="api-method post">POST</div>
+                    <h3>/delete/{delete_token}</h3>
+                    <p>Delete an image using the unique delete token returned at upload time. Removes both the image file and its metadata.</p>
+                </div>
+                <div class="api-card">
+                    <div class="api-method get">GET</div>
+                    <h3>/gallery</h3>
+                    <p>Browse the 50 most recently uploaded images in a visual gallery page. Sorted newest-first.</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="deploy" class="features">
+            <h2>Deployment</h2>
+            <p class="section-desc">
+                Convey Images ships as a single binary. Build it, configure it, and run it behind your reverse proxy of choice.
+            </p>
+
+            <div class="steps-grid">
+                <div class="step-card">
+                    <div class="step-number">1</div>
+                    <h3>Build</h3>
+                    <p>Compile with Cargo:<br><code>cargo build --release -p convey-images</code><br>Or cross-compile for Linux with musl for a fully static binary.</p>
+                </div>
+                <div class="step-card">
+                    <div class="step-number">2</div>
+                    <h3>Configure</h3>
+                    <p>Copy <code>convey.toml.example</code> to <code>/etc/convey-images/config.toml</code> and set your bind address, base URL, storage path, and limits.</p>
+                </div>
+                <div class="step-card">
+                    <div class="step-number">3</div>
+                    <h3>Run</h3>
+                    <p>Start the service:<br><code>convey-images -c /etc/convey-images/config.toml</code><br>A systemd unit file is included for production use.</p>
+                </div>
+                <div class="step-card">
+                    <div class="step-number">4</div>
+                    <h3>Reverse Proxy</h3>
+                    <p>Point Nginx or Apache at the bind address. Sample configs for both are included. Add TLS with <code>certbot</code>.</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="config" class="faq">
+            <h2>Configuration</h2>
+            <p class="section-desc">
+                All settings are controlled via a single TOML file. Here's every option:
+            </p>
+
+            <div class="config-table-wrap">
+                <table class="config-table">
+                    <thead>
+                        <tr>
+                            <th>Setting</th>
+                            <th>Default</th>
+                            <th>Description</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>bind_address</code></td>
+                            <td><code>0.0.0.0:8844</code></td>
+                            <td>HTTP server bind address</td>
+                        </tr>
+                        <tr>
+                            <td><code>base_url</code></td>
+                            <td><code>https://convey.pugbot.net</code></td>
+                            <td>Public URL used for generating image links</td>
+                        </tr>
+                        <tr>
+                            <td><code>storage_dir</code></td>
+                            <td><code>/var/lib/convey-images</code></td>
+                            <td>Directory where images and metadata are stored</td>
+                        </tr>
+                        <tr>
+                            <td><code>max_upload_size</code></td>
+                            <td>20 MB</td>
+                            <td>Maximum file size per upload (in bytes)</td>
+                        </tr>
+                        <tr>
+                            <td><code>max_images</code></td>
+                            <td>50,000</td>
+                            <td>Maximum number of stored images (oldest evicted when exceeded)</td>
+                        </tr>
+                        <tr>
+                            <td><code>retention_days</code></td>
+                            <td>0 (forever)</td>
+                            <td>Auto-delete images older than N days (0 disables)</td>
+                        </tr>
+                        <tr>
+                            <td><code>max_dimension</code></td>
+                            <td>4096</td>
+                            <td>Maximum width or height — larger images are downscaled</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section id="faq-ci" class="faq">
+            <h2>Frequently Asked Questions</h2>
+
+            <div class="faq-list">
+                <details class="faq-item">
+                    <summary>Is Convey Images integrated into the Convey chat client?</summary>
+                    <p>Yes. When you paste or attach an image in Convey, the client uploads it to your configured Convey Images instance via the <code>POST /upload</code> API and automatically shares the resulting URL in chat.</p>
+                </details>
+
+                <details class="faq-item">
+                    <summary>What image formats are supported?</summary>
+                    <p>JPEG, PNG, GIF, and WebP are all accepted. GIF and WebP images are re-encoded as PNG to ensure complete metadata stripping. JPEG images are re-encoded as JPEG.</p>
+                </details>
+
+                <details class="faq-item">
+                    <summary>Does it really remove all EXIF data?</summary>
+                    <p>Yes. Images are fully decoded and then re-encoded from the raw pixel data. This removes <strong>all</strong> embedded metadata — EXIF, GPS coordinates, camera make/model, timestamps, ICC color profiles, and any other chunks. Nothing survives re-encoding.</p>
+                </details>
+
+                <details class="faq-item">
+                    <summary>What happens when I upload a duplicate image?</summary>
+                    <p>Convey Images computes a SHA-256 hash of the processed image. If an identical image already exists, it returns the existing URL instead of creating a new entry — saving storage space and bandwidth.</p>
+                </details>
+
+                <details class="faq-item">
+                    <summary>How does auto-cleanup work?</summary>
+                    <p>If <code>retention_days</code> is set (non-zero), a background task runs every hour and deletes images older than the configured retention period. Additionally, when <code>max_images</code> is reached, the oldest image is removed to make room for new uploads.</p>
+                </details>
+
+                <details class="faq-item">
+                    <summary>Do I need an account to use it?</summary>
+                    <p>No. Convey Images requires no authentication for uploading or viewing. Each upload returns a unique delete token that only the uploader receives — that's the only way to remove an image.</p>
+                </details>
+
+                <details class="faq-item">
+                    <summary>Can I use it without the Convey chat client?</summary>
+                    <p>Absolutely. The web interface supports drag & drop, file picker, and clipboard paste. You can also use any HTTP client or <code>curl</code> to upload via the API:<br><code>curl -F "file=@photo.jpg" https://convey.pugbot.net/upload</code></p>
+                </details>
+
+                <details class="faq-item">
+                    <summary>Is it open source?</summary>
+                    <p>Yes. Convey Images is part of the <a href="https://github.com/slackin/NAIS" target="_blank" rel="noopener">NAIS project</a>, licensed under <strong>Apache 2.0</strong>. The full source is in the <a href="https://github.com/slackin/NAIS/tree/main/convey" target="_blank" rel="noopener">convey/</a> directory.</p>
+                </details>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 Convey Project &middot; <a href="index.html">Home</a> &middot; <a href="https://github.com/slackin/NAIS" target="_blank" rel="noopener">GitHub</a> &middot; Licensed under Apache 2.0</p>
+    </footer>
+</body>
+</html>
